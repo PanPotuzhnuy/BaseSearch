@@ -11,8 +11,8 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::db::{
     Analytics, AnalyticsFilterAction, AnalyticsFilterField, AnalyticsGroupRow,
-    AnalyticsMonthRow, AnalyticsPriceMetric, AnalyticsSection, AnalyticsSectionKind, Db, Filters,
-    PriceMetricKind, Query, RecordCard,
+    AnalyticsMonthRow, AnalyticsPriceMetric, AnalyticsScope, AnalyticsSection,
+    AnalyticsSectionKind, Db, Filters, PriceMetricKind, Query, RecordCard,
 };
 use crate::export::ExportError;
 use crate::i18n::{Lang, Tr, fmt, group_digits, tr};
@@ -179,6 +179,13 @@ pub struct App {
     analytics: Option<Analytics>,
     active_tab: AppTab,
     analytics_limit: u64,
+    /// Generation of the query the loaded analytics belong to.
+    analytics_gen: u64,
+    /// Active category chip on the Analytics tab.
+    analytics_scope: AnalyticsScope,
+    /// Which scopes are loaded for `analytics_gen` (indexed by scope).
+    analytics_loaded: [bool; 4],
+    analytics_loading: bool,
     month_metric: MonthMetric,
     selected: HashSet<usize>,
     select_anchor: Option<usize>,
@@ -262,6 +269,10 @@ impl App {
             analytics: None,
             active_tab: AppTab::Results,
             analytics_limit: 10,
+            analytics_gen: 0,
+            analytics_scope: AnalyticsScope::default(),
+            analytics_loaded: [false; 4],
+            analytics_loading: false,
             month_metric: MonthMetric::default(),
             selected: HashSet::new(),
             select_anchor: None,
@@ -335,16 +346,18 @@ impl App {
         };
         self.search_gen += 1;
         self.search_in_flight = true;
-        if self.active_tab == AppTab::Analytics {
-            self.analytics = None;
-        }
+        // Запрос изменился — загруженная аналитика устарела.
+        self.analytics = None;
+        self.analytics_loaded = [false; 4];
+        self.analytics_loading = false;
         let _ = self.search_tx.send(WorkerReq::Search {
             q: Box::new(self.active_query.clone()),
             page: self.page,
             generation: self.search_gen,
-            include_analytics: self.active_tab == AppTab::Analytics,
-            analytics_limit: self.analytics_limit,
         });
+        if self.active_tab == AppTab::Analytics {
+            self.request_analytics();
+        }
     }
 
     fn goto_page(&mut self, page: u64) {
@@ -355,8 +368,25 @@ impl App {
             q: Box::new(self.active_query.clone()),
             page,
             generation: self.search_gen,
-            include_analytics: false,
-            analytics_limit: self.analytics_limit,
+        });
+    }
+
+    /// Запрашивает активный раздел аналитики, если он ещё не загружен.
+    fn request_analytics(&mut self) {
+        if self.active_query.is_empty() {
+            return;
+        }
+        if self.analytics_gen == self.search_gen
+            && self.analytics_loaded[self.analytics_scope.index()]
+        {
+            return;
+        }
+        self.analytics_loading = true;
+        let _ = self.search_tx.send(WorkerReq::Analytics {
+            q: Box::new(self.active_query.clone()),
+            limit: self.analytics_limit,
+            scope: self.analytics_scope,
+            generation: self.search_gen,
         });
     }
 
@@ -374,24 +404,53 @@ impl App {
                     ids,
                     rows,
                     total,
-                    analytics,
                     ms,
                 } => {
                     if generation == self.search_gen {
                         self.row_ids = ids;
                         self.rows = rows;
                         self.total = Some(total);
-                        if let Some(analytics) = analytics {
-                            self.analytics = Some(*analytics);
-                        } else if self.active_tab != AppTab::Analytics
-                            || self.active_query.is_empty()
-                        {
-                            self.analytics = None;
-                        }
                         self.last_search_ms = Some(ms);
                         self.search_in_flight = false;
                         self.selected.clear();
                         self.select_anchor = None;
+                    }
+                }
+                Msg::AnalyticsDone {
+                    generation,
+                    scope,
+                    analytics,
+                } => {
+                    if generation == self.search_gen {
+                        match self.analytics.as_mut() {
+                            Some(existing) if self.analytics_gen == generation => {
+                                // Дозагрузка раздела: обзор и месяцы свежие,
+                                // разделы складываются в общий контейнер.
+                                existing.overview = analytics.overview;
+                                existing.months = analytics.months;
+                                match scope {
+                                    AnalyticsScope::Companies => {
+                                        existing.company_sections = analytics.company_sections;
+                                    }
+                                    AnalyticsScope::Products => {
+                                        existing.product_sections = analytics.product_sections;
+                                    }
+                                    AnalyticsScope::Countries => {
+                                        existing.country_sections = analytics.country_sections;
+                                    }
+                                    AnalyticsScope::Prices => {
+                                        existing.price_sections = analytics.price_sections;
+                                    }
+                                }
+                            }
+                            _ => {
+                                self.analytics = Some(*analytics);
+                                self.analytics_loaded = [false; 4];
+                            }
+                        }
+                        self.analytics_gen = generation;
+                        self.analytics_loaded[scope.index()] = true;
+                        self.analytics_loading = false;
                     }
                 }
                 Msg::SearchError {
@@ -400,6 +459,7 @@ impl App {
                 } => {
                     if generation == self.search_gen {
                         self.search_in_flight = false;
+                        self.analytics_loading = false;
                         self.status = StatusLine {
                             text: format!("{}: {message}", self.t().error),
                             is_error: true,
@@ -763,7 +823,7 @@ impl App {
         if do_search {
             self.start_search(true);
         } else if switched_to_analytics {
-            self.start_search(false);
+            self.request_analytics();
         }
         if do_import {
             self.pick_and_import(&ctx);
@@ -995,6 +1055,7 @@ impl App {
     }
 
     fn ui_analytics_view(&mut self, root: &mut egui::Ui) {
+        let mut need_request = false;
         egui::CentralPanel::default().show_inside(root, |ui| {
             let t = self.t();
             if self.active_query.is_empty() {
@@ -1008,6 +1069,7 @@ impl App {
             }
 
             let Some(analytics) = &self.analytics else {
+                need_request = !self.analytics_loading;
                 ui.add_space((ui.available_height() * 0.30).max(0.0));
                 ui.vertical_centered(|ui| {
                     ui.spinner();
@@ -1020,7 +1082,12 @@ impl App {
             let mut action: Option<AnalyticsFilterAction> = None;
             let mut show_more = false;
             let mut new_metric: Option<MonthMetric> = None;
+            let mut new_scope: Option<AnalyticsScope> = None;
             let month_metric = self.month_metric;
+            let scope = self.analytics_scope;
+            let scope_ready = self.analytics_loaded[scope.index()];
+            let loading = self.analytics_loading;
+            let lang = self.lang;
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading(t.analytics_answer);
@@ -1038,8 +1105,26 @@ impl App {
                     });
                 });
                 ui.add_space(3.0);
-                ui.label(egui::RichText::new(t.analytics_scope_note).weak().small());
-                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(t.analytics_scope_note).weak().small());
+                    if let (Some(first), Some(last)) =
+                        (analytics.months.first(), analytics.months.last())
+                    {
+                        ui.label(
+                            egui::RichText::new(fmt(
+                                t.period_of,
+                                &[
+                                    &first.month,
+                                    &last.month,
+                                    &analytics.months.len().to_string(),
+                                ],
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    }
+                });
+                ui.add_space(8.0);
 
                 ui.horizontal_wrapped(|ui| {
                     kpi_tile(
@@ -1063,13 +1148,13 @@ impl App {
                     kpi_tile(
                         ui,
                         t.total_value,
-                        format!("{} $", fmt_decimal(analytics.overview.total_value_usd, 2)),
+                        format!("{} $", fmt_compact(analytics.overview.total_value_usd)),
                         t.total_value_help,
                     );
                     kpi_tile(
                         ui,
                         t.net_weight,
-                        format!("{} kg", fmt_decimal(analytics.overview.total_net_kg, 3)),
+                        format!("{} kg", fmt_compact(analytics.overview.total_net_kg)),
                         t.net_weight_help,
                     );
                     kpi_tile(
@@ -1095,73 +1180,111 @@ impl App {
                     );
                 });
 
-                ui.add_space(14.0);
+                ui.add_space(12.0);
                 if !analytics.months.is_empty() {
-                    ui.heading(egui::RichText::new(t.months_section).size(17.0));
-                    ui.label(egui::RichText::new(t.months_hint).weak().small());
-                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        for (metric, label) in [
-                            (MonthMetric::Value, t.metric_value),
-                            (MonthMetric::Rows, t.metric_rows),
-                            (MonthMetric::NetWeight, t.metric_weight),
-                        ] {
-                            if ui.selectable_label(month_metric == metric, label).clicked() {
-                                new_metric = Some(metric);
+                        ui.label(egui::RichText::new(t.months_section).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            for (metric, label) in [
+                                (MonthMetric::NetWeight, t.metric_weight),
+                                (MonthMetric::Rows, t.metric_rows),
+                                (MonthMetric::Value, t.metric_value),
+                            ] {
+                                if ui.selectable_label(month_metric == metric, label).clicked() {
+                                    new_metric = Some(metric);
+                                }
+                            }
+                        });
+                    });
+                    ui.add_space(2.0);
+                    months_chart(ui, &analytics.months, month_metric, lang);
+                    ui.add_space(12.0);
+                }
+
+                // Переключатель разделов: считается и рисуется только активный.
+                ui.horizontal(|ui| {
+                    for s in AnalyticsScope::ALL {
+                        let label = match s {
+                            AnalyticsScope::Companies => t.companies_section,
+                            AnalyticsScope::Products => t.products_section,
+                            AnalyticsScope::Countries => t.countries_section,
+                            AnalyticsScope::Prices => t.prices_section,
+                        };
+                        if ui.selectable_label(scope == s, label).clicked() && s != scope {
+                            new_scope = Some(s);
+                        }
+                    }
+                    if loading {
+                        ui.spinner();
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(match scope {
+                        AnalyticsScope::Companies => t.companies_section_hint,
+                        AnalyticsScope::Products => t.products_section_hint,
+                        AnalyticsScope::Countries => t.countries_section_hint,
+                        AnalyticsScope::Prices => t.prices_section_hint,
+                    })
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(6.0);
+
+                if !scope_ready {
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| {
+                        ui.spinner();
+                    });
+                } else {
+                    match scope {
+                        AnalyticsScope::Companies => {
+                            if let Some(next) =
+                                analytics_cards(ui, &analytics.company_sections, lang)
+                            {
+                                action = Some(next);
                             }
                         }
-                    });
-                    ui.add_space(4.0);
-                    months_chart(ui, &analytics.months, month_metric, self.lang);
-                    ui.add_space(14.0);
+                        AnalyticsScope::Products => {
+                            if let Some(next) =
+                                analytics_cards(ui, &analytics.product_sections, lang)
+                            {
+                                action = Some(next);
+                            }
+                        }
+                        AnalyticsScope::Countries => {
+                            if let Some(next) =
+                                analytics_cards(ui, &analytics.country_sections, lang)
+                            {
+                                action = Some(next);
+                            }
+                        }
+                        AnalyticsScope::Prices => {
+                            price_table(ui, &analytics.price_sections, lang);
+                        }
+                    }
                 }
-                if let Some(next) = analytics_section_block(
-                    ui,
-                    t.companies_section,
-                    t.companies_section_hint,
-                    &analytics.company_sections,
-                    self.lang,
-                ) {
-                    action = Some(next);
-                }
-                if let Some(next) = analytics_section_block(
-                    ui,
-                    t.products_section,
-                    t.products_section_hint,
-                    &analytics.product_sections,
-                    self.lang,
-                ) {
-                    action = Some(next);
-                }
-                if let Some(next) = analytics_section_block(
-                    ui,
-                    t.countries_section,
-                    t.countries_section_hint,
-                    &analytics.country_sections,
-                    self.lang,
-                ) {
-                    action = Some(next);
-                }
-                price_section_block(
-                    ui,
-                    t.prices_section,
-                    t.prices_section_hint,
-                    &analytics.price_sections,
-                    self.lang,
-                );
+                ui.add_space(8.0);
             });
 
             if let Some(metric) = new_metric {
                 self.month_metric = metric;
             }
+            if let Some(scope) = new_scope {
+                self.analytics_scope = scope;
+                need_request = true;
+            }
             if show_more {
                 self.analytics_limit = 50;
-                self.start_search(false);
+                self.analytics_loaded = [false; 4];
+                need_request = true;
             }
             if let Some(action) = action {
                 self.apply_analytics_filter(action);
             }
         });
+        if need_request {
+            self.request_analytics();
+        }
     }
 
     fn ui_table(&mut self, root: &mut egui::Ui) {
@@ -1785,103 +1908,143 @@ fn kpi_tile(ui: &mut egui::Ui, label: &str, value: String, help: &str) {
     response.on_hover_text(help);
 }
 
-fn analytics_section_block(
+/// Cards of one analytics scope, laid out side by side so the whole scope
+/// fits on screen without endless scrolling.
+fn analytics_cards(
     ui: &mut egui::Ui,
-    title: &str,
-    hint: &str,
     sections: &[AnalyticsSection],
     lang: Lang,
 ) -> Option<AnalyticsFilterAction> {
-    ui.add_space(8.0);
-    ui.heading(egui::RichText::new(title).size(17.0));
-    ui.label(egui::RichText::new(hint).weak().small());
-    ui.add_space(6.0);
-
     let mut action = None;
-    for section in sections {
-        if section.rows.is_empty() {
-            continue;
-        }
-        ui.label(egui::RichText::new(section_title(section.kind, lang)).strong());
-        ui.add_space(3.0);
-        for row in &section.rows {
-            if let Some(next) = analytics_bar_row(ui, row, lang) {
-                action = Some(next);
-            }
-        }
-        ui.add_space(8.0);
+    let sections: Vec<&AnalyticsSection> =
+        sections.iter().filter(|s| !s.rows.is_empty()).collect();
+    if sections.is_empty() {
+        return None;
+    }
+    let gap = 10.0;
+    let avail = ui.available_width();
+    let per_row = if avail >= 960.0 {
+        3.min(sections.len())
+    } else if avail >= 640.0 {
+        2.min(sections.len())
+    } else {
+        1
+    };
+    let card_w = ((avail - gap * (per_row as f32 - 1.0)) / per_row as f32).max(260.0);
+    for chunk in sections.chunks(per_row) {
+        ui.with_layout(
+            egui::Layout::left_to_right(egui::Align::Min).with_main_align(egui::Align::Min),
+            |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+                for section in chunk {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(card_w, 10.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_min_width(card_w);
+                            ui.set_max_width(card_w);
+                            if let Some(next) = analytics_card(ui, section, lang) {
+                                action = Some(next);
+                            }
+                        },
+                    );
+                }
+            },
+        );
+        ui.add_space(gap);
     }
     action
 }
 
-fn analytics_bar_row(
+fn analytics_card(
+    ui: &mut egui::Ui,
+    section: &AnalyticsSection,
+    lang: Lang,
+) -> Option<AnalyticsFilterAction> {
+    let mut action = None;
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(section_title(section.kind, lang)).strong());
+            ui.add_space(4.0);
+            for row in &section.rows {
+                if let Some(next) = compact_bar_row(ui, row, lang) {
+                    action = Some(next);
+                }
+            }
+            let total_share: f64 = section.rows.iter().map(|r| r.share_percent).sum();
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(fmt(
+                    top_share_pattern(lang),
+                    &[
+                        &section.rows.len().to_string(),
+                        &fmt_decimal(total_share.min(100.0), 1),
+                    ],
+                ))
+                .weak()
+                .small(),
+            );
+        });
+    action
+}
+
+/// One compact clickable row: label, share bar, value and percentage.
+/// Full numbers are in the hover tooltip; click applies the filter.
+fn compact_bar_row(
     ui: &mut egui::Ui,
     row: &AnalyticsGroupRow,
     lang: Lang,
 ) -> Option<AnalyticsFilterAction> {
-    let width = ui.available_width().max(320.0);
-    let height = 48.0;
+    let width = ui.available_width();
+    let height = 24.0;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
     let visuals = ui.visuals();
-    let bg = visuals.faint_bg_color;
-    let stroke = visuals.widgets.noninteractive.bg_stroke;
-    let rounding = egui::CornerRadius::same(5);
-    ui.painter()
-        .rect(rect, rounding, bg, stroke, egui::StrokeKind::Inside);
-
+    let rounding = egui::CornerRadius::same(3);
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, rounding, visuals.widgets.hovered.weak_bg_fill);
+    }
     let share_width = (rect.width() * (row.share_percent as f32 / 100.0)).clamp(0.0, rect.width());
-    let share_rect = egui::Rect::from_min_size(rect.min, egui::vec2(share_width, rect.height()));
+    let share_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), rect.bottom() - 3.0),
+        egui::vec2(share_width, 3.0),
+    );
+    let bar_bg = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), rect.bottom() - 3.0),
+        egui::vec2(rect.width(), 3.0),
+    );
     let bar_color = if visuals.dark_mode {
-        egui::Color32::from_rgba_unmultiplied(80, 140, 255, 55)
+        egui::Color32::from_rgb(80, 140, 255)
     } else {
-        egui::Color32::from_rgba_unmultiplied(37, 99, 235, 42)
+        ACCENT
     };
+    ui.painter()
+        .rect_filled(bar_bg, rounding, visuals.faint_bg_color);
     ui.painter().rect_filled(share_rect, rounding, bar_color);
 
-    let text_color = visuals.text_color();
-    let weak = visuals.weak_text_color();
-    let label_font = egui::FontId::new(13.5, egui::FontFamily::Proportional);
-    let small_font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
-    let mono_font = egui::FontId::new(12.5, egui::FontFamily::Monospace);
-    let left = rect.left() + 9.0;
-    let right = rect.right() - 9.0;
-    let top = rect.top() + 7.0;
-    let bottom = rect.bottom() - 7.0;
+    let label_font = egui::FontId::new(12.5, egui::FontFamily::Proportional);
+    let mono_font = egui::FontId::new(11.5, egui::FontFamily::Monospace);
+    let right_text = format!(
+        "{} $ · {}%",
+        fmt_compact(row.total_value_usd),
+        fmt_decimal(row.share_percent, 1)
+    );
+    let right_w = right_text.chars().count() as f32 * 7.0;
     ui.painter().text(
-        egui::pos2(left, top),
-        egui::Align2::LEFT_TOP,
-        trunc_label(&row.label, 54),
+        egui::pos2(rect.left() + 2.0, rect.top() + 9.0),
+        egui::Align2::LEFT_CENTER,
+        trunc_label(&row.label, ((width - right_w - 12.0) / 6.8).max(8.0) as usize),
         label_font,
-        text_color,
+        visuals.text_color(),
     );
     ui.painter().text(
-        egui::pos2(right, top),
-        egui::Align2::RIGHT_TOP,
-        format!(
-            "{} $  |  {} kg",
-            fmt_decimal(row.total_value_usd, 2),
-            fmt_decimal(row.total_net_kg, 2)
-        ),
-        mono_font.clone(),
-        text_color,
-    );
-    ui.painter().text(
-        egui::pos2(left, bottom),
-        egui::Align2::LEFT_BOTTOM,
-        row_counts_label(row, lang),
-        small_font,
-        weak,
-    );
-    ui.painter().text(
-        egui::pos2(right, bottom),
-        egui::Align2::RIGHT_BOTTOM,
-        format!(
-            "{}%  |  {} $/kg",
-            fmt_decimal(row.share_percent, 1),
-            fmt_decimal(row.avg_value_per_net_kg, 2)
-        ),
+        egui::pos2(rect.right() - 2.0, rect.top() + 9.0),
+        egui::Align2::RIGHT_CENTER,
+        right_text,
         mono_font,
-        weak,
+        visuals.weak_text_color(),
     );
 
     let response = response.on_hover_text(row_hover_text(row, lang));
@@ -1892,24 +2055,15 @@ fn analytics_bar_row(
     }
 }
 
-fn price_section_block(
-    ui: &mut egui::Ui,
-    title: &str,
-    hint: &str,
-    metrics: &[AnalyticsPriceMetric],
-    lang: Lang,
-) {
-    ui.add_space(8.0);
-    ui.heading(egui::RichText::new(title).size(17.0));
-    ui.label(egui::RichText::new(hint).weak().small());
-    ui.add_space(6.0);
+fn price_table(ui: &mut egui::Ui, metrics: &[AnalyticsPriceMetric], lang: Lang) {
     egui::Grid::new("analytics_price_metrics")
-        .num_columns(5)
+        .num_columns(6)
         .striped(true)
         .spacing([14.0, 6.0])
         .show(ui, |ui| {
             ui.label(egui::RichText::new(price_header_metric(lang)).weak());
             ui.label(egui::RichText::new(price_header_avg(lang)).weak());
+            ui.label(egui::RichText::new(price_header_weighted(lang)).weak());
             ui.label(egui::RichText::new("min").weak());
             ui.label(egui::RichText::new("max").weak());
             ui.label(egui::RichText::new(price_header_count(lang)).weak());
@@ -1920,12 +2074,31 @@ fn price_section_block(
                 }
                 ui.label(price_metric_title(metric.kind, lang));
                 ui.label(egui::RichText::new(fmt_decimal(metric.average, 3)).monospace());
+                ui.label(
+                    egui::RichText::new(fmt_decimal(metric.weighted_average, 3)).monospace(),
+                );
                 ui.label(egui::RichText::new(fmt_decimal(metric.minimum, 3)).monospace());
                 ui.label(egui::RichText::new(fmt_decimal(metric.maximum, 3)).monospace());
                 ui.label(egui::RichText::new(group_digits(metric.count)).monospace());
                 ui.end_row();
             }
         });
+}
+
+fn price_header_weighted(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "сер. зважена",
+        Lang::Ru => "ср. взвешенная",
+        Lang::En => "weighted avg",
+    }
+}
+
+fn top_share_pattern(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Топ {} = {}% обсягу",
+        Lang::Ru => "Топ {} = {}% объёма",
+        Lang::En => "Top {} = {}% of volume",
+    }
 }
 
 fn section_title(kind: AnalyticsSectionKind, lang: Lang) -> &'static str {
@@ -1984,26 +2157,30 @@ fn row_counts_label(row: &AnalyticsGroupRow, lang: Lang) -> String {
 }
 
 fn row_hover_text(row: &AnalyticsGroupRow, lang: Lang) -> String {
+    let counts = row_counts_label(row, lang);
     match lang {
         Lang::Ua => format!(
-            "{}\nСума: {} $\nНетто: {} кг\nЧастка: {}%\nСередня ціна: {} $/кг\nНатисніть, щоб відфільтрувати результати.",
+            "{}\n{}\nСума: {} $\nНетто: {} кг\nЧастка: {}%\nСередня ціна: {} $/кг\nНатисніть, щоб відфільтрувати результати.",
             row.label,
+            counts,
             fmt_decimal(row.total_value_usd, 2),
             fmt_decimal(row.total_net_kg, 3),
             fmt_decimal(row.share_percent, 2),
             fmt_decimal(row.avg_value_per_net_kg, 2)
         ),
         Lang::Ru => format!(
-            "{}\nСумма: {} $\nНетто: {} кг\nДоля: {}%\nСредняя цена: {} $/кг\nНажмите, чтобы отфильтровать результаты.",
+            "{}\n{}\nСумма: {} $\nНетто: {} кг\nДоля: {}%\nСредняя цена: {} $/кг\nНажмите, чтобы отфильтровать результаты.",
             row.label,
+            counts,
             fmt_decimal(row.total_value_usd, 2),
             fmt_decimal(row.total_net_kg, 3),
             fmt_decimal(row.share_percent, 2),
             fmt_decimal(row.avg_value_per_net_kg, 2)
         ),
         Lang::En => format!(
-            "{}\nValue: {} $\nNet: {} kg\nShare: {}%\nAverage price: {} $/kg\nClick to filter results.",
+            "{}\n{}\nValue: {} $\nNet: {} kg\nShare: {}%\nAverage price: {} $/kg\nClick to filter results.",
             row.label,
+            counts,
             fmt_decimal(row.total_value_usd, 2),
             fmt_decimal(row.total_net_kg, 3),
             fmt_decimal(row.share_percent, 2),

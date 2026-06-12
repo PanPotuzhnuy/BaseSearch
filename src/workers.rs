@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
 
-use crate::db::{Analytics, Db, Query, analytics_should_run};
+use crate::db::{Analytics, AnalyticsScope, Db, Query, analytics_should_run};
 use crate::export::{self, ExportError};
 use crate::import::{self, FileSummary, ImportPhase};
 
@@ -15,8 +15,14 @@ pub enum WorkerReq {
         q: Box<Query>,
         page: u64,
         generation: u64,
-        include_analytics: bool,
-        analytics_limit: u64,
+    },
+    /// One analytics category for the current query; cheap enough to
+    /// request lazily as the user switches scope chips.
+    Analytics {
+        q: Box<Query>,
+        limit: u64,
+        scope: AnalyticsScope,
+        generation: u64,
     },
     Stats,
 }
@@ -37,12 +43,16 @@ pub enum Msg {
         ids: Vec<i64>,
         rows: Vec<Vec<String>>,
         total: u64,
-        analytics: Option<Box<Analytics>>,
         ms: u64,
     },
     SearchError {
         generation: u64,
         message: String,
+    },
+    AnalyticsDone {
+        generation: u64,
+        scope: AnalyticsScope,
+        analytics: Box<Analytics>,
     },
     Stats(u64),
     Import(ImportEvent),
@@ -78,8 +88,6 @@ pub fn spawn_search_worker(
                     q,
                     page,
                     generation,
-                    include_analytics,
-                    analytics_limit,
                 } => {
                     let started = Instant::now();
                     let total = match count_cache.as_ref().filter(|(cq, _)| cq == q.as_ref()) {
@@ -89,21 +97,38 @@ pub fn spawn_search_worker(
                     let result = total.and_then(|total| {
                         count_cache = Some(((*q).clone(), total));
                         let (ids, rows) = db.search_page(&q, PAGE_SIZE, page * PAGE_SIZE)?;
-                        let analytics = if include_analytics && analytics_should_run(&q) {
-                            Some(Box::new(db.analytics(&q, analytics_limit)?))
-                        } else {
-                            None
-                        };
-                        Ok((ids, rows, total, analytics))
+                        Ok((ids, rows, total))
                     });
                     let msg = match result {
-                        Ok((ids, rows, total, analytics)) => Msg::SearchDone {
+                        Ok((ids, rows, total)) => Msg::SearchDone {
                             generation,
                             ids,
                             rows,
                             total,
-                            analytics,
                             ms: started.elapsed().as_millis() as u64,
+                        },
+                        Err(e) => Msg::SearchError {
+                            generation,
+                            message: e.to_string(),
+                        },
+                    };
+                    let _ = tx.send(msg);
+                    ctx.request_repaint();
+                }
+                WorkerReq::Analytics {
+                    q,
+                    limit,
+                    scope,
+                    generation,
+                } => {
+                    if !analytics_should_run(&q) {
+                        continue;
+                    }
+                    let msg = match db.analytics_scoped(&q, limit, scope) {
+                        Ok(analytics) => Msg::AnalyticsDone {
+                            generation,
+                            scope,
+                            analytics: Box::new(analytics),
                         },
                         Err(e) => Msg::SearchError {
                             generation,

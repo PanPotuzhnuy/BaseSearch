@@ -159,6 +159,8 @@ pub struct Tr {
     pub version_label: &'static str,
     /// Selected rows count label.
     pub selected_n: &'static str,
+    /// "Период: {} — {} ({} мес.)"
+    pub period_of: &'static str,
     pub months_section: &'static str,
     pub months_hint: &'static str,
     pub metric_value: &'static str,
@@ -278,6 +280,7 @@ pub static UA: Tr = Tr {
     db_cleared: "Базу очищено",
     version_label: "Версія",
     selected_n: "вибрано: {}",
+    period_of: "Період: {} — {} ({} міс.)",
     months_section: "Динаміка за місяцями",
     months_hint: "Як змінювались обсяги за знайденими рядками від місяця до місяця. Наведіть на стовпчик, щоб побачити деталі.",
     metric_value: "Вартість, $",
@@ -397,6 +400,7 @@ pub static RU: Tr = Tr {
     db_cleared: "База очищена",
     version_label: "Версия",
     selected_n: "выбрано: {}",
+    period_of: "Период: {} — {} ({} мес.)",
     months_section: "Динамика по месяцам",
     months_hint: "Как менялись объёмы по найденным строкам от месяца к месяцу. Наведите на столбец, чтобы увидеть детали.",
     metric_value: "Стоимость, $",
@@ -516,6 +520,7 @@ pub static EN: Tr = Tr {
     db_cleared: "Database cleared",
     version_label: "Version",
     selected_n: "selected: {}",
+    period_of: "Period: {} — {} ({} mo.)",
     months_section: "Monthly dynamics",
     months_hint: "How volumes changed month to month for the matched rows. Hover a bar for details.",
     metric_value: "Value, $",

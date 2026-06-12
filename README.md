@@ -102,9 +102,9 @@ The top block, **Answer for current query**, shows the main numbers:
 - average value per net kilogram;
 - counts of product codes, trademarks, and countries.
 
-The lower sections are compact charts instead of overloaded dashboards:
+Everything below the tiles fits on one screen — no endless scrolling:
 
-| Section | What it answers |
+| Block | What it answers |
 |---|---|
 | Monthly dynamics | How value, rows, or net weight changed month to month: seasonality, spikes, when imports started or stopped. Switch the metric above the chart; hover a bar for the full numbers. |
 | Companies | Who received/imported, who sent, and which organization codes are most important. |
@@ -112,9 +112,13 @@ The lower sections are compact charts instead of overloaded dashboards:
 | Countries | Origin, dispatch, and trade countries for the matching shipments. |
 | Prices | Average, weighted, minimum, and maximum price indicators where source fields are filled. |
 
-Each row shows its share, value, weight, row count, declaration count, company
-count, and average value per kg. Clicking a row applies the matching filter back
-to the Results table.
+Companies, Goods, Countries, and Prices are switchable categories: only the
+active one is calculated, which keeps the tab fast even on very broad queries.
+A category is shown as side-by-side cards with compact share rows — each row
+shows its value and share, the full numbers (rows, declarations, companies,
+weight, average price) appear on hover, and clicking a row applies the matching
+filter back to the Results table. The period covered by the matching rows is
+shown above the tiles.
 
 To avoid heavy full-database grouping by accident, the Analytics tab asks for a
 search term or filter before running large calculations.
@@ -231,6 +235,12 @@ application executable.
   Linux (X11 and Wayland), and macOS. System fonts are picked per OS with a
   safe built-in fallback; the database location falls back to the home
   directory when the install folder is read-only.
+- **Analytics redesigned as a one-screen dashboard.** Companies, Goods,
+  Countries, and Prices became switchable categories with side-by-side
+  compact cards instead of one long scrolling list. Only the active category
+  is calculated — on broad queries the tab now responds several times faster.
+  Added a period summary, "top N = X% of volume" footers, and a
+  weighted-average column in the price table.
 - **Monthly dynamics chart.** The Analytics tab opens with a bar chart of the
   matched rows grouped by month, switchable between value ($), row count, and
   net weight, with hover details for every month.

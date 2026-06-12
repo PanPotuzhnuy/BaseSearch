@@ -171,6 +171,35 @@ pub struct AnalyticsPriceMetric {
     pub weighted_average: f64,
 }
 
+/// Analytics category computed independently, so the GUI can load only
+/// the visible one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnalyticsScope {
+    #[default]
+    Companies,
+    Products,
+    Countries,
+    Prices,
+}
+
+impl AnalyticsScope {
+    pub const ALL: [AnalyticsScope; 4] = [
+        AnalyticsScope::Companies,
+        AnalyticsScope::Products,
+        AnalyticsScope::Countries,
+        AnalyticsScope::Prices,
+    ];
+
+    pub fn index(self) -> usize {
+        match self {
+            AnalyticsScope::Companies => 0,
+            AnalyticsScope::Products => 1,
+            AnalyticsScope::Countries => 2,
+            AnalyticsScope::Prices => 3,
+        }
+    }
+}
+
 /// One month of import dynamics (chart data).
 #[derive(Clone, Debug, Default)]
 pub struct AnalyticsMonthRow {
@@ -606,7 +635,177 @@ impl Db {
 
     // ---------- analytics ----------
 
+    /// Full analytics across every scope (used by the CLI and tests).
+    /// The GUI requests one scope at a time via [`Db::analytics_scoped`],
+    /// which is several times cheaper on broad queries.
     pub fn analytics(&self, q: &Query, limit: u64) -> rusqlite::Result<Analytics> {
+        let mut analytics = self.analytics_scoped(q, limit, AnalyticsScope::Companies)?;
+        let products = self.analytics_scoped(q, limit, AnalyticsScope::Products)?;
+        let countries = self.analytics_scoped(q, limit, AnalyticsScope::Countries)?;
+        let prices = self.analytics_scoped(q, limit, AnalyticsScope::Prices)?;
+        analytics.product_sections = products.product_sections;
+        analytics.top_trademarks = products.top_trademarks;
+        analytics.top_product_codes = products.top_product_codes;
+        analytics.country_sections = countries.country_sections;
+        analytics.top_origin_countries = countries.top_origin_countries;
+        analytics.price_sections = prices.price_sections;
+        Ok(analytics)
+    }
+
+    /// Overview, monthly dynamics and the sections of a single scope.
+    pub fn analytics_scoped(
+        &self,
+        q: &Query,
+        limit: u64,
+        scope: AnalyticsScope,
+    ) -> rusqlite::Result<Analytics> {
+        let overview = self.analytics_overview(q)?;
+        let months = self.analytics_months(q)?;
+        let mut analytics = Analytics {
+            overview,
+            months,
+            ..Default::default()
+        };
+        let overview = &analytics.overview;
+        match scope {
+            AnalyticsScope::Companies => {
+                analytics.company_sections = vec![
+                    self.analytics_group(
+                        q,
+                        AnalyticsSectionKind::Recipients,
+                        "r.recipient",
+                        AnalyticsFilterField::Recipient,
+                        limit,
+                        overview,
+                    )?,
+                    self.analytics_group(
+                        q,
+                        AnalyticsSectionKind::Senders,
+                        "r.sender",
+                        AnalyticsFilterField::Sender,
+                        limit,
+                        overview,
+                    )?,
+                    self.analytics_group(
+                        q,
+                        AnalyticsSectionKind::Edrpou,
+                        "r.edrpou",
+                        AnalyticsFilterField::Edrpou,
+                        limit,
+                        overview,
+                    )?,
+                ];
+                analytics.top_recipients =
+                    section_rows(&analytics.company_sections, AnalyticsSectionKind::Recipients);
+                analytics.top_senders =
+                    section_rows(&analytics.company_sections, AnalyticsSectionKind::Senders);
+            }
+            AnalyticsScope::Products => {
+                analytics.product_sections = vec![
+                    self.analytics_group(
+                        q,
+                        AnalyticsSectionKind::ProductCodes,
+                        "r.product_code",
+                        AnalyticsFilterField::ProductCode,
+                        limit,
+                        overview,
+                    )?,
+                    self.analytics_group(
+                        q,
+                        AnalyticsSectionKind::Trademarks,
+                        "r.trademark",
+                        AnalyticsFilterField::Trademark,
+                        limit,
+                        overview,
+                    )?,
+                    self.analytics_group(
+                        q,
+                        AnalyticsSectionKind::ProductGroups,
+                        "SUBSTR(TRIM(r.description), 1, 80)",
+                        AnalyticsFilterField::Description,
+                        limit,
+                        overview,
+                    )?,
+                ];
+                analytics.top_trademarks =
+                    section_rows(&analytics.product_sections, AnalyticsSectionKind::Trademarks);
+                analytics.top_product_codes = section_rows(
+                    &analytics.product_sections,
+                    AnalyticsSectionKind::ProductCodes,
+                );
+            }
+            AnalyticsScope::Countries => {
+                analytics.country_sections = vec![
+                    self.analytics_group(
+                        q,
+                        AnalyticsSectionKind::OriginCountries,
+                        "r.origin_country",
+                        AnalyticsFilterField::OriginCountry,
+                        limit,
+                        overview,
+                    )?,
+                    self.analytics_group(
+                        q,
+                        AnalyticsSectionKind::DispatchCountries,
+                        "r.dispatch_country",
+                        AnalyticsFilterField::DispatchCountry,
+                        limit,
+                        overview,
+                    )?,
+                    self.analytics_group(
+                        q,
+                        AnalyticsSectionKind::TradeCountries,
+                        "r.trade_country",
+                        AnalyticsFilterField::TradeCountry,
+                        limit,
+                        overview,
+                    )?,
+                ];
+                analytics.top_origin_countries = section_rows(
+                    &analytics.country_sections,
+                    AnalyticsSectionKind::OriginCountries,
+                );
+            }
+            AnalyticsScope::Prices => {
+                analytics.price_sections = vec![
+                    self.price_metric(
+                        q,
+                        PriceMetricKind::ValuePerNetKg,
+                        "CASE
+                            WHEN num_value(r.currency_control_value) IS NOT NULL
+                                AND num_value(r.net_kg) IS NOT NULL
+                                AND num_value(r.net_kg) > 0
+                            THEN num_value(r.currency_control_value) / num_value(r.net_kg)
+                         END",
+                    )?,
+                    self.price_metric(q, PriceMetricKind::RfvUsdKg, "num_value(r.rfv_usd_kg)")?,
+                    self.price_metric(
+                        q,
+                        PriceMetricKind::RmvNetUsdKg,
+                        "num_value(r.rmv_net_usd_kg)",
+                    )?,
+                    self.price_metric(
+                        q,
+                        PriceMetricKind::RmvUsdExtraUnit,
+                        "num_value(r.rmv_usd_extra_unit)",
+                    )?,
+                    self.price_metric(
+                        q,
+                        PriceMetricKind::RmvGrossUsdKg,
+                        "num_value(r.rmv_gross_usd_kg)",
+                    )?,
+                    self.price_metric(
+                        q,
+                        PriceMetricKind::MinBaseUsdKg,
+                        "num_value(r.min_base_usd_kg)",
+                    )?,
+                ];
+            }
+        }
+        Ok(analytics)
+    }
+
+    fn analytics_overview(&self, q: &Query) -> rusqlite::Result<AnalyticsOverview> {
         let (joins, where_sql, params) = self.build_where(q);
         let sql = format!(
             "SELECT
@@ -647,143 +846,9 @@ impl Db {
                     avg_value_per_net_kg: 0.0,
                 })
             })?;
-        let overview = AnalyticsOverview {
+        Ok(AnalyticsOverview {
             avg_value_per_net_kg: ratio(overview.total_value_usd, overview.total_net_kg),
             ..overview
-        };
-
-        let company_sections = vec![
-            self.analytics_group(
-                q,
-                AnalyticsSectionKind::Recipients,
-                "r.recipient",
-                AnalyticsFilterField::Recipient,
-                limit,
-                &overview,
-            )?,
-            self.analytics_group(
-                q,
-                AnalyticsSectionKind::Senders,
-                "r.sender",
-                AnalyticsFilterField::Sender,
-                limit,
-                &overview,
-            )?,
-            self.analytics_group(
-                q,
-                AnalyticsSectionKind::Edrpou,
-                "r.edrpou",
-                AnalyticsFilterField::Edrpou,
-                limit,
-                &overview,
-            )?,
-        ];
-        let product_sections = vec![
-            self.analytics_group(
-                q,
-                AnalyticsSectionKind::ProductCodes,
-                "r.product_code",
-                AnalyticsFilterField::ProductCode,
-                limit,
-                &overview,
-            )?,
-            self.analytics_group(
-                q,
-                AnalyticsSectionKind::Trademarks,
-                "r.trademark",
-                AnalyticsFilterField::Trademark,
-                limit,
-                &overview,
-            )?,
-            self.analytics_group(
-                q,
-                AnalyticsSectionKind::ProductGroups,
-                "SUBSTR(TRIM(r.description), 1, 80)",
-                AnalyticsFilterField::Description,
-                limit,
-                &overview,
-            )?,
-        ];
-        let country_sections = vec![
-            self.analytics_group(
-                q,
-                AnalyticsSectionKind::OriginCountries,
-                "r.origin_country",
-                AnalyticsFilterField::OriginCountry,
-                limit,
-                &overview,
-            )?,
-            self.analytics_group(
-                q,
-                AnalyticsSectionKind::DispatchCountries,
-                "r.dispatch_country",
-                AnalyticsFilterField::DispatchCountry,
-                limit,
-                &overview,
-            )?,
-            self.analytics_group(
-                q,
-                AnalyticsSectionKind::TradeCountries,
-                "r.trade_country",
-                AnalyticsFilterField::TradeCountry,
-                limit,
-                &overview,
-            )?,
-        ];
-        let price_sections = vec![
-            self.price_metric(
-                q,
-                PriceMetricKind::ValuePerNetKg,
-                "CASE
-                    WHEN num_value(r.currency_control_value) IS NOT NULL
-                        AND num_value(r.net_kg) IS NOT NULL
-                        AND num_value(r.net_kg) > 0
-                    THEN num_value(r.currency_control_value) / num_value(r.net_kg)
-                 END",
-            )?,
-            self.price_metric(q, PriceMetricKind::RfvUsdKg, "num_value(r.rfv_usd_kg)")?,
-            self.price_metric(
-                q,
-                PriceMetricKind::RmvNetUsdKg,
-                "num_value(r.rmv_net_usd_kg)",
-            )?,
-            self.price_metric(
-                q,
-                PriceMetricKind::RmvUsdExtraUnit,
-                "num_value(r.rmv_usd_extra_unit)",
-            )?,
-            self.price_metric(
-                q,
-                PriceMetricKind::RmvGrossUsdKg,
-                "num_value(r.rmv_gross_usd_kg)",
-            )?,
-            self.price_metric(
-                q,
-                PriceMetricKind::MinBaseUsdKg,
-                "num_value(r.min_base_usd_kg)",
-            )?,
-        ];
-
-        let top_recipients = section_rows(&company_sections, AnalyticsSectionKind::Recipients);
-        let top_senders = section_rows(&company_sections, AnalyticsSectionKind::Senders);
-        let top_trademarks = section_rows(&product_sections, AnalyticsSectionKind::Trademarks);
-        let top_product_codes = section_rows(&product_sections, AnalyticsSectionKind::ProductCodes);
-        let top_origin_countries =
-            section_rows(&country_sections, AnalyticsSectionKind::OriginCountries);
-        let months = self.analytics_months(q)?;
-
-        Ok(Analytics {
-            overview,
-            months,
-            company_sections,
-            product_sections,
-            country_sections,
-            price_sections,
-            top_recipients,
-            top_senders,
-            top_trademarks,
-            top_product_codes,
-            top_origin_countries,
         })
     }
 
