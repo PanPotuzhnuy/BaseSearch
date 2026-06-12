@@ -6,7 +6,10 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use base_search::db::{Db, Filters, Query};
+use base_search::db::{
+    AnalyticsGroupRow, AnalyticsPriceMetric, AnalyticsSection, AnalyticsSectionKind, Db, Filters,
+    PriceMetricKind, Query,
+};
 use base_search::export;
 use base_search::import::{self, ImportPhase};
 use base_search::schema::RESULT_COLUMNS;
@@ -248,37 +251,109 @@ fn cmd_analytics(db_path: &Path, args: &[String]) -> Result<(), String> {
     let started = Instant::now();
     let analytics = db.analytics(&q, 10).map_err(|e| e.to_string())?;
     println!(
-        "Строк: {}  отправителей: {}  получателей: {}  торговых марок: {}",
+        "Rows: {}  declarations: {}  recipients: {}  senders: {}  EDRPOU: {}",
         analytics.overview.row_count,
-        analytics.overview.distinct_senders,
+        analytics.overview.declaration_count,
         analytics.overview.distinct_recipients,
-        analytics.overview.distinct_trademarks
+        analytics.overview.distinct_senders,
+        analytics.overview.distinct_edrpou
     );
     println!(
-        "Сумма: {:.2} $  брутто: {:.3} кг  нетто: {:.3} кг  количество: {:.3}",
+        "Value: {:.2} $  net: {:.3} kg  gross: {:.3} kg  avg: {:.2} $/kg  quantity: {:.3}",
         analytics.overview.total_value_usd,
-        analytics.overview.total_gross_kg,
         analytics.overview.total_net_kg,
+        analytics.overview.total_gross_kg,
+        analytics.overview.avg_value_per_net_kg,
         analytics.overview.total_quantity
     );
-    print_group("Топ получателей", &analytics.top_recipients);
-    print_group("Топ отправителей", &analytics.top_senders);
-    print_group("Топ торговых марок", &analytics.top_trademarks);
-    print_group("Топ кодов товара", &analytics.top_product_codes);
-    println!("Готово за {} мс", started.elapsed().as_millis());
+    println!(
+        "Product codes: {}  trademarks: {}  origin countries: {}  dispatch countries: {}  trade countries: {}",
+        analytics.overview.distinct_product_codes,
+        analytics.overview.distinct_trademarks,
+        analytics.overview.distinct_origin_countries,
+        analytics.overview.distinct_dispatch_countries,
+        analytics.overview.distinct_trade_countries
+    );
+    print_sections("Companies", &analytics.company_sections);
+    print_sections("Goods", &analytics.product_sections);
+    print_sections("Countries", &analytics.country_sections);
+    print_prices(&analytics.price_sections);
+    println!("Done in {} ms", started.elapsed().as_millis());
     Ok(())
 }
 
-fn print_group(title: &str, rows: &[base_search::db::AnalyticsGroupRow]) {
+fn print_sections(group: &str, sections: &[AnalyticsSection]) {
+    for section in sections {
+        if section.rows.is_empty() {
+            continue;
+        }
+        println!("\n{group} / {}:", analytics_section_title(section.kind));
+        print_group(&section.rows);
+    }
+}
+
+fn print_group(rows: &[AnalyticsGroupRow]) {
     if rows.is_empty() {
         return;
     }
-    println!("\n{title}:");
     for row in rows {
         println!(
-            "  {} | строк {} | {:.2} $ | нетто {:.3} кг",
-            row.label, row.rows, row.total_value_usd, row.total_net_kg
+            "  {} | rows {} | decl {} | companies {} | share {:.1}% | {:.2} $ | net {:.3} kg | {:.2} $/kg",
+            row.label,
+            row.rows,
+            row.declarations,
+            row.companies,
+            row.share_percent,
+            row.total_value_usd,
+            row.total_net_kg,
+            row.avg_value_per_net_kg
         );
+    }
+}
+
+fn print_prices(metrics: &[AnalyticsPriceMetric]) {
+    if metrics.is_empty() {
+        return;
+    }
+    println!("\nPrices:");
+    for metric in metrics {
+        if metric.count == 0 {
+            continue;
+        }
+        println!(
+            "  {} | values {} | avg {:.4} | weighted {:.4} | min {:.4} | max {:.4}",
+            price_metric_title(metric.kind),
+            metric.count,
+            metric.average,
+            metric.weighted_average,
+            metric.minimum,
+            metric.maximum
+        );
+    }
+}
+
+fn analytics_section_title(kind: AnalyticsSectionKind) -> &'static str {
+    match kind {
+        AnalyticsSectionKind::Recipients => "Recipients / who received",
+        AnalyticsSectionKind::Senders => "Senders",
+        AnalyticsSectionKind::Edrpou => "EDRPOU",
+        AnalyticsSectionKind::ProductCodes => "Product codes",
+        AnalyticsSectionKind::Trademarks => "Trademarks",
+        AnalyticsSectionKind::ProductGroups => "Description groups",
+        AnalyticsSectionKind::OriginCountries => "Origin countries",
+        AnalyticsSectionKind::DispatchCountries => "Dispatch countries",
+        AnalyticsSectionKind::TradeCountries => "Trade countries",
+    }
+}
+
+fn price_metric_title(kind: PriceMetricKind) -> &'static str {
+    match kind {
+        PriceMetricKind::ValuePerNetKg => "Value / net kg",
+        PriceMetricKind::RfvUsdKg => "RFV $/kg",
+        PriceMetricKind::RmvNetUsdKg => "RMV net $/kg",
+        PriceMetricKind::RmvUsdExtraUnit => "RMV extra unit",
+        PriceMetricKind::RmvGrossUsdKg => "RMV gross $/kg",
+        PriceMetricKind::MinBaseUsdKg => "Minimum base $/kg",
     }
 }
 

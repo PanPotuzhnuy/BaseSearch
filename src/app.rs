@@ -9,7 +9,11 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use egui_extras::{Column, TableBuilder};
 
-use crate::db::{Analytics, AnalyticsGroupRow, Db, Filters, Query, RecordCard};
+use crate::db::{
+    Analytics, AnalyticsFilterAction, AnalyticsFilterField, AnalyticsGroupRow,
+    AnalyticsMonthRow, AnalyticsPriceMetric, AnalyticsSection, AnalyticsSectionKind, Db, Filters,
+    PriceMetricKind, Query, RecordCard,
+};
 use crate::export::ExportError;
 use crate::i18n::{Lang, Tr, fmt, group_digits, tr};
 use crate::import::{FileSummary, ImportPhase};
@@ -44,6 +48,31 @@ enum CellKind {
     Code,
     /// Numbers: monospace and right-aligned.
     Number,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppTab {
+    Results,
+    Analytics,
+}
+
+/// Metric displayed in the monthly dynamics chart.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum MonthMetric {
+    #[default]
+    Value,
+    Rows,
+    NetWeight,
+}
+
+impl MonthMetric {
+    fn of(self, row: &AnalyticsMonthRow) -> f64 {
+        match self {
+            MonthMetric::Value => row.total_value_usd,
+            MonthMetric::Rows => row.rows as f64,
+            MonthMetric::NetWeight => row.total_net_kg,
+        }
+    }
 }
 
 /// Result column width and visual style.
@@ -94,12 +123,23 @@ fn trunc_label(s: &str, max: usize) -> String {
     out
 }
 
+/// Database location: a `data` folder beside the executable (a portable
+/// install) or, when that location is not writable (e.g. /usr/bin on Linux
+/// or /Applications on macOS), a folder in the user's home directory.
 pub fn default_db_path() -> PathBuf {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
-    exe_dir.join("data").join("base_search.db")
+    let portable = exe_dir.join("data");
+    if std::fs::create_dir_all(&portable).is_ok() {
+        return portable.join("base_search.db");
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".base-search").join("base_search.db")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -137,7 +177,9 @@ pub struct App {
     rows: Vec<Vec<String>>,
     row_ids: Vec<i64>,
     analytics: Option<Analytics>,
-    show_analytics: bool,
+    active_tab: AppTab,
+    analytics_limit: u64,
+    month_metric: MonthMetric,
     selected: HashSet<usize>,
     select_anchor: Option<usize>,
     visible_cols: Vec<bool>,
@@ -218,7 +260,9 @@ impl App {
             rows: Vec::new(),
             row_ids: Vec::new(),
             analytics: None,
-            show_analytics: false,
+            active_tab: AppTab::Results,
+            analytics_limit: 10,
+            month_metric: MonthMetric::default(),
             selected: HashSet::new(),
             select_anchor: None,
             visible_cols,
@@ -291,14 +335,15 @@ impl App {
         };
         self.search_gen += 1;
         self.search_in_flight = true;
-        if self.show_analytics {
+        if self.active_tab == AppTab::Analytics {
             self.analytics = None;
         }
         let _ = self.search_tx.send(WorkerReq::Search {
             q: Box::new(self.active_query.clone()),
             page: self.page,
             generation: self.search_gen,
-            include_analytics: self.show_analytics,
+            include_analytics: self.active_tab == AppTab::Analytics,
+            analytics_limit: self.analytics_limit,
         });
     }
 
@@ -311,6 +356,7 @@ impl App {
             page,
             generation: self.search_gen,
             include_analytics: false,
+            analytics_limit: self.analytics_limit,
         });
     }
 
@@ -337,7 +383,9 @@ impl App {
                         self.total = Some(total);
                         if let Some(analytics) = analytics {
                             self.analytics = Some(*analytics);
-                        } else if !self.show_analytics || self.active_query.is_empty() {
+                        } else if self.active_tab != AppTab::Analytics
+                            || self.active_query.is_empty()
+                        {
                             self.analytics = None;
                         }
                         self.last_search_ms = Some(ms);
@@ -591,6 +639,23 @@ impl App {
         }
     }
 
+    fn apply_analytics_filter(&mut self, action: AnalyticsFilterAction) {
+        match action.field {
+            AnalyticsFilterField::Recipient => self.filters.recipient = action.value,
+            AnalyticsFilterField::Sender => self.filters.sender = action.value,
+            AnalyticsFilterField::Edrpou => self.filters.edrpou = action.value,
+            AnalyticsFilterField::ProductCode => self.filters.product_code = action.value,
+            AnalyticsFilterField::OriginCountry => self.filters.origin_country = action.value,
+            AnalyticsFilterField::DispatchCountry => self.filters.dispatch_country = action.value,
+            AnalyticsFilterField::TradeCountry => self.filters.trade_country = action.value,
+            AnalyticsFilterField::Trademark | AnalyticsFilterField::Description => {
+                self.query_text = action.value;
+            }
+        }
+        self.active_tab = AppTab::Results;
+        self.start_search(true);
+    }
+
     // ---------- panels ----------
 
     fn ui_toolbar(&mut self, root: &mut egui::Ui) {
@@ -599,7 +664,7 @@ impl App {
         let mut do_search = false;
         let mut do_import = false;
         let mut do_export = false;
-        let mut analytics_toggled = false;
+        let mut switched_to_analytics = false;
         let frame = egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin {
             left: 12,
             right: 12,
@@ -638,6 +703,20 @@ impl App {
                         do_export = true;
                     }
                     ui.separator();
+                    if ui
+                        .selectable_label(self.active_tab == AppTab::Results, t.results_tab)
+                        .clicked()
+                    {
+                        self.active_tab = AppTab::Results;
+                    }
+                    if ui
+                        .selectable_label(self.active_tab == AppTab::Analytics, t.analytics)
+                        .clicked()
+                    {
+                        switched_to_analytics = self.active_tab != AppTab::Analytics;
+                        self.active_tab = AppTab::Analytics;
+                    }
+                    ui.separator();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.menu_button(t.columns_btn, |ui| {
                             for (i, name) in RESULT_COLUMNS.iter().enumerate() {
@@ -652,14 +731,6 @@ impl App {
                                 }
                             }
                         });
-                        let analytics_btn = ui.selectable_label(self.show_analytics, t.analytics);
-                        if analytics_btn.clicked() {
-                            self.show_analytics = !self.show_analytics;
-                            analytics_toggled = true;
-                            if !self.show_analytics {
-                                self.analytics = None;
-                            }
-                        }
                         let filters_btn = ui.selectable_label(self.show_filters, t.filters);
                         if filters_btn.clicked() {
                             self.show_filters = !self.show_filters;
@@ -691,7 +762,7 @@ impl App {
             });
         if do_search {
             self.start_search(true);
-        } else if analytics_toggled && self.show_analytics {
+        } else if switched_to_analytics {
             self.start_search(false);
         }
         if do_import {
@@ -923,98 +994,174 @@ impl App {
         }
     }
 
-    fn ui_analytics_panel(&mut self, root: &mut egui::Ui) {
-        if !self.show_analytics {
-            return;
-        }
-        egui::Panel::right("analytics_panel")
-            .resizable(true)
-            .default_size(380.0)
-            .size_range(300.0..=560.0)
-            .show_inside(root, |ui| {
-                let t = self.t();
-                ui.horizontal(|ui| {
+    fn ui_analytics_view(&mut self, root: &mut egui::Ui) {
+        egui::CentralPanel::default().show_inside(root, |ui| {
+            let t = self.t();
+            if self.active_query.is_empty() {
+                ui.add_space((ui.available_height() * 0.30).max(0.0));
+                ui.vertical_centered(|ui| {
                     ui.heading(t.analytics);
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(t.analytics_hint).weak());
+                });
+                return;
+            }
+
+            let Some(analytics) = &self.analytics else {
+                ui.add_space((ui.available_height() * 0.30).max(0.0));
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(8.0);
+                    ui.label(t.searching);
+                });
+                return;
+            };
+
+            let mut action: Option<AnalyticsFilterAction> = None;
+            let mut show_more = false;
+            let mut new_metric: Option<MonthMetric> = None;
+            let month_metric = self.month_metric;
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading(t.analytics_answer);
                     if self.search_in_flight {
                         ui.spinner();
                     }
-                });
-                ui.separator();
-
-                if self.active_query.is_empty() {
-                    ui.label(egui::RichText::new(t.analytics_hint).weak());
-                    return;
-                }
-
-                let Some(analytics) = &self.analytics else {
-                    ui.add_space(16.0);
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(t.searching);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let shown = self.analytics_limit.min(50);
+                        ui.label(
+                            egui::RichText::new(fmt(t.showing_top, &[&shown.to_string()])).weak(),
+                        );
+                        if self.analytics_limit < 50 && ui.button(t.show_more).clicked() {
+                            show_more = true;
+                        }
                     });
-                    return;
-                };
+                });
+                ui.add_space(3.0);
+                ui.label(egui::RichText::new(t.analytics_scope_note).weak().small());
+                ui.add_space(10.0);
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    egui::Grid::new("analytics_overview")
-                        .num_columns(2)
-                        .striped(true)
-                        .spacing([16.0, 7.0])
-                        .show(ui, |ui| {
-                            metric(ui, t.rows_label, group_digits(analytics.overview.row_count));
-                            metric(
-                                ui,
-                                t.unique_senders,
-                                group_digits(analytics.overview.distinct_senders),
-                            );
-                            metric(
-                                ui,
-                                t.unique_recipients,
-                                group_digits(analytics.overview.distinct_recipients),
-                            );
-                            metric(
-                                ui,
-                                t.unique_edrpou,
-                                group_digits(analytics.overview.distinct_edrpou),
-                            );
-                            metric(
-                                ui,
-                                t.unique_trademarks,
-                                group_digits(analytics.overview.distinct_trademarks),
-                            );
-                            metric(
-                                ui,
-                                t.total_value,
-                                format!("{} $", fmt_decimal(analytics.overview.total_value_usd, 2)),
-                            );
-                            metric(
-                                ui,
-                                t.gross_weight,
-                                fmt_decimal(analytics.overview.total_gross_kg, 3),
-                            );
-                            metric(
-                                ui,
-                                t.net_weight,
-                                fmt_decimal(analytics.overview.total_net_kg, 3),
-                            );
-                            metric(
-                                ui,
-                                t.quantity,
-                                fmt_decimal(analytics.overview.total_quantity, 3),
-                            );
-                        });
-
-                    analytics_group_table(ui, t.top_recipients, &analytics.top_recipients);
-                    analytics_group_table(ui, t.top_senders, &analytics.top_senders);
-                    analytics_group_table(ui, t.top_trademarks, &analytics.top_trademarks);
-                    analytics_group_table(ui, t.top_product_codes, &analytics.top_product_codes);
-                    analytics_group_table(
+                ui.horizontal_wrapped(|ui| {
+                    kpi_tile(
                         ui,
-                        t.top_origin_countries,
-                        &analytics.top_origin_countries,
+                        t.rows_label,
+                        group_digits(analytics.overview.row_count),
+                        t.rows_help,
+                    );
+                    kpi_tile(
+                        ui,
+                        t.declarations_label,
+                        group_digits(analytics.overview.declaration_count),
+                        t.declarations_help,
+                    );
+                    kpi_tile(
+                        ui,
+                        t.recipients_label,
+                        group_digits(analytics.overview.distinct_recipients),
+                        t.recipients_help,
+                    );
+                    kpi_tile(
+                        ui,
+                        t.total_value,
+                        format!("{} $", fmt_decimal(analytics.overview.total_value_usd, 2)),
+                        t.total_value_help,
+                    );
+                    kpi_tile(
+                        ui,
+                        t.net_weight,
+                        format!("{} kg", fmt_decimal(analytics.overview.total_net_kg, 3)),
+                        t.net_weight_help,
+                    );
+                    kpi_tile(
+                        ui,
+                        t.avg_value_kg,
+                        format!(
+                            "{} $/kg",
+                            fmt_decimal(analytics.overview.avg_value_per_net_kg, 2)
+                        ),
+                        t.avg_value_kg_help,
+                    );
+                    kpi_tile(
+                        ui,
+                        t.product_codes_count,
+                        group_digits(analytics.overview.distinct_product_codes),
+                        t.product_codes_help,
+                    );
+                    kpi_tile(
+                        ui,
+                        t.countries_count,
+                        group_digits(analytics.overview.distinct_origin_countries),
+                        t.countries_help,
                     );
                 });
+
+                ui.add_space(14.0);
+                if !analytics.months.is_empty() {
+                    ui.heading(egui::RichText::new(t.months_section).size(17.0));
+                    ui.label(egui::RichText::new(t.months_hint).weak().small());
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        for (metric, label) in [
+                            (MonthMetric::Value, t.metric_value),
+                            (MonthMetric::Rows, t.metric_rows),
+                            (MonthMetric::NetWeight, t.metric_weight),
+                        ] {
+                            if ui.selectable_label(month_metric == metric, label).clicked() {
+                                new_metric = Some(metric);
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                    months_chart(ui, &analytics.months, month_metric, self.lang);
+                    ui.add_space(14.0);
+                }
+                if let Some(next) = analytics_section_block(
+                    ui,
+                    t.companies_section,
+                    t.companies_section_hint,
+                    &analytics.company_sections,
+                    self.lang,
+                ) {
+                    action = Some(next);
+                }
+                if let Some(next) = analytics_section_block(
+                    ui,
+                    t.products_section,
+                    t.products_section_hint,
+                    &analytics.product_sections,
+                    self.lang,
+                ) {
+                    action = Some(next);
+                }
+                if let Some(next) = analytics_section_block(
+                    ui,
+                    t.countries_section,
+                    t.countries_section_hint,
+                    &analytics.country_sections,
+                    self.lang,
+                ) {
+                    action = Some(next);
+                }
+                price_section_block(
+                    ui,
+                    t.prices_section,
+                    t.prices_section_hint,
+                    &analytics.price_sections,
+                    self.lang,
+                );
             });
+
+            if let Some(metric) = new_metric {
+                self.month_metric = metric;
+            }
+            if show_more {
+                self.analytics_limit = 50;
+                self.start_search(false);
+            }
+            if let Some(action) = action {
+                self.apply_analytics_filter(action);
+            }
+        });
     }
 
     fn ui_table(&mut self, root: &mut egui::Ui) {
@@ -1457,8 +1604,10 @@ impl eframe::App for App {
         }
         self.ui_toolbar(root);
         self.ui_status_bar(root);
-        self.ui_analytics_panel(root);
-        self.ui_table(root);
+        match self.active_tab {
+            AppTab::Results => self.ui_table(root),
+            AppTab::Analytics => self.ui_analytics_view(root),
+        }
         self.ui_card_window(&ctx);
         self.ui_import_report(&ctx);
         self.ui_settings_window(&ctx);
@@ -1470,46 +1619,444 @@ impl eframe::App for App {
     }
 }
 
-fn metric(ui: &mut egui::Ui, label: &str, value: String) {
-    ui.label(egui::RichText::new(label).weak());
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.label(egui::RichText::new(value).strong().monospace());
-    });
-    ui.end_row();
+/// Bar chart of monthly dynamics. Bars are drawn with the painter;
+/// hovering a bar shows the full numbers for that month.
+fn months_chart(ui: &mut egui::Ui, months: &[AnalyticsMonthRow], metric: MonthMetric, lang: Lang) {
+    let height = 190.0;
+    let width = ui.available_width().max(320.0);
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let visuals = ui.visuals();
+    let rounding = egui::CornerRadius::same(5);
+    ui.painter().rect(
+        rect,
+        rounding,
+        visuals.faint_bg_color,
+        visuals.widgets.noninteractive.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+
+    let max_value = months
+        .iter()
+        .map(|m| metric.of(m))
+        .fold(0.0_f64, f64::max)
+        .max(f64::EPSILON);
+    let label_h = 18.0;
+    let pad = 10.0;
+    let plot = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + pad, rect.top() + pad),
+        egui::pos2(rect.right() - pad, rect.bottom() - pad - label_h),
+    );
+
+    // Horizontal grid: quarter lines with weak value captions.
+    let grid_font = egui::FontId::new(10.5, egui::FontFamily::Monospace);
+    let grid_color = visuals.weak_text_color().gamma_multiply(0.5);
+    for step in 1..=3 {
+        let frac = step as f32 / 4.0;
+        let y = plot.bottom() - plot.height() * frac;
+        ui.painter().hline(
+            plot.x_range(),
+            y,
+            egui::Stroke::new(0.5, grid_color.gamma_multiply(0.6)),
+        );
+        ui.painter().text(
+            egui::pos2(plot.left(), y - 1.0),
+            egui::Align2::LEFT_BOTTOM,
+            fmt_compact(max_value * frac as f64),
+            grid_font.clone(),
+            grid_color,
+        );
+    }
+
+    let n = months.len().max(1);
+    let slot = plot.width() / n as f32;
+    let bar_w = (slot * 0.72).clamp(3.0, 64.0);
+    let hover_x = response.hover_pos().map(|p| p.x);
+    let mut hovered: Option<usize> = None;
+
+    let bar_color = if visuals.dark_mode {
+        egui::Color32::from_rgb(80, 140, 255)
+    } else {
+        ACCENT
+    };
+    let month_font = egui::FontId::new(10.5, egui::FontFamily::Monospace);
+    let value_font = egui::FontId::new(10.5, egui::FontFamily::Monospace);
+    // Подписи месяцев прореживаются, чтобы не слипались.
+    let label_every = ((42.0 / slot).ceil() as usize).max(1);
+
+    for (i, month) in months.iter().enumerate() {
+        let cx = plot.left() + slot * (i as f32 + 0.5);
+        let value = metric.of(month);
+        let bar_h = (plot.height() * (value / max_value) as f32).max(1.5);
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(cx - bar_w / 2.0, plot.bottom() - bar_h),
+            egui::pos2(cx + bar_w / 2.0, plot.bottom()),
+        );
+        let is_hovered = hover_x
+            .map(|x| (x - cx).abs() <= slot / 2.0)
+            .unwrap_or(false);
+        if is_hovered {
+            hovered = Some(i);
+        }
+        let color = if is_hovered {
+            bar_color
+        } else {
+            bar_color.gamma_multiply(0.62)
+        };
+        ui.painter()
+            .rect_filled(bar, egui::CornerRadius::same(2), color);
+        if i % label_every == 0 {
+            ui.painter().text(
+                egui::pos2(cx, rect.bottom() - 4.0),
+                egui::Align2::CENTER_BOTTOM,
+                short_month(&month.month),
+                month_font.clone(),
+                visuals.weak_text_color(),
+            );
+        }
+        // Значение над столбцом, когда место позволяет.
+        if slot >= 46.0 && value > 0.0 {
+            ui.painter().text(
+                egui::pos2(cx, bar.top() - 2.0),
+                egui::Align2::CENTER_BOTTOM,
+                fmt_compact(value),
+                value_font.clone(),
+                visuals.weak_text_color(),
+            );
+        }
+    }
+
+    if let Some(i) = hovered {
+        let month = &months[i];
+        let (rows_l, decls_l, value_l, weight_l) = match lang {
+            Lang::Ua => ("рядків", "декларацій", "вартість", "вага нетто"),
+            Lang::Ru => ("строк", "деклараций", "стоимость", "вес нетто"),
+            Lang::En => ("rows", "declarations", "value", "net weight"),
+        };
+        response.on_hover_text(format!(
+            "{}\n{}: {}\n{}: {}\n{}: {} $\n{}: {} kg",
+            month.month,
+            rows_l,
+            group_digits(month.rows),
+            decls_l,
+            group_digits(month.declarations),
+            value_l,
+            fmt_decimal(month.total_value_usd, 0),
+            weight_l,
+            fmt_decimal(month.total_net_kg, 0),
+        ));
+    }
 }
 
-fn analytics_group_table(ui: &mut egui::Ui, title: &str, rows: &[AnalyticsGroupRow]) {
-    ui.add_space(14.0);
-    ui.label(egui::RichText::new(title).strong());
-    ui.add_space(3.0);
-    if rows.is_empty() {
-        ui.label(egui::RichText::new("\u{2014}").weak());
-        return;
+/// "2024-03" -> "03'24"
+fn short_month(month: &str) -> String {
+    match (month.get(0..4), month.get(5..7)) {
+        (Some(year), Some(m)) => format!("{m}'{}", &year[2..]),
+        _ => month.to_string(),
     }
-    egui::Grid::new(("analytics_group", title))
-        .num_columns(3)
-        .striped(true)
-        .spacing([10.0, 5.0])
+}
+
+/// Compact number for chart captions: 12.4M, 980K, 312.
+fn fmt_compact(value: f64) -> String {
+    let abs = value.abs();
+    if abs >= 1.0e9 {
+        format!("{:.1}B", value / 1.0e9)
+    } else if abs >= 1.0e6 {
+        format!("{:.1}M", value / 1.0e6)
+    } else if abs >= 1.0e4 {
+        format!("{:.0}K", value / 1.0e3)
+    } else if abs >= 100.0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+fn kpi_tile(ui: &mut egui::Ui, label: &str, value: String, help: &str) {
+    let frame = egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(8));
+    let response = frame
         .show(ui, |ui| {
-            for row in rows {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(&row.label))
-                        .truncate()
-                        .selectable(false),
-                )
-                .on_hover_text(&row.label);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(group_digits(row.rows)).monospace());
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{} $", fmt_decimal(row.total_value_usd, 2)))
-                            .monospace(),
-                    );
-                });
+            ui.set_min_width(146.0);
+            ui.label(egui::RichText::new(label).weak().small());
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(value).strong().monospace().size(16.0));
+        })
+        .response;
+    response.on_hover_text(help);
+}
+
+fn analytics_section_block(
+    ui: &mut egui::Ui,
+    title: &str,
+    hint: &str,
+    sections: &[AnalyticsSection],
+    lang: Lang,
+) -> Option<AnalyticsFilterAction> {
+    ui.add_space(8.0);
+    ui.heading(egui::RichText::new(title).size(17.0));
+    ui.label(egui::RichText::new(hint).weak().small());
+    ui.add_space(6.0);
+
+    let mut action = None;
+    for section in sections {
+        if section.rows.is_empty() {
+            continue;
+        }
+        ui.label(egui::RichText::new(section_title(section.kind, lang)).strong());
+        ui.add_space(3.0);
+        for row in &section.rows {
+            if let Some(next) = analytics_bar_row(ui, row, lang) {
+                action = Some(next);
+            }
+        }
+        ui.add_space(8.0);
+    }
+    action
+}
+
+fn analytics_bar_row(
+    ui: &mut egui::Ui,
+    row: &AnalyticsGroupRow,
+    lang: Lang,
+) -> Option<AnalyticsFilterAction> {
+    let width = ui.available_width().max(320.0);
+    let height = 48.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let visuals = ui.visuals();
+    let bg = visuals.faint_bg_color;
+    let stroke = visuals.widgets.noninteractive.bg_stroke;
+    let rounding = egui::CornerRadius::same(5);
+    ui.painter()
+        .rect(rect, rounding, bg, stroke, egui::StrokeKind::Inside);
+
+    let share_width = (rect.width() * (row.share_percent as f32 / 100.0)).clamp(0.0, rect.width());
+    let share_rect = egui::Rect::from_min_size(rect.min, egui::vec2(share_width, rect.height()));
+    let bar_color = if visuals.dark_mode {
+        egui::Color32::from_rgba_unmultiplied(80, 140, 255, 55)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(37, 99, 235, 42)
+    };
+    ui.painter().rect_filled(share_rect, rounding, bar_color);
+
+    let text_color = visuals.text_color();
+    let weak = visuals.weak_text_color();
+    let label_font = egui::FontId::new(13.5, egui::FontFamily::Proportional);
+    let small_font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+    let mono_font = egui::FontId::new(12.5, egui::FontFamily::Monospace);
+    let left = rect.left() + 9.0;
+    let right = rect.right() - 9.0;
+    let top = rect.top() + 7.0;
+    let bottom = rect.bottom() - 7.0;
+    ui.painter().text(
+        egui::pos2(left, top),
+        egui::Align2::LEFT_TOP,
+        trunc_label(&row.label, 54),
+        label_font,
+        text_color,
+    );
+    ui.painter().text(
+        egui::pos2(right, top),
+        egui::Align2::RIGHT_TOP,
+        format!(
+            "{} $  |  {} kg",
+            fmt_decimal(row.total_value_usd, 2),
+            fmt_decimal(row.total_net_kg, 2)
+        ),
+        mono_font.clone(),
+        text_color,
+    );
+    ui.painter().text(
+        egui::pos2(left, bottom),
+        egui::Align2::LEFT_BOTTOM,
+        row_counts_label(row, lang),
+        small_font,
+        weak,
+    );
+    ui.painter().text(
+        egui::pos2(right, bottom),
+        egui::Align2::RIGHT_BOTTOM,
+        format!(
+            "{}%  |  {} $/kg",
+            fmt_decimal(row.share_percent, 1),
+            fmt_decimal(row.avg_value_per_net_kg, 2)
+        ),
+        mono_font,
+        weak,
+    );
+
+    let response = response.on_hover_text(row_hover_text(row, lang));
+    if response.clicked() {
+        row.filter_action.clone()
+    } else {
+        None
+    }
+}
+
+fn price_section_block(
+    ui: &mut egui::Ui,
+    title: &str,
+    hint: &str,
+    metrics: &[AnalyticsPriceMetric],
+    lang: Lang,
+) {
+    ui.add_space(8.0);
+    ui.heading(egui::RichText::new(title).size(17.0));
+    ui.label(egui::RichText::new(hint).weak().small());
+    ui.add_space(6.0);
+    egui::Grid::new("analytics_price_metrics")
+        .num_columns(5)
+        .striped(true)
+        .spacing([14.0, 6.0])
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(price_header_metric(lang)).weak());
+            ui.label(egui::RichText::new(price_header_avg(lang)).weak());
+            ui.label(egui::RichText::new("min").weak());
+            ui.label(egui::RichText::new("max").weak());
+            ui.label(egui::RichText::new(price_header_count(lang)).weak());
+            ui.end_row();
+            for metric in metrics {
+                if metric.count == 0 {
+                    continue;
+                }
+                ui.label(price_metric_title(metric.kind, lang));
+                ui.label(egui::RichText::new(fmt_decimal(metric.average, 3)).monospace());
+                ui.label(egui::RichText::new(fmt_decimal(metric.minimum, 3)).monospace());
+                ui.label(egui::RichText::new(fmt_decimal(metric.maximum, 3)).monospace());
+                ui.label(egui::RichText::new(group_digits(metric.count)).monospace());
                 ui.end_row();
             }
         });
+}
+
+fn section_title(kind: AnalyticsSectionKind, lang: Lang) -> &'static str {
+    match (kind, lang) {
+        (AnalyticsSectionKind::Recipients, Lang::Ua) => "Одержувачі / хто ввозив",
+        (AnalyticsSectionKind::Recipients, Lang::Ru) => "Получатели / кто ввозил",
+        (AnalyticsSectionKind::Recipients, Lang::En) => "Recipients / importers",
+        (AnalyticsSectionKind::Senders, Lang::Ua) => "Відправники",
+        (AnalyticsSectionKind::Senders, Lang::Ru) => "Отправители",
+        (AnalyticsSectionKind::Senders, Lang::En) => "Senders",
+        (AnalyticsSectionKind::Edrpou, Lang::Ua) => "ЄДРПОУ",
+        (AnalyticsSectionKind::Edrpou, Lang::Ru) => "ЕДРПОУ",
+        (AnalyticsSectionKind::Edrpou, Lang::En) => "EDRPOU",
+        (AnalyticsSectionKind::ProductCodes, Lang::Ua) => "Коди УКТЗЕД",
+        (AnalyticsSectionKind::ProductCodes, Lang::Ru) => "Коды УКТЗЕД",
+        (AnalyticsSectionKind::ProductCodes, Lang::En) => "Product codes",
+        (AnalyticsSectionKind::Trademarks, Lang::Ua) => "Торгові марки",
+        (AnalyticsSectionKind::Trademarks, Lang::Ru) => "Торговые марки",
+        (AnalyticsSectionKind::Trademarks, Lang::En) => "Trademarks",
+        (AnalyticsSectionKind::ProductGroups, Lang::Ua) => "Групи за описом",
+        (AnalyticsSectionKind::ProductGroups, Lang::Ru) => "Группы по описанию",
+        (AnalyticsSectionKind::ProductGroups, Lang::En) => "Description groups",
+        (AnalyticsSectionKind::OriginCountries, Lang::Ua) => "Країни походження",
+        (AnalyticsSectionKind::OriginCountries, Lang::Ru) => "Страны происхождения",
+        (AnalyticsSectionKind::OriginCountries, Lang::En) => "Origin countries",
+        (AnalyticsSectionKind::DispatchCountries, Lang::Ua) => "Країни відправлення",
+        (AnalyticsSectionKind::DispatchCountries, Lang::Ru) => "Страны отправления",
+        (AnalyticsSectionKind::DispatchCountries, Lang::En) => "Dispatch countries",
+        (AnalyticsSectionKind::TradeCountries, Lang::Ua) => "Країни торгівлі",
+        (AnalyticsSectionKind::TradeCountries, Lang::Ru) => "Страны торговли",
+        (AnalyticsSectionKind::TradeCountries, Lang::En) => "Trade countries",
+    }
+}
+
+fn row_counts_label(row: &AnalyticsGroupRow, lang: Lang) -> String {
+    match lang {
+        Lang::Ua => format!(
+            "рядків {} | декларацій {} | компаній {}",
+            group_digits(row.rows),
+            group_digits(row.declarations),
+            group_digits(row.companies)
+        ),
+        Lang::Ru => format!(
+            "строк {} | деклараций {} | компаний {}",
+            group_digits(row.rows),
+            group_digits(row.declarations),
+            group_digits(row.companies)
+        ),
+        Lang::En => format!(
+            "rows {} | declarations {} | companies {}",
+            group_digits(row.rows),
+            group_digits(row.declarations),
+            group_digits(row.companies)
+        ),
+    }
+}
+
+fn row_hover_text(row: &AnalyticsGroupRow, lang: Lang) -> String {
+    match lang {
+        Lang::Ua => format!(
+            "{}\nСума: {} $\nНетто: {} кг\nЧастка: {}%\nСередня ціна: {} $/кг\nНатисніть, щоб відфільтрувати результати.",
+            row.label,
+            fmt_decimal(row.total_value_usd, 2),
+            fmt_decimal(row.total_net_kg, 3),
+            fmt_decimal(row.share_percent, 2),
+            fmt_decimal(row.avg_value_per_net_kg, 2)
+        ),
+        Lang::Ru => format!(
+            "{}\nСумма: {} $\nНетто: {} кг\nДоля: {}%\nСредняя цена: {} $/кг\nНажмите, чтобы отфильтровать результаты.",
+            row.label,
+            fmt_decimal(row.total_value_usd, 2),
+            fmt_decimal(row.total_net_kg, 3),
+            fmt_decimal(row.share_percent, 2),
+            fmt_decimal(row.avg_value_per_net_kg, 2)
+        ),
+        Lang::En => format!(
+            "{}\nValue: {} $\nNet: {} kg\nShare: {}%\nAverage price: {} $/kg\nClick to filter results.",
+            row.label,
+            fmt_decimal(row.total_value_usd, 2),
+            fmt_decimal(row.total_net_kg, 3),
+            fmt_decimal(row.share_percent, 2),
+            fmt_decimal(row.avg_value_per_net_kg, 2)
+        ),
+    }
+}
+
+fn price_metric_title(kind: PriceMetricKind, lang: Lang) -> &'static str {
+    match (kind, lang) {
+        (PriceMetricKind::ValuePerNetKg, Lang::Ua) => "ФВ / нетто",
+        (PriceMetricKind::ValuePerNetKg, Lang::Ru) => "ФВ / нетто",
+        (PriceMetricKind::ValuePerNetKg, Lang::En) => "Value / net kg",
+        (PriceMetricKind::RfvUsdKg, Lang::Ua) => "РФВ $/кг",
+        (PriceMetricKind::RfvUsdKg, Lang::Ru) => "РФВ $/кг",
+        (PriceMetricKind::RfvUsdKg, Lang::En) => "RFV $/kg",
+        (PriceMetricKind::RmvNetUsdKg, Lang::Ua) => "РМВ нетто $/кг",
+        (PriceMetricKind::RmvNetUsdKg, Lang::Ru) => "РМВ нетто $/кг",
+        (PriceMetricKind::RmvNetUsdKg, Lang::En) => "RMV net $/kg",
+        (PriceMetricKind::RmvUsdExtraUnit, Lang::Ua) => "РМВ $/дод.од.",
+        (PriceMetricKind::RmvUsdExtraUnit, Lang::Ru) => "РМВ $/доп.ед.",
+        (PriceMetricKind::RmvUsdExtraUnit, Lang::En) => "RMV $/extra unit",
+        (PriceMetricKind::RmvGrossUsdKg, Lang::Ua) => "РМВ брутто $/кг",
+        (PriceMetricKind::RmvGrossUsdKg, Lang::Ru) => "РМВ брутто $/кг",
+        (PriceMetricKind::RmvGrossUsdKg, Lang::En) => "RMV gross $/kg",
+        (PriceMetricKind::MinBaseUsdKg, Lang::Ua) => "Мін. база $/кг",
+        (PriceMetricKind::MinBaseUsdKg, Lang::Ru) => "Мин. база $/кг",
+        (PriceMetricKind::MinBaseUsdKg, Lang::En) => "Min base $/kg",
+    }
+}
+
+fn price_header_metric(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "показник",
+        Lang::Ru => "показатель",
+        Lang::En => "metric",
+    }
+}
+
+fn price_header_avg(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "середнє",
+        Lang::Ru => "среднее",
+        Lang::En => "average",
+    }
+}
+
+fn price_header_count(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "значень",
+        Lang::Ru => "значений",
+        Lang::En => "values",
+    }
 }
 
 fn fmt_decimal(value: f64, decimals: usize) -> String {
@@ -1559,32 +2106,88 @@ fn filter_field(ui: &mut egui::Ui, label: &str, value: &mut String, width: f32, 
     });
 }
 
+/// System font candidates per OS. The first readable file wins; when none
+/// is found, egui's bundled fonts are used (they cover Cyrillic too).
+fn system_font_candidates() -> (&'static [&'static str], &'static [&'static str]) {
+    #[cfg(target_os = "windows")]
+    {
+        (
+            &["C:\\Windows\\Fonts\\segoeui.ttf"],
+            &["C:\\Windows\\Fonts\\consola.ttf"],
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        (
+            &[
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/Library/Fonts/Arial Unicode.ttf",
+            ],
+            &[
+                "/System/Library/Fonts/Supplemental/Courier New.ttf",
+                "/Library/Fonts/Courier New.ttf",
+            ],
+        )
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        (
+            &[
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            ],
+            &[
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+                "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+            ],
+        )
+    }
+}
+
+fn load_first_font(
+    fonts: &mut egui::FontDefinitions,
+    family: egui::FontFamily,
+    key: &str,
+    candidates: &[&str],
+) {
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts
+                .font_data
+                .insert(key.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .insert(0, key.to_owned());
+            return;
+        }
+    }
+}
+
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    // System Segoe UI: native look and complete Cyrillic coverage.
-    if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
-        fonts.font_data.insert(
-            "segoe".to_owned(),
-            Arc::new(egui::FontData::from_owned(bytes)),
-        );
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(0, "segoe".to_owned());
-    }
-    // Consolas for codes and numbers.
-    if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\consola.ttf") {
-        fonts.font_data.insert(
-            "consolas".to_owned(),
-            Arc::new(egui::FontData::from_owned(bytes)),
-        );
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .insert(0, "consolas".to_owned());
-    }
+    let (proportional, monospace) = system_font_candidates();
+    // Native system font with complete Cyrillic coverage when available.
+    load_first_font(
+        &mut fonts,
+        egui::FontFamily::Proportional,
+        "system-ui",
+        proportional,
+    );
+    // System monospace for codes and numbers.
+    load_first_font(
+        &mut fonts,
+        egui::FontFamily::Monospace,
+        "system-mono",
+        monospace,
+    );
     ctx.set_fonts(fonts);
 }
 

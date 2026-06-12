@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
 
-use crate::db::{Analytics, Db, Query};
+use crate::db::{Analytics, Db, Query, analytics_should_run};
 use crate::export::{self, ExportError};
 use crate::import::{self, FileSummary, ImportPhase};
 
@@ -16,6 +16,7 @@ pub enum WorkerReq {
         page: u64,
         generation: u64,
         include_analytics: bool,
+        analytics_limit: u64,
     },
     Stats,
 }
@@ -78,6 +79,7 @@ pub fn spawn_search_worker(
                     page,
                     generation,
                     include_analytics,
+                    analytics_limit,
                 } => {
                     let started = Instant::now();
                     let total = match count_cache.as_ref().filter(|(cq, _)| cq == q.as_ref()) {
@@ -87,8 +89,8 @@ pub fn spawn_search_worker(
                     let result = total.and_then(|total| {
                         count_cache = Some(((*q).clone(), total));
                         let (ids, rows) = db.search_page(&q, PAGE_SIZE, page * PAGE_SIZE)?;
-                        let analytics = if include_analytics && !q.is_empty() {
-                            Some(Box::new(db.analytics(&q, 10)?))
+                        let analytics = if include_analytics && analytics_should_run(&q) {
+                            Some(Box::new(db.analytics(&q, analytics_limit)?))
                         } else {
                             None
                         };

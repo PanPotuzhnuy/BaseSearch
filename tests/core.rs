@@ -4,7 +4,10 @@
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
-use base_search::db::{Db, Filters, Query, build_fts_query, extract_year, parse_number};
+use base_search::db::{
+    AnalyticsFilterField, AnalyticsSectionKind, Db, Filters, PriceMetricKind, Query,
+    analytics_should_run, build_fts_query, extract_year, parse_number,
+};
 use base_search::export;
 use base_search::import::{self, collapse_ws, normalize_date, normalize_value};
 use base_search::schema::{COLUMNS, RESULT_COLUMNS, col_index};
@@ -362,6 +365,206 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
     assert_eq!(analytics.top_product_codes[0].label, "8517130000");
     assert_eq!(analytics.top_origin_countries[0].label, "CN");
     assert_eq!(analytics.top_origin_countries[0].rows, 2);
+
+    // Monthly dynamics: both Apple-2024 rows fall into the same month.
+    assert_eq!(analytics.months.len(), 1);
+    assert_eq!(analytics.months[0].month, "2024-03");
+    assert_eq!(analytics.months[0].rows, 2);
+    assert_eq!(analytics.months[0].declarations, 2);
+    assert_close(analytics.months[0].total_value_usd, 1500.75);
+
+    // Without the year filter the months are listed chronologically.
+    let q_all = Query {
+        text: "Apple".into(),
+        ..Default::default()
+    };
+    let analytics_all = db.analytics(&q_all, 5).unwrap();
+    let months: Vec<&str> = analytics_all
+        .months
+        .iter()
+        .map(|m| m.month.as_str())
+        .collect();
+    assert_eq!(months, vec!["2024-03", "2025-01"]);
+    assert_eq!(analytics_all.months[1].rows, 1);
+    assert_close(analytics_all.months[1].total_value_usd, 2400.0);
+}
+
+#[test]
+fn analytics_builds_decision_sections_for_trade_questions() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("analytics_sections.xlsx");
+    let db_path = dir.path().join("data").join("analytics_sections.db");
+    write_test_xlsx(
+        &xlsx,
+        &[
+            vec![
+                ("declaration_number", "24UA100110000201U1"),
+                ("declaration_date", "15.03.2024"),
+                ("sender", "APPLE DISTRIBUTION INTERNATIONAL LTD"),
+                ("edrpou", "11111111"),
+                ("recipient", "IPHONE UKRAINE LLC"),
+                ("product_code", "8517130000"),
+                ("description", "Apple iPhone 15 smartphone"),
+                ("trade_country", "IE"),
+                ("dispatch_country", "IE"),
+                ("origin_country", "CN"),
+                ("quantity", "10"),
+                ("gross_kg", "12.5"),
+                ("net_kg", "10"),
+                ("currency_control_value", "1 200.50"),
+                ("rfv_usd_kg", "120.05"),
+                ("rmv_net_usd_kg", "119.5"),
+                ("trademark", "Apple"),
+            ],
+            vec![
+                ("declaration_number", "24UA100110000201U1"),
+                ("declaration_date", "16.03.2024"),
+                ("sender", "APPLE OPERATIONS EUROPE"),
+                ("edrpou", "22222222"),
+                ("recipient", "TECH IMPORT LLC"),
+                ("product_code", "8517790000"),
+                ("description", "Apple iPhone parts"),
+                ("trade_country", "IE"),
+                ("dispatch_country", "PL"),
+                ("origin_country", "US"),
+                ("quantity", "2"),
+                ("gross_kg", "3,5"),
+                ("net_kg", "2,5"),
+                ("currency_control_value", "300,25"),
+                ("rfv_usd_kg", "120.1"),
+                ("rmv_net_usd_kg", "121"),
+                ("trademark", "Apple"),
+            ],
+            vec![
+                ("declaration_number", "24UA100110000202U2"),
+                ("declaration_date", "17.03.2024"),
+                ("sender", "APPLE OPERATIONS EUROPE"),
+                ("edrpou", "22222222"),
+                ("recipient", "TECH IMPORT LLC"),
+                ("product_code", "8517790000"),
+                ("description", "Apple service replacement unit"),
+                ("trade_country", "US"),
+                ("dispatch_country", "US"),
+                ("origin_country", "US"),
+                ("quantity", "1"),
+                ("gross_kg", "bad"),
+                ("net_kg", ""),
+                ("currency_control_value", "not a number"),
+                ("rfv_usd_kg", ""),
+                ("rmv_net_usd_kg", "bad"),
+                ("trademark", "Apple"),
+            ],
+            vec![
+                ("declaration_number", "24UA100110000203U3"),
+                ("declaration_date", "17.03.2024"),
+                ("sender", "SAMSUNG ELECTRONICS"),
+                ("edrpou", "33333333"),
+                ("recipient", "TECH IMPORT LLC"),
+                ("product_code", "8517130000"),
+                ("description", "Samsung smartphone"),
+                ("trade_country", "KR"),
+                ("dispatch_country", "KR"),
+                ("origin_country", "VN"),
+                ("quantity", "5"),
+                ("gross_kg", "7"),
+                ("net_kg", "6"),
+                ("currency_control_value", "700"),
+                ("trademark", "Samsung"),
+            ],
+        ],
+    );
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 4);
+
+    let q = Query {
+        text: "Apple".into(),
+        filters: Filters {
+            year: "2024".into(),
+            ..Default::default()
+        },
+    };
+    let analytics = db.analytics(&q, 10).unwrap();
+    assert_eq!(analytics.overview.row_count, 3);
+    assert_eq!(analytics.overview.declaration_count, 2);
+    assert_eq!(analytics.overview.distinct_senders, 2);
+    assert_eq!(analytics.overview.distinct_recipients, 2);
+    assert_eq!(analytics.overview.distinct_edrpou, 2);
+    assert_eq!(analytics.overview.distinct_product_codes, 2);
+    assert_eq!(analytics.overview.distinct_trademarks, 1);
+    assert_eq!(analytics.overview.distinct_origin_countries, 2);
+    assert_eq!(analytics.overview.distinct_dispatch_countries, 3);
+    assert_eq!(analytics.overview.distinct_trade_countries, 2);
+    assert_close(analytics.overview.total_value_usd, 1500.75);
+    assert_close(analytics.overview.total_net_kg, 12.5);
+    assert_close(analytics.overview.avg_value_per_net_kg, 120.06);
+
+    let recipients = analytics_section(
+        &analytics.company_sections,
+        AnalyticsSectionKind::Recipients,
+    );
+    assert_eq!(recipients.rows[0].label, "IPHONE UKRAINE LLC");
+    assert_close(recipients.rows[0].share_percent, 79.9933);
+    assert_eq!(recipients.rows[0].declarations, 1);
+    assert_close(recipients.rows[0].avg_value_per_net_kg, 120.05);
+    let filter = recipients.rows[0].filter_action.as_ref().unwrap();
+    assert_eq!(filter.field, AnalyticsFilterField::Recipient);
+    assert_eq!(filter.value, "IPHONE UKRAINE LLC");
+
+    let codes = analytics_section(
+        &analytics.product_sections,
+        AnalyticsSectionKind::ProductCodes,
+    );
+    assert_eq!(codes.rows[0].label, "8517130000");
+    assert_eq!(codes.rows[0].companies, 1);
+    assert_eq!(codes.rows[1].label, "8517790000");
+    assert_eq!(codes.rows[1].companies, 1);
+
+    let trademarks = analytics_section(
+        &analytics.product_sections,
+        AnalyticsSectionKind::Trademarks,
+    );
+    assert_eq!(trademarks.rows[0].label, "Apple");
+    assert_eq!(trademarks.rows[0].companies, 2);
+
+    let origin = analytics_section(
+        &analytics.country_sections,
+        AnalyticsSectionKind::OriginCountries,
+    );
+    assert_eq!(origin.rows[0].label, "CN");
+    assert_eq!(origin.rows[1].label, "US");
+    let dispatch = analytics_section(
+        &analytics.country_sections,
+        AnalyticsSectionKind::DispatchCountries,
+    );
+    assert_eq!(dispatch.rows.len(), 3);
+    let trade = analytics_section(
+        &analytics.country_sections,
+        AnalyticsSectionKind::TradeCountries,
+    );
+    assert_eq!(trade.rows[0].label, "IE");
+
+    let value_per_kg = price_metric(&analytics.price_sections, PriceMetricKind::ValuePerNetKg);
+    assert_eq!(value_per_kg.count, 2);
+    assert_close(value_per_kg.average, 120.075);
+    assert_close(value_per_kg.minimum, 120.05);
+    assert_close(value_per_kg.maximum, 120.1);
+    assert_close(value_per_kg.weighted_average, 120.06);
+
+    let rfv = price_metric(&analytics.price_sections, PriceMetricKind::RfvUsdKg);
+    assert_eq!(rfv.count, 2);
+    assert_close(rfv.average, 120.075);
+    assert_close(rfv.minimum, 120.05);
+    assert_close(rfv.maximum, 120.1);
+    let rmv = price_metric(&analytics.price_sections, PriceMetricKind::RmvNetUsdKg);
+    assert_eq!(rmv.count, 2);
+    assert_close(rmv.average, 120.25);
+
+    assert!(!analytics_should_run(&Query::default()));
+    assert!(analytics_should_run(&q));
 }
 
 fn assert_close(actual: f64, expected: f64) {
@@ -369,6 +572,26 @@ fn assert_close(actual: f64, expected: f64) {
         (actual - expected).abs() < 0.0001,
         "expected {expected}, got {actual}"
     );
+}
+
+fn analytics_section(
+    sections: &[base_search::db::AnalyticsSection],
+    kind: AnalyticsSectionKind,
+) -> &base_search::db::AnalyticsSection {
+    sections
+        .iter()
+        .find(|section| section.kind == kind)
+        .unwrap_or_else(|| panic!("missing section {kind:?}"))
+}
+
+fn price_metric(
+    metrics: &[base_search::db::AnalyticsPriceMetric],
+    kind: PriceMetricKind,
+) -> &base_search::db::AnalyticsPriceMetric {
+    metrics
+        .iter()
+        .find(|metric| metric.kind == kind)
+        .unwrap_or_else(|| panic!("missing metric {kind:?}"))
 }
 
 /// Registry-style format: repeated headers, a declaration number split into

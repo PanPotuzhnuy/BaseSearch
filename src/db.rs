@@ -80,29 +80,116 @@ pub struct ImportLogEntry {
 #[derive(Clone, Debug, Default)]
 pub struct AnalyticsOverview {
     pub row_count: u64,
+    pub declaration_count: u64,
     pub distinct_senders: u64,
     pub distinct_recipients: u64,
     pub distinct_edrpou: u64,
     pub distinct_trademarks: u64,
+    pub distinct_product_codes: u64,
+    pub distinct_origin_countries: u64,
+    pub distinct_dispatch_countries: u64,
+    pub distinct_trade_countries: u64,
     pub total_value_usd: f64,
     pub total_gross_kg: f64,
     pub total_net_kg: f64,
     pub total_quantity: f64,
+    pub avg_value_per_net_kg: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnalyticsFilterField {
+    Recipient,
+    Sender,
+    Edrpou,
+    ProductCode,
+    Trademark,
+    OriginCountry,
+    DispatchCountry,
+    TradeCountry,
+    Description,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnalyticsFilterAction {
+    pub field: AnalyticsFilterField,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct AnalyticsGroupRow {
     pub label: String,
     pub rows: u64,
+    pub declarations: u64,
+    pub companies: u64,
     pub total_value_usd: f64,
     pub total_net_kg: f64,
     pub total_gross_kg: f64,
     pub total_quantity: f64,
+    pub share_percent: f64,
+    pub avg_value_per_net_kg: f64,
+    pub filter_action: Option<AnalyticsFilterAction>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnalyticsSectionKind {
+    #[default]
+    Recipients,
+    Senders,
+    Edrpou,
+    ProductCodes,
+    Trademarks,
+    ProductGroups,
+    OriginCountries,
+    DispatchCountries,
+    TradeCountries,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AnalyticsSection {
+    pub kind: AnalyticsSectionKind,
+    pub rows: Vec<AnalyticsGroupRow>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PriceMetricKind {
+    #[default]
+    ValuePerNetKg,
+    RfvUsdKg,
+    RmvNetUsdKg,
+    RmvUsdExtraUnit,
+    RmvGrossUsdKg,
+    MinBaseUsdKg,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AnalyticsPriceMetric {
+    pub kind: PriceMetricKind,
+    pub count: u64,
+    pub average: f64,
+    pub minimum: f64,
+    pub maximum: f64,
+    pub weighted_average: f64,
+}
+
+/// One month of import dynamics (chart data).
+#[derive(Clone, Debug, Default)]
+pub struct AnalyticsMonthRow {
+    /// "2024-03"
+    pub month: String,
+    pub rows: u64,
+    pub declarations: u64,
+    pub total_value_usd: f64,
+    pub total_net_kg: f64,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Analytics {
     pub overview: AnalyticsOverview,
+    pub months: Vec<AnalyticsMonthRow>,
+    pub company_sections: Vec<AnalyticsSection>,
+    pub product_sections: Vec<AnalyticsSection>,
+    pub country_sections: Vec<AnalyticsSection>,
+    pub price_sections: Vec<AnalyticsPriceMetric>,
     pub top_recipients: Vec<AnalyticsGroupRow>,
     pub top_senders: Vec<AnalyticsGroupRow>,
     pub top_trademarks: Vec<AnalyticsGroupRow>,
@@ -524,10 +611,15 @@ impl Db {
         let sql = format!(
             "SELECT
                 COUNT(*),
+                COUNT(DISTINCT NULLIF(TRIM(r.declaration_number), '')),
                 COUNT(DISTINCT NULLIF(TRIM(r.sender), '')),
                 COUNT(DISTINCT NULLIF(TRIM(r.recipient), '')),
                 COUNT(DISTINCT NULLIF(TRIM(r.edrpou), '')),
                 COUNT(DISTINCT NULLIF(TRIM(r.trademark), '')),
+                COUNT(DISTINCT NULLIF(TRIM(r.product_code), '')),
+                COUNT(DISTINCT NULLIF(TRIM(r.origin_country), '')),
+                COUNT(DISTINCT NULLIF(TRIM(r.dispatch_country), '')),
+                COUNT(DISTINCT NULLIF(TRIM(r.trade_country), '')),
                 SUM(num_value(r.currency_control_value)),
                 SUM(num_value(r.gross_kg)),
                 SUM(num_value(r.net_kg)),
@@ -539,35 +631,211 @@ impl Db {
             .query_row(&sql, params_from_iter(params.clone()), |row| {
                 Ok(AnalyticsOverview {
                     row_count: row.get::<_, i64>(0)? as u64,
-                    distinct_senders: row.get::<_, i64>(1)? as u64,
-                    distinct_recipients: row.get::<_, i64>(2)? as u64,
-                    distinct_edrpou: row.get::<_, i64>(3)? as u64,
-                    distinct_trademarks: row.get::<_, i64>(4)? as u64,
-                    total_value_usd: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
-                    total_gross_kg: row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
-                    total_net_kg: row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
-                    total_quantity: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
+                    declaration_count: row.get::<_, i64>(1)? as u64,
+                    distinct_senders: row.get::<_, i64>(2)? as u64,
+                    distinct_recipients: row.get::<_, i64>(3)? as u64,
+                    distinct_edrpou: row.get::<_, i64>(4)? as u64,
+                    distinct_trademarks: row.get::<_, i64>(5)? as u64,
+                    distinct_product_codes: row.get::<_, i64>(6)? as u64,
+                    distinct_origin_countries: row.get::<_, i64>(7)? as u64,
+                    distinct_dispatch_countries: row.get::<_, i64>(8)? as u64,
+                    distinct_trade_countries: row.get::<_, i64>(9)? as u64,
+                    total_value_usd: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
+                    total_gross_kg: row.get::<_, Option<f64>>(11)?.unwrap_or(0.0),
+                    total_net_kg: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
+                    total_quantity: row.get::<_, Option<f64>>(13)?.unwrap_or(0.0),
+                    avg_value_per_net_kg: 0.0,
                 })
             })?;
+        let overview = AnalyticsOverview {
+            avg_value_per_net_kg: ratio(overview.total_value_usd, overview.total_net_kg),
+            ..overview
+        };
+
+        let company_sections = vec![
+            self.analytics_group(
+                q,
+                AnalyticsSectionKind::Recipients,
+                "r.recipient",
+                AnalyticsFilterField::Recipient,
+                limit,
+                &overview,
+            )?,
+            self.analytics_group(
+                q,
+                AnalyticsSectionKind::Senders,
+                "r.sender",
+                AnalyticsFilterField::Sender,
+                limit,
+                &overview,
+            )?,
+            self.analytics_group(
+                q,
+                AnalyticsSectionKind::Edrpou,
+                "r.edrpou",
+                AnalyticsFilterField::Edrpou,
+                limit,
+                &overview,
+            )?,
+        ];
+        let product_sections = vec![
+            self.analytics_group(
+                q,
+                AnalyticsSectionKind::ProductCodes,
+                "r.product_code",
+                AnalyticsFilterField::ProductCode,
+                limit,
+                &overview,
+            )?,
+            self.analytics_group(
+                q,
+                AnalyticsSectionKind::Trademarks,
+                "r.trademark",
+                AnalyticsFilterField::Trademark,
+                limit,
+                &overview,
+            )?,
+            self.analytics_group(
+                q,
+                AnalyticsSectionKind::ProductGroups,
+                "SUBSTR(TRIM(r.description), 1, 80)",
+                AnalyticsFilterField::Description,
+                limit,
+                &overview,
+            )?,
+        ];
+        let country_sections = vec![
+            self.analytics_group(
+                q,
+                AnalyticsSectionKind::OriginCountries,
+                "r.origin_country",
+                AnalyticsFilterField::OriginCountry,
+                limit,
+                &overview,
+            )?,
+            self.analytics_group(
+                q,
+                AnalyticsSectionKind::DispatchCountries,
+                "r.dispatch_country",
+                AnalyticsFilterField::DispatchCountry,
+                limit,
+                &overview,
+            )?,
+            self.analytics_group(
+                q,
+                AnalyticsSectionKind::TradeCountries,
+                "r.trade_country",
+                AnalyticsFilterField::TradeCountry,
+                limit,
+                &overview,
+            )?,
+        ];
+        let price_sections = vec![
+            self.price_metric(
+                q,
+                PriceMetricKind::ValuePerNetKg,
+                "CASE
+                    WHEN num_value(r.currency_control_value) IS NOT NULL
+                        AND num_value(r.net_kg) IS NOT NULL
+                        AND num_value(r.net_kg) > 0
+                    THEN num_value(r.currency_control_value) / num_value(r.net_kg)
+                 END",
+            )?,
+            self.price_metric(q, PriceMetricKind::RfvUsdKg, "num_value(r.rfv_usd_kg)")?,
+            self.price_metric(
+                q,
+                PriceMetricKind::RmvNetUsdKg,
+                "num_value(r.rmv_net_usd_kg)",
+            )?,
+            self.price_metric(
+                q,
+                PriceMetricKind::RmvUsdExtraUnit,
+                "num_value(r.rmv_usd_extra_unit)",
+            )?,
+            self.price_metric(
+                q,
+                PriceMetricKind::RmvGrossUsdKg,
+                "num_value(r.rmv_gross_usd_kg)",
+            )?,
+            self.price_metric(
+                q,
+                PriceMetricKind::MinBaseUsdKg,
+                "num_value(r.min_base_usd_kg)",
+            )?,
+        ];
+
+        let top_recipients = section_rows(&company_sections, AnalyticsSectionKind::Recipients);
+        let top_senders = section_rows(&company_sections, AnalyticsSectionKind::Senders);
+        let top_trademarks = section_rows(&product_sections, AnalyticsSectionKind::Trademarks);
+        let top_product_codes = section_rows(&product_sections, AnalyticsSectionKind::ProductCodes);
+        let top_origin_countries =
+            section_rows(&country_sections, AnalyticsSectionKind::OriginCountries);
+        let months = self.analytics_months(q)?;
 
         Ok(Analytics {
             overview,
-            top_recipients: self.analytics_group(q, "recipient", limit)?,
-            top_senders: self.analytics_group(q, "sender", limit)?,
-            top_trademarks: self.analytics_group(q, "trademark", limit)?,
-            top_product_codes: self.analytics_group(q, "product_code", limit)?,
-            top_origin_countries: self.analytics_group(q, "origin_country", limit)?,
+            months,
+            company_sections,
+            product_sections,
+            country_sections,
+            price_sections,
+            top_recipients,
+            top_senders,
+            top_trademarks,
+            top_product_codes,
+            top_origin_countries,
         })
+    }
+
+    /// Import dynamics grouped by month ("YYYY-MM" from the ISO date).
+    /// Returns the most recent 48 months in chronological order.
+    fn analytics_months(&self, q: &Query) -> rusqlite::Result<Vec<AnalyticsMonthRow>> {
+        let (joins, where_sql, params) = self.build_where(q);
+        let month_filter =
+            "TRIM(r.declaration_date) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]*'";
+        let filter_sql = if where_sql.is_empty() {
+            format!(" WHERE {month_filter}")
+        } else {
+            format!("{where_sql} AND {month_filter}")
+        };
+        let sql = format!(
+            "SELECT
+                SUBSTR(TRIM(r.declaration_date), 1, 7) AS month,
+                COUNT(*) AS rows_count,
+                COUNT(DISTINCT NULLIF(TRIM(r.declaration_number), '')) AS declarations_count,
+                COALESCE(SUM(num_value(r.currency_control_value)), 0.0) AS total_value_usd,
+                COALESCE(SUM(num_value(r.net_kg)), 0.0) AS total_net_kg
+             FROM records r{joins}{filter_sql}
+             GROUP BY month
+             ORDER BY month DESC
+             LIMIT 48"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params), |row| {
+            Ok(AnalyticsMonthRow {
+                month: row.get(0)?,
+                rows: row.get::<_, i64>(1)? as u64,
+                declarations: row.get::<_, i64>(2)? as u64,
+                total_value_usd: row.get(3)?,
+                total_net_kg: row.get(4)?,
+            })
+        })?;
+        let mut months: Vec<AnalyticsMonthRow> = rows.flatten().collect();
+        months.reverse();
+        Ok(months)
     }
 
     fn analytics_group(
         &self,
         q: &Query,
-        column: &str,
+        kind: AnalyticsSectionKind,
+        label_expr: &str,
+        filter_field: AnalyticsFilterField,
         limit: u64,
-    ) -> rusqlite::Result<Vec<AnalyticsGroupRow>> {
+        overview: &AnalyticsOverview,
+    ) -> rusqlite::Result<AnalyticsSection> {
         let (joins, where_sql, mut params) = self.build_where(q);
-        let non_empty = format!("TRIM(COALESCE(r.{column}, '')) <> ''");
+        let non_empty = format!("TRIM(COALESCE({label_expr}, '')) <> ''");
         let filter_sql = if where_sql.is_empty() {
             format!(" WHERE {non_empty}")
         } else {
@@ -575,30 +843,98 @@ impl Db {
         };
         let sql = format!(
             "SELECT
-                TRIM(r.{column}) AS label,
+                TRIM({label_expr}) AS label,
                 COUNT(*) AS rows_count,
+                COUNT(DISTINCT NULLIF(TRIM(r.declaration_number), '')) AS declarations_count,
+                COUNT(DISTINCT NULLIF(TRIM(r.edrpou), '')) AS companies_count,
                 COALESCE(SUM(num_value(r.currency_control_value)), 0.0) AS total_value_usd,
                 COALESCE(SUM(num_value(r.net_kg)), 0.0) AS total_net_kg,
                 COALESCE(SUM(num_value(r.gross_kg)), 0.0) AS total_gross_kg,
                 COALESCE(SUM(num_value(r.quantity)), 0.0) AS total_quantity
              FROM records r{joins}{filter_sql}
-             GROUP BY TRIM(r.{column})
-             ORDER BY total_value_usd DESC, rows_count DESC, label COLLATE NOCASE
+             GROUP BY TRIM({label_expr})
+             ORDER BY total_value_usd DESC, total_net_kg DESC, rows_count DESC, label COLLATE NOCASE
              LIMIT ?"
         );
         params.push((limit as i64).into());
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(params), |row| {
+            let label: String = row.get(0)?;
+            let total_value_usd: f64 = row.get(4)?;
+            let total_net_kg: f64 = row.get(5)?;
+            let total_gross_kg: f64 = row.get(6)?;
+            let total_quantity: f64 = row.get(7)?;
+            let share_base = if overview.total_value_usd > 0.0 {
+                overview.total_value_usd
+            } else if overview.total_net_kg > 0.0 {
+                overview.total_net_kg
+            } else {
+                overview.row_count as f64
+            };
+            let share_value = if overview.total_value_usd > 0.0 {
+                total_value_usd
+            } else if overview.total_net_kg > 0.0 {
+                total_net_kg
+            } else {
+                row.get::<_, i64>(1)? as f64
+            };
             Ok(AnalyticsGroupRow {
-                label: row.get(0)?,
+                filter_action: Some(AnalyticsFilterAction {
+                    field: filter_field,
+                    value: label.clone(),
+                }),
+                label,
                 rows: row.get::<_, i64>(1)? as u64,
-                total_value_usd: row.get(2)?,
-                total_net_kg: row.get(3)?,
-                total_gross_kg: row.get(4)?,
-                total_quantity: row.get(5)?,
+                declarations: row.get::<_, i64>(2)? as u64,
+                companies: row.get::<_, i64>(3)? as u64,
+                total_value_usd,
+                total_net_kg,
+                total_gross_kg,
+                total_quantity,
+                share_percent: ratio(share_value * 100.0, share_base),
+                avg_value_per_net_kg: ratio(total_value_usd, total_net_kg),
             })
         })?;
-        rows.collect()
+        Ok(AnalyticsSection {
+            kind,
+            rows: rows.collect::<rusqlite::Result<Vec<_>>>()?,
+        })
+    }
+
+    fn price_metric(
+        &self,
+        q: &Query,
+        kind: PriceMetricKind,
+        price_expr: &str,
+    ) -> rusqlite::Result<AnalyticsPriceMetric> {
+        let (joins, where_sql, params) = self.build_where(q);
+        let sql = format!(
+            "SELECT
+                COUNT(price),
+                AVG(price),
+                MIN(price),
+                MAX(price),
+                SUM(CASE WHEN price IS NOT NULL AND weight IS NOT NULL AND weight > 0
+                    THEN price * weight ELSE 0 END),
+                SUM(CASE WHEN price IS NOT NULL AND weight IS NOT NULL AND weight > 0
+                    THEN weight ELSE 0 END)
+             FROM (
+                SELECT {price_expr} AS price, num_value(r.net_kg) AS weight
+                FROM records r{joins}{where_sql}
+             )"
+        );
+        self.conn.query_row(&sql, params_from_iter(params), |row| {
+            let weighted_sum = row.get::<_, Option<f64>>(4)?.unwrap_or(0.0);
+            let weighted_kg = row.get::<_, Option<f64>>(5)?.unwrap_or(0.0);
+            Ok(AnalyticsPriceMetric {
+                kind,
+                count: row.get::<_, i64>(0)? as u64,
+                average: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                minimum: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                maximum: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                weighted_average: ratio(weighted_sum, weighted_kg),
+            })
+        })
     }
 
     // ---------- statistics ----------
@@ -763,6 +1099,29 @@ pub fn contains_ci(hay: &str, needle_lower: &str) -> bool {
         }
     }
     false
+}
+
+pub fn analytics_should_run(q: &Query) -> bool {
+    !q.is_empty()
+}
+
+fn section_rows(
+    sections: &[AnalyticsSection],
+    kind: AnalyticsSectionKind,
+) -> Vec<AnalyticsGroupRow> {
+    sections
+        .iter()
+        .find(|section| section.kind == kind)
+        .map(|section| section.rows.clone())
+        .unwrap_or_default()
+}
+
+fn ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator.abs() <= f64::EPSILON {
+        0.0
+    } else {
+        numerator / denominator
+    }
 }
 
 pub fn parse_number(value: &str) -> Option<f64> {

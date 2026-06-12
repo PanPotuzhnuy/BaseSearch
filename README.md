@@ -1,10 +1,13 @@
-# Base Search 1.0
+# Base Search 1.1
 
-Base Search is a local Windows desktop application for fast search and basic
-analytics across large Excel datasets. It imports spreadsheet files into a local
-database, builds a search index, and lets users find, inspect, summarize, and
-export records without fighting slow filters, freezing workbooks, or repeated
-manual searches in Excel.
+[![CI](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml)
+
+Base Search is a local cross-platform desktop application for fast search and
+practical analytics across large Excel datasets. It runs on **Windows, Linux,
+and macOS**, imports spreadsheet files into a local database, builds a search
+index, and lets users find, inspect, summarize, and export records without
+fighting slow filters, freezing workbooks, or repeated manual searches in
+Excel.
 
 The first version was built for customs and import datasets, but the core idea
 is broader: take large tabular Excel exports, store them locally, and make them
@@ -22,9 +25,15 @@ on the user's computer.
 - View all imported source columns in the result table, including value, price,
   weight, rate, and technical customs fields when they exist in the source data.
 - Open a full details view for any result row.
-- Calculate analytics for the current search/filter set: row count, unique
-  companies, total value, weight, quantity, and top recipients, senders,
-  trademarks, product codes, and origin countries.
+- Open a separate Analytics tab for the current search/filter set: product
+  rows, unique declarations, companies, value, net/gross weight, average value
+  per kg, product codes, brands, countries, and price indicators.
+- See monthly dynamics on a bar chart: how value, row count, or net weight
+  changed month to month for the matching rows — seasonality, spikes, and
+  when a company started or stopped importing.
+- Compare who received/imported goods, who sent them, which product codes and
+  brands dominate, where goods came from, and how much value/weight each group
+  represents.
 - Copy single values, whole rows, or selected rows back into Excel.
 - Export search results to CSV or XLSX.
 - Keep the interface responsive while importing, searching, exporting, or
@@ -49,19 +58,19 @@ That makes repeated search and filtering much faster and more predictable.
 
 ## Quick Start
 
-Run the application:
+**Windows.** Run the prebuilt application:
 
 ```text
 dist\BaseSearch\BaseSearch.exe
 ```
 
-The local database is stored next to the executable:
+**Linux / macOS.** Build from source (see below) or download the binaries from
+the CI artifacts, then run `BaseSearch`.
 
-```text
-dist\BaseSearch\data\base_search.db
-```
-
-If the database file does not exist, Base Search creates it automatically.
+The local database is stored in a `data` folder next to the executable. When
+that location is not writable (for example, a system-wide install), Base Search
+falls back to `~/.base-search/` in the user's home directory. If the database
+file does not exist, it is created automatically.
 
 ## Basic Workflow
 
@@ -70,10 +79,45 @@ If the database file does not exist, Base Search creates it automatically.
 3. Type a query: product description, company name, product code, declaration
    number, trademark, or country.
 4. Narrow results with filters when needed.
-5. Open **Analytics** to calculate totals and top groups for the current query.
+5. Open **Analytics** to understand the current query: who moved the goods,
+   what goods dominate, where they came from, and what the value/weight picture
+   looks like.
 6. Double-click a row to open its full details.
 7. Right-click a row for quick copy and quick filter actions.
 8. Export the current result set to CSV or XLSX.
+
+## Analytics Tab
+
+Analytics always follows the same query and filters as the Results table. For
+example, if the user searches for `Apple` and filters year `2024`, the Analytics
+tab is calculated only for those matching rows.
+
+The top block, **Answer for current query**, shows the main numbers:
+
+- product rows, which are table rows, not declaration count;
+- unique declarations;
+- recipients, senders, and organization codes;
+- total value from the source value field when it is present;
+- net and gross weight;
+- average value per net kilogram;
+- counts of product codes, trademarks, and countries.
+
+The lower sections are compact charts instead of overloaded dashboards:
+
+| Section | What it answers |
+|---|---|
+| Monthly dynamics | How value, rows, or net weight changed month to month: seasonality, spikes, when imports started or stopped. Switch the metric above the chart; hover a bar for the full numbers. |
+| Companies | Who received/imported, who sent, and which organization codes are most important. |
+| Goods | Which product codes, brands, and short product groups dominate. |
+| Countries | Origin, dispatch, and trade countries for the matching shipments. |
+| Prices | Average, weighted, minimum, and maximum price indicators where source fields are filled. |
+
+Each row shows its share, value, weight, row count, declaration count, company
+count, and average value per kg. Clicking a row applies the matching filter back
+to the Results table.
+
+To avoid heavy full-database grouping by accident, the Analytics tab asks for a
+search term or filter before running large calculations.
 
 ## Search Syntax
 
@@ -113,6 +157,7 @@ In development testing, Base Search handled multi-million-row datasets locally:
 | Repeat import of the same file | Fast, because identical files are skipped by content hash. |
 | Narrow search | Usually interactive after indexing. |
 | Very broad search | Slower, because the app must count and page through many matching rows. |
+| Analytics | Calculated for the active query/filter. Broad analytics depends on result size and disk speed. |
 | CSV export | Recommended for very large result sets. |
 | XLSX export | Convenient for smaller exports, but limited by Excel worksheet size. |
 
@@ -140,26 +185,27 @@ benchmarking, and quick verification.
 
 Requirements:
 
-- Windows 10/11
-- Rust stable with the MSVC toolchain
+- Rust stable (1.96+)
+- **Windows:** MSVC toolchain (Visual Studio Build Tools)
+- **Linux:** `build-essential`, `pkg-config`, `libxkbcommon-dev`,
+  `libwayland-dev` (X11 and Wayland are both supported at runtime)
+- **macOS:** Xcode Command Line Tools
 
-Commands:
+Commands (identical on every platform):
 
-```powershell
+```bash
 cargo test
 cargo build --release
 ```
 
-Release binaries are created in:
-
-```text
-target\release\BaseSearch.exe
-target\release\base-search-cli.exe
-```
+Release binaries are created in `target/release/`: `BaseSearch` and
+`base-search-cli` (with `.exe` on Windows). Continuous integration builds and
+tests every commit on Windows, Linux, and macOS and publishes downloadable
+binaries as workflow artifacts.
 
 ## Architecture
 
-- **Rust** for the application core and Windows executables.
+- **Rust** for the application core and native executables on every platform.
 - **egui/eframe** for the desktop interface.
 - **calamine** for reading Excel files.
 - **SQLite** for local storage in a single database file.
@@ -176,6 +222,27 @@ datasets can grow to many gigabytes.
 Base Search has no cloud backend and does not upload user files. It reads
 selected local spreadsheets and writes a local SQLite database beside the
 application executable.
+
+## Changelog
+
+### 1.1
+
+- **Cross-platform support.** Base Search now builds and runs on Windows,
+  Linux (X11 and Wayland), and macOS. System fonts are picked per OS with a
+  safe built-in fallback; the database location falls back to the home
+  directory when the install folder is read-only.
+- **Monthly dynamics chart.** The Analytics tab opens with a bar chart of the
+  matched rows grouped by month, switchable between value ($), row count, and
+  net weight, with hover details for every month.
+- **Continuous integration.** Every commit is tested and built on all three
+  platforms; binaries are published as workflow artifacts.
+
+### 1.0
+
+- Initial public release: streaming Excel import (`.xlsx`/`.xlsb`/`.xls`),
+  full-text search with FTS5, filters, analytics tab with KPI tiles and
+  clickable share charts, two-level duplicate protection, CSV/XLSX export,
+  UA/RU/EN interface, light/dark theme.
 
 ## License
 
