@@ -1,0 +1,372 @@
+//! Interface strings: Ukrainian by default, plus Russian and English.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Lang {
+    #[default]
+    Ua,
+    Ru,
+    En,
+}
+
+impl Lang {
+    pub fn code(self) -> &'static str {
+        match self {
+            Lang::Ua => "ua",
+            Lang::Ru => "ru",
+            Lang::En => "en",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Lang {
+        match code {
+            "ru" => Lang::Ru,
+            "en" => Lang::En,
+            _ => Lang::Ua,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Lang::Ua => "Українська",
+            Lang::Ru => "Русский",
+            Lang::En => "English",
+        }
+    }
+
+    pub const ALL: [Lang; 3] = [Lang::Ua, Lang::Ru, Lang::En];
+}
+
+pub struct Tr {
+    pub app_title: &'static str,
+    pub import: &'static str,
+    pub export: &'static str,
+    pub find: &'static str,
+    pub search_hint: &'static str,
+    pub filters: &'static str,
+    pub clear_filters: &'static str,
+    pub year: &'static str,
+    pub product_code: &'static str,
+    pub sender: &'static str,
+    pub recipient: &'static str,
+    pub edrpou: &'static str,
+    pub trade_country: &'static str,
+    pub dispatch_country: &'static str,
+    pub origin_country: &'static str,
+    /// Rows range label.
+    pub rows_of: &'static str,
+    pub nothing_found: &'static str,
+    pub enter_query_hint: &'static str,
+    pub db_empty: &'static str,
+    /// Database row count label.
+    pub db_rows: &'static str,
+    pub searching: &'static str,
+    /// Search duration label.
+    pub search_ms: &'static str,
+    pub reading_file: &'static str,
+    pub writing_rows: &'static str,
+    pub indexing: &'static str,
+    pub exporting: &'static str,
+    pub cancel: &'static str,
+    /// Import completion summary.
+    pub import_done: &'static str,
+    /// Export completion summary.
+    pub export_done: &'static str,
+    pub error: &'static str,
+    pub choose_files: &'static str,
+    pub excel_files: &'static str,
+    pub save_as: &'static str,
+    pub details: &'static str,
+    pub close: &'static str,
+    pub copy_all: &'static str,
+    pub file_col: &'static str,
+    pub xlsx_limit: &'static str,
+    pub cancelled: &'static str,
+    /// Current file progress label.
+    pub file_of: &'static str,
+    /// Missing required columns message.
+    pub missing_cols: &'static str,
+    pub import_report: &'static str,
+    /// Per-file import result.
+    pub file_result: &'static str,
+    pub language: &'static str,
+    pub ready: &'static str,
+    /// Duplicate-file skip message.
+    pub file_skipped: &'static str,
+    pub copy_value: &'static str,
+    pub copy_row: &'static str,
+    /// Copy selected rows label.
+    pub copy_selected: &'static str,
+    pub flt_sender: &'static str,
+    pub flt_recipient: &'static str,
+    pub flt_code: &'static str,
+    pub flt_edrpou: &'static str,
+    pub settings: &'static str,
+    pub columns_btn: &'static str,
+    pub theme_label: &'static str,
+    pub theme_light: &'static str,
+    pub theme_dark: &'static str,
+    pub zoom_label: &'static str,
+    pub db_section: &'static str,
+    pub db_file_label: &'static str,
+    pub db_size_label: &'static str,
+    pub clear_db: &'static str,
+    pub clear_confirm: &'static str,
+    pub clear_yes: &'static str,
+    pub clearing: &'static str,
+    pub db_cleared: &'static str,
+    pub version_label: &'static str,
+    /// Selected rows count label.
+    pub selected_n: &'static str,
+}
+
+pub static UA: Tr = Tr {
+    app_title: "Base Search",
+    import: "📥 Імпорт Excel",
+    export: "💾 Експорт",
+    find: "Знайти",
+    search_hint: "Товар, компанія, код товару, номер декларації…  (поч* — пошук за початком слова)",
+    filters: "Фільтри",
+    clear_filters: "Скинути",
+    year: "Рік",
+    product_code: "Код товару",
+    sender: "Відправник",
+    recipient: "Одержувач",
+    edrpou: "ЕДРПОУ",
+    trade_country: "Країна торгівлі",
+    dispatch_country: "Країна відправлення",
+    origin_country: "Країна походження",
+    rows_of: "Рядки {}–{} з {}",
+    nothing_found: "Нічого не знайдено",
+    enter_query_hint: "Введіть запит і натисніть «Знайти»",
+    db_empty: "База порожня. Натисніть «Імпорт Excel», щоб додати файли.",
+    db_rows: "У базі: {} рядків",
+    searching: "Пошук…",
+    search_ms: "за {} мс",
+    reading_file: "Читання файлу…",
+    writing_rows: "Запис рядків",
+    indexing: "Індексація пошуку",
+    exporting: "Експорт рядків",
+    cancel: "Скасувати",
+    import_done: "Імпорт завершено: додано {}, дублікатів {}, помилок {}",
+    export_done: "Експортовано рядків: {}",
+    error: "Помилка",
+    choose_files: "Виберіть Excel-файли",
+    excel_files: "Excel-файли",
+    save_as: "Зберегти результати",
+    details: "Картка запису",
+    close: "Закрити",
+    copy_all: "Копіювати все",
+    file_col: "Файл",
+    xlsx_limit: "Забагато рядків для XLSX (ліміт 1 048 575). Збережіть у CSV.",
+    cancelled: "Скасовано",
+    file_of: "Файл {} з {}: {}",
+    missing_cols: "Відсутні обов'язкові колонки: {}",
+    import_report: "Підсумки імпорту",
+    file_result: "додано {}, дублікатів {}, {} с",
+    language: "Мова",
+    ready: "Готово",
+    file_skipped: "файл вже імпортовано (збігається з «{}»)",
+    copy_value: "Копіювати значення",
+    copy_row: "Копіювати рядок",
+    copy_selected: "Копіювати вибрані ({})",
+    flt_sender: "Усі постачання відправника",
+    flt_recipient: "Усі постачання одержувача",
+    flt_code: "Усе за цим кодом",
+    flt_edrpou: "Усе за цим ЄДРПОУ",
+    settings: "Налаштування",
+    columns_btn: "Колонки",
+    theme_label: "Тема",
+    theme_light: "Світла",
+    theme_dark: "Темна",
+    zoom_label: "Масштаб",
+    db_section: "База даних",
+    db_file_label: "Файл бази",
+    db_size_label: "Розмір",
+    clear_db: "Очистити базу",
+    clear_confirm: "Видалити всі імпортовані дані? Цю дію не можна скасувати.",
+    clear_yes: "Так, видалити",
+    clearing: "Очищення бази…",
+    db_cleared: "Базу очищено",
+    version_label: "Версія",
+    selected_n: "вибрано: {}",
+};
+
+pub static RU: Tr = Tr {
+    app_title: "Base Search",
+    import: "📥 Импорт Excel",
+    export: "💾 Экспорт",
+    find: "Найти",
+    search_hint: "Товар, компания, код товара, номер декларации…  (нач* — поиск по началу слова)",
+    filters: "Фильтры",
+    clear_filters: "Сбросить",
+    year: "Год",
+    product_code: "Код товара",
+    sender: "Отправитель",
+    recipient: "Получатель",
+    edrpou: "ЕДРПОУ",
+    trade_country: "Страна торговли",
+    dispatch_country: "Страна отправления",
+    origin_country: "Страна происхождения",
+    rows_of: "Строки {}–{} из {}",
+    nothing_found: "Ничего не найдено",
+    enter_query_hint: "Введите запрос и нажмите «Найти»",
+    db_empty: "База пуста. Нажмите «Импорт Excel», чтобы добавить файлы.",
+    db_rows: "В базе: {} строк",
+    searching: "Поиск…",
+    search_ms: "за {} мс",
+    reading_file: "Чтение файла…",
+    writing_rows: "Запись строк",
+    indexing: "Индексация поиска",
+    exporting: "Экспорт строк",
+    cancel: "Отмена",
+    import_done: "Импорт завершён: добавлено {}, дубликатов {}, ошибок {}",
+    export_done: "Экспортировано строк: {}",
+    error: "Ошибка",
+    choose_files: "Выберите Excel-файлы",
+    excel_files: "Excel-файлы",
+    save_as: "Сохранить результаты",
+    details: "Карточка записи",
+    close: "Закрыть",
+    copy_all: "Копировать всё",
+    file_col: "Файл",
+    xlsx_limit: "Слишком много строк для XLSX (лимит 1 048 575). Сохраните в CSV.",
+    cancelled: "Отменено",
+    file_of: "Файл {} из {}: {}",
+    missing_cols: "Нет обязательных колонок: {}",
+    import_report: "Итоги импорта",
+    file_result: "добавлено {}, дубликатов {}, {} с",
+    language: "Язык",
+    ready: "Готово",
+    file_skipped: "файл уже импортирован (совпадает с «{}»)",
+    copy_value: "Копировать значение",
+    copy_row: "Копировать строку",
+    copy_selected: "Копировать выбранные ({})",
+    flt_sender: "Все поставки отправителя",
+    flt_recipient: "Все поставки получателя",
+    flt_code: "Всё по этому коду",
+    flt_edrpou: "Всё по этому ЕДРПОУ",
+    settings: "Настройки",
+    columns_btn: "Колонки",
+    theme_label: "Тема",
+    theme_light: "Светлая",
+    theme_dark: "Тёмная",
+    zoom_label: "Масштаб",
+    db_section: "База данных",
+    db_file_label: "Файл базы",
+    db_size_label: "Размер",
+    clear_db: "Очистить базу",
+    clear_confirm: "Удалить все импортированные данные? Это действие необратимо.",
+    clear_yes: "Да, удалить",
+    clearing: "Очистка базы…",
+    db_cleared: "База очищена",
+    version_label: "Версия",
+    selected_n: "выбрано: {}",
+};
+
+pub static EN: Tr = Tr {
+    app_title: "Base Search",
+    import: "📥 Import Excel",
+    export: "💾 Export",
+    find: "Search",
+    search_hint: "Goods, company, product code, declaration number…  (wor* — prefix search)",
+    filters: "Filters",
+    clear_filters: "Reset",
+    year: "Year",
+    product_code: "Product code",
+    sender: "Sender",
+    recipient: "Recipient",
+    edrpou: "EDRPOU",
+    trade_country: "Trade country",
+    dispatch_country: "Dispatch country",
+    origin_country: "Origin country",
+    rows_of: "Rows {}–{} of {}",
+    nothing_found: "Nothing found",
+    enter_query_hint: "Type a query and press “Search”",
+    db_empty: "Database is empty. Click “Import Excel” to add files.",
+    db_rows: "Database: {} rows",
+    searching: "Searching…",
+    search_ms: "in {} ms",
+    reading_file: "Reading file…",
+    writing_rows: "Writing rows",
+    indexing: "Building search index",
+    exporting: "Exporting rows",
+    cancel: "Cancel",
+    import_done: "Import finished: added {}, duplicates {}, errors {}",
+    export_done: "Rows exported: {}",
+    error: "Error",
+    choose_files: "Choose Excel files",
+    excel_files: "Excel files",
+    save_as: "Save results",
+    details: "Record details",
+    close: "Close",
+    copy_all: "Copy all",
+    file_col: "File",
+    xlsx_limit: "Too many rows for XLSX (limit 1,048,575). Save as CSV instead.",
+    cancelled: "Cancelled",
+    file_of: "File {} of {}: {}",
+    missing_cols: "Missing required columns: {}",
+    import_report: "Import summary",
+    file_result: "added {}, duplicates {}, {} s",
+    language: "Language",
+    ready: "Ready",
+    file_skipped: "file already imported (identical to “{}”)",
+    copy_value: "Copy value",
+    copy_row: "Copy row",
+    copy_selected: "Copy selected ({})",
+    flt_sender: "All shipments of this sender",
+    flt_recipient: "All shipments of this recipient",
+    flt_code: "Everything with this code",
+    flt_edrpou: "Everything with this EDRPOU",
+    settings: "Settings",
+    columns_btn: "Columns",
+    theme_label: "Theme",
+    theme_light: "Light",
+    theme_dark: "Dark",
+    zoom_label: "Zoom",
+    db_section: "Database",
+    db_file_label: "Database file",
+    db_size_label: "Size",
+    clear_db: "Clear database",
+    clear_confirm: "Delete all imported data? This cannot be undone.",
+    clear_yes: "Yes, delete",
+    clearing: "Clearing database…",
+    db_cleared: "Database cleared",
+    version_label: "Version",
+    selected_n: "selected: {}",
+};
+
+pub fn tr(lang: Lang) -> &'static Tr {
+    match lang {
+        Lang::Ua => &UA,
+        Lang::Ru => &RU,
+        Lang::En => &EN,
+    }
+}
+
+/// Replaces consecutive "{}" placeholders with the provided arguments.
+pub fn fmt(pattern: &str, args: &[&str]) -> String {
+    let mut out = String::with_capacity(pattern.len() + 16);
+    let mut rest = pattern;
+    let mut i = 0;
+    while let Some(pos) = rest.find("{}") {
+        out.push_str(&rest[..pos]);
+        out.push_str(args.get(i).copied().unwrap_or(""));
+        rest = &rest[pos + 2..];
+        i += 1;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 1234567 -> "1 234 567"
+pub fn group_digits(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push('\u{202F}'); // narrow no-break space
+        }
+        out.push(ch);
+    }
+    out
+}

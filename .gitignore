@@ -1,0 +1,38 @@
+# Rust build output
+/target/
+
+# Packaged application builds and bundled local databases
+/dist/
+
+# Local application data and SQLite sidecar files
+/data/
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Source datasets and generated exports
+*.xlsx
+*.xls
+*.xlsb
+*.csv
+
+# Local configuration, logs, and temporary files
+.env
+.env.*
+*.log
+*.tmp
+*.temp
+
+# Editor and OS files
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
