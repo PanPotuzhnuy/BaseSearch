@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use egui_extras::{Column, TableBuilder};
 
-use crate::db::{Db, Filters, Query, RecordCard};
+use crate::db::{Analytics, AnalyticsGroupRow, Db, Filters, Query, RecordCard};
 use crate::export::ExportError;
 use crate::i18n::{Lang, Tr, fmt, group_digits, tr};
 use crate::import::{FileSummary, ImportPhase};
@@ -31,7 +31,7 @@ enum RowMenuAction {
     FilterEdrpou(String),
 }
 
-type QuickAction = (&'static str, usize, fn(String) -> RowMenuAction);
+type QuickAction = (&'static str, &'static str, fn(String) -> RowMenuAction);
 
 /// Visual cell type.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,16 +49,37 @@ enum CellKind {
 /// Result column width and visual style.
 fn col_spec(name: &str) -> (f32, CellKind) {
     match name {
+        "clearance_time" => (130.0, CellKind::Weak),
+        "customs_office" => (190.0, CellKind::Weak),
+        "declaration_type" => (72.0, CellKind::Weak),
         "declaration_date" => (88.0, CellKind::Weak),
         "declaration_number" => (150.0, CellKind::Weak),
         "sender" => (195.0, CellKind::Normal),
         "recipient" => (195.0, CellKind::Normal),
+        "item_number" => (58.0, CellKind::Number),
         "description" => (440.0, CellKind::Normal),
         "product_code" => (104.0, CellKind::Code),
         "edrpou" => (88.0, CellKind::Weak),
         "trade_country" | "dispatch_country" | "origin_country" => (76.0, CellKind::Weak),
+        "delivery_terms" => (92.0, CellKind::Weak),
+        "delivery_place" => (140.0, CellKind::Weak),
         "quantity" => (76.0, CellKind::Number),
-        "gross_kg" | "net_kg" => (92.0, CellKind::Number),
+        "unit" => (72.0, CellKind::Weak),
+        "gross_kg"
+        | "net_kg"
+        | "declaration_weight"
+        | "currency_control_value"
+        | "rfv_usd_kg"
+        | "unit_weight"
+        | "weight_difference"
+        | "rmv_net_usd_kg"
+        | "rmv_usd_extra_unit"
+        | "rmv_gross_usd_kg"
+        | "min_base_usd_kg"
+        | "min_base_difference"
+        | "preferential"
+        | "full_rate" => (112.0, CellKind::Number),
+        "contract" => (150.0, CellKind::Weak),
         "trademark" => (110.0, CellKind::Weak),
         "source_file" => (140.0, CellKind::Weak),
         _ => (110.0, CellKind::Normal),
@@ -115,6 +136,8 @@ pub struct App {
     total: Option<u64>,
     rows: Vec<Vec<String>>,
     row_ids: Vec<i64>,
+    analytics: Option<Analytics>,
+    show_analytics: bool,
     selected: HashSet<usize>,
     select_anchor: Option<usize>,
     visible_cols: Vec<bool>,
@@ -194,6 +217,8 @@ impl App {
             total: None,
             rows: Vec::new(),
             row_ids: Vec::new(),
+            analytics: None,
+            show_analytics: false,
             selected: HashSet::new(),
             select_anchor: None,
             visible_cols,
@@ -266,10 +291,14 @@ impl App {
         };
         self.search_gen += 1;
         self.search_in_flight = true;
+        if self.show_analytics {
+            self.analytics = None;
+        }
         let _ = self.search_tx.send(WorkerReq::Search {
             q: Box::new(self.active_query.clone()),
             page: self.page,
             generation: self.search_gen,
+            include_analytics: self.show_analytics,
         });
     }
 
@@ -281,6 +310,7 @@ impl App {
             q: Box::new(self.active_query.clone()),
             page,
             generation: self.search_gen,
+            include_analytics: false,
         });
     }
 
@@ -298,12 +328,18 @@ impl App {
                     ids,
                     rows,
                     total,
+                    analytics,
                     ms,
                 } => {
                     if generation == self.search_gen {
                         self.row_ids = ids;
                         self.rows = rows;
                         self.total = Some(total);
+                        if let Some(analytics) = analytics {
+                            self.analytics = Some(*analytics);
+                        } else if !self.show_analytics || self.active_query.is_empty() {
+                            self.analytics = None;
+                        }
                         self.last_search_ms = Some(ms);
                         self.search_in_flight = false;
                         self.selected.clear();
@@ -439,7 +475,7 @@ impl App {
             .set_title(t.save_as)
             .add_filter("CSV", &["csv"])
             .add_filter("Excel", &["xlsx"])
-            .set_file_name("customs_export.csv")
+            .set_file_name("base_search_export.csv")
             .save_file();
         let Some(mut dest) = dest else { return };
         if dest.extension().is_none() {
@@ -563,6 +599,7 @@ impl App {
         let mut do_search = false;
         let mut do_import = false;
         let mut do_export = false;
+        let mut analytics_toggled = false;
         let frame = egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin {
             left: 12,
             right: 12,
@@ -615,6 +652,14 @@ impl App {
                                 }
                             }
                         });
+                        let analytics_btn = ui.selectable_label(self.show_analytics, t.analytics);
+                        if analytics_btn.clicked() {
+                            self.show_analytics = !self.show_analytics;
+                            analytics_toggled = true;
+                            if !self.show_analytics {
+                                self.analytics = None;
+                            }
+                        }
                         let filters_btn = ui.selectable_label(self.show_filters, t.filters);
                         if filters_btn.clicked() {
                             self.show_filters = !self.show_filters;
@@ -646,6 +691,8 @@ impl App {
             });
         if do_search {
             self.start_search(true);
+        } else if analytics_toggled && self.show_analytics {
+            self.start_search(false);
         }
         if do_import {
             self.pick_and_import(&ctx);
@@ -876,6 +923,100 @@ impl App {
         }
     }
 
+    fn ui_analytics_panel(&mut self, root: &mut egui::Ui) {
+        if !self.show_analytics {
+            return;
+        }
+        egui::Panel::right("analytics_panel")
+            .resizable(true)
+            .default_size(380.0)
+            .size_range(300.0..=560.0)
+            .show_inside(root, |ui| {
+                let t = self.t();
+                ui.horizontal(|ui| {
+                    ui.heading(t.analytics);
+                    if self.search_in_flight {
+                        ui.spinner();
+                    }
+                });
+                ui.separator();
+
+                if self.active_query.is_empty() {
+                    ui.label(egui::RichText::new(t.analytics_hint).weak());
+                    return;
+                }
+
+                let Some(analytics) = &self.analytics else {
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(t.searching);
+                    });
+                    return;
+                };
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::Grid::new("analytics_overview")
+                        .num_columns(2)
+                        .striped(true)
+                        .spacing([16.0, 7.0])
+                        .show(ui, |ui| {
+                            metric(ui, t.rows_label, group_digits(analytics.overview.row_count));
+                            metric(
+                                ui,
+                                t.unique_senders,
+                                group_digits(analytics.overview.distinct_senders),
+                            );
+                            metric(
+                                ui,
+                                t.unique_recipients,
+                                group_digits(analytics.overview.distinct_recipients),
+                            );
+                            metric(
+                                ui,
+                                t.unique_edrpou,
+                                group_digits(analytics.overview.distinct_edrpou),
+                            );
+                            metric(
+                                ui,
+                                t.unique_trademarks,
+                                group_digits(analytics.overview.distinct_trademarks),
+                            );
+                            metric(
+                                ui,
+                                t.total_value,
+                                format!("{} $", fmt_decimal(analytics.overview.total_value_usd, 2)),
+                            );
+                            metric(
+                                ui,
+                                t.gross_weight,
+                                fmt_decimal(analytics.overview.total_gross_kg, 3),
+                            );
+                            metric(
+                                ui,
+                                t.net_weight,
+                                fmt_decimal(analytics.overview.total_net_kg, 3),
+                            );
+                            metric(
+                                ui,
+                                t.quantity,
+                                fmt_decimal(analytics.overview.total_quantity, 3),
+                            );
+                        });
+
+                    analytics_group_table(ui, t.top_recipients, &analytics.top_recipients);
+                    analytics_group_table(ui, t.top_senders, &analytics.top_senders);
+                    analytics_group_table(ui, t.top_trademarks, &analytics.top_trademarks);
+                    analytics_group_table(ui, t.top_product_codes, &analytics.top_product_codes);
+                    analytics_group_table(
+                        ui,
+                        t.top_origin_countries,
+                        &analytics.top_origin_countries,
+                    );
+                });
+            });
+    }
+
     fn ui_table(&mut self, root: &mut egui::Ui) {
         egui::CentralPanel::default().show_inside(root, |ui| {
             if self.rows.is_empty() {
@@ -1008,15 +1149,20 @@ impl App {
                                         ui.close();
                                     }
                                     ui.separator();
-                                    // RESULT_COLUMNS indexes: 2=sender,
-                                    // 3=recipient, 5=product code, 6=EDRPOU.
                                     let quick: [QuickAction; 4] = [
-                                        (t.flt_sender, 2, RowMenuAction::FilterSender),
-                                        (t.flt_recipient, 3, RowMenuAction::FilterRecipient),
-                                        (t.flt_code, 5, RowMenuAction::FilterCode),
-                                        (t.flt_edrpou, 6, RowMenuAction::FilterEdrpou),
+                                        (t.flt_sender, "sender", RowMenuAction::FilterSender),
+                                        (
+                                            t.flt_recipient,
+                                            "recipient",
+                                            RowMenuAction::FilterRecipient,
+                                        ),
+                                        (t.flt_code, "product_code", RowMenuAction::FilterCode),
+                                        (t.flt_edrpou, "edrpou", RowMenuAction::FilterEdrpou),
                                     ];
-                                    for (label, col, make) in quick {
+                                    for (label, column, make) in quick {
+                                        let Some(col) = result_col_index(column) else {
+                                            continue;
+                                        };
                                         let cell = cells[col].trim();
                                         if cell.is_empty() {
                                             continue;
@@ -1311,6 +1457,7 @@ impl eframe::App for App {
         }
         self.ui_toolbar(root);
         self.ui_status_bar(root);
+        self.ui_analytics_panel(root);
         self.ui_table(root);
         self.ui_card_window(&ctx);
         self.ui_import_report(&ctx);
@@ -1321,6 +1468,85 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
     }
+}
+
+fn metric(ui: &mut egui::Ui, label: &str, value: String) {
+    ui.label(egui::RichText::new(label).weak());
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.label(egui::RichText::new(value).strong().monospace());
+    });
+    ui.end_row();
+}
+
+fn analytics_group_table(ui: &mut egui::Ui, title: &str, rows: &[AnalyticsGroupRow]) {
+    ui.add_space(14.0);
+    ui.label(egui::RichText::new(title).strong());
+    ui.add_space(3.0);
+    if rows.is_empty() {
+        ui.label(egui::RichText::new("\u{2014}").weak());
+        return;
+    }
+    egui::Grid::new(("analytics_group", title))
+        .num_columns(3)
+        .striped(true)
+        .spacing([10.0, 5.0])
+        .show(ui, |ui| {
+            for row in rows {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&row.label))
+                        .truncate()
+                        .selectable(false),
+                )
+                .on_hover_text(&row.label);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(group_digits(row.rows)).monospace());
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} $", fmt_decimal(row.total_value_usd, 2)))
+                            .monospace(),
+                    );
+                });
+                ui.end_row();
+            }
+        });
+}
+
+fn fmt_decimal(value: f64, decimals: usize) -> String {
+    if !value.is_finite() {
+        return "0".to_string();
+    }
+    let mut s = format!("{value:.decimals$}");
+    if let Some(dot) = s.find('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.len() == dot + 1 {
+            s.pop();
+        }
+    }
+    let (sign, body) = s
+        .strip_prefix('-')
+        .map(|rest| ("-", rest))
+        .unwrap_or(("", s.as_str()));
+    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+    let mut grouped = String::with_capacity(s.len() + s.len() / 3);
+    grouped.push_str(sign);
+    for (i, ch) in int_part.chars().enumerate() {
+        if i > 0 && (int_part.len() - i).is_multiple_of(3) {
+            grouped.push('\u{202F}');
+        }
+        grouped.push(ch);
+    }
+    if !frac_part.is_empty() {
+        grouped.push('.');
+        grouped.push_str(frac_part);
+    }
+    grouped
+}
+
+fn result_col_index(name: &str) -> Option<usize> {
+    RESULT_COLUMNS.iter().position(|column| *column == name)
 }
 
 fn filter_field(ui: &mut egui::Ui, label: &str, value: &mut String, width: f32, search: &mut bool) {

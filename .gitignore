@@ -1,8 +1,14 @@
 # Rust build output
 /target/
 
-# Packaged application builds and bundled local databases
-/dist/
+# Packaged application builds. Keep the public Windows binaries in the repo,
+# but never commit local databases created beside the executable.
+/dist/*
+!/dist/BaseSearch/
+!/dist/BaseSearch/BaseSearch.exe
+!/dist/BaseSearch/base-search-cli.exe
+!/dist/BaseSearch/README.txt
+/dist/BaseSearch/data/
 
 # Local application data and SQLite sidecar files
 /data/

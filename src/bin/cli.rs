@@ -9,6 +9,7 @@ use std::time::Instant;
 use base_search::db::{Db, Filters, Query};
 use base_search::export;
 use base_search::import::{self, ImportPhase};
+use base_search::schema::RESULT_COLUMNS;
 
 const USAGE: &str = "base-search-cli — техническая проверка базы Base Search
 
@@ -18,6 +19,8 @@ const USAGE: &str = "base-search-cli — техническая проверка
   base-search-cli import <db> <file.xlsx|file.xlsb> [...]
   base-search-cli search <db> [запрос...] [--limit N] [--year Y] [--code C]
                      [--sender S] [--recipient R] [--edrpou E]
+  base-search-cli analytics <db> [запрос...] [--year Y] [--code C]
+                       [--sender S] [--recipient R] [--edrpou E]
   base-search-cli export <db> <out.csv|out.xlsx> [запрос...]";
 
 fn main() -> ExitCode {
@@ -27,6 +30,7 @@ fn main() -> ExitCode {
         Some("peek") if args.len() == 2 => cmd_peek(Path::new(&args[1])),
         Some("import") if args.len() >= 3 => cmd_import(Path::new(&args[1]), &args[2..]),
         Some("search") if args.len() >= 2 => cmd_search(Path::new(&args[1]), &args[2..]),
+        Some("analytics") if args.len() >= 2 => cmd_analytics(Path::new(&args[1]), &args[2..]),
         Some("export") if args.len() >= 3 => cmd_export(Path::new(&args[1]), &args[2], &args[3..]),
         Some("sql") if args.len() == 3 => cmd_sql(Path::new(&args[1]), &args[2]),
         _ => {
@@ -223,19 +227,68 @@ fn cmd_search(db_path: &Path, args: &[String]) -> Result<(), String> {
     let page_ms = started.elapsed().as_millis();
     println!("Найдено: {total} (count {count_ms} мс, страница {page_ms} мс)");
     for row in &rows {
-        // date, declaration number, sender, recipient, code, description
-        let desc: String = row[4].chars().take(60).collect();
+        let desc: String = result_value(row, "description").chars().take(60).collect();
         println!(
             "  {} | {} | {} | {} | {} | {}",
-            row[0],
-            row[1],
-            trunc(&row[2], 25),
-            trunc(&row[3], 25),
-            row[5],
+            result_value(row, "declaration_date"),
+            result_value(row, "declaration_number"),
+            trunc(result_value(row, "sender"), 25),
+            trunc(result_value(row, "recipient"), 25),
+            result_value(row, "product_code"),
             desc
         );
     }
     Ok(())
+}
+
+fn cmd_analytics(db_path: &Path, args: &[String]) -> Result<(), String> {
+    let mut db = Db::open(db_path)?;
+    ensure_indexed(&mut db)?;
+    let (q, _) = parse_query(args);
+    let started = Instant::now();
+    let analytics = db.analytics(&q, 10).map_err(|e| e.to_string())?;
+    println!(
+        "Строк: {}  отправителей: {}  получателей: {}  торговых марок: {}",
+        analytics.overview.row_count,
+        analytics.overview.distinct_senders,
+        analytics.overview.distinct_recipients,
+        analytics.overview.distinct_trademarks
+    );
+    println!(
+        "Сумма: {:.2} $  брутто: {:.3} кг  нетто: {:.3} кг  количество: {:.3}",
+        analytics.overview.total_value_usd,
+        analytics.overview.total_gross_kg,
+        analytics.overview.total_net_kg,
+        analytics.overview.total_quantity
+    );
+    print_group("Топ получателей", &analytics.top_recipients);
+    print_group("Топ отправителей", &analytics.top_senders);
+    print_group("Топ торговых марок", &analytics.top_trademarks);
+    print_group("Топ кодов товара", &analytics.top_product_codes);
+    println!("Готово за {} мс", started.elapsed().as_millis());
+    Ok(())
+}
+
+fn print_group(title: &str, rows: &[base_search::db::AnalyticsGroupRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    println!("\n{title}:");
+    for row in rows {
+        println!(
+            "  {} | строк {} | {:.2} $ | нетто {:.3} кг",
+            row.label, row.rows, row.total_value_usd, row.total_net_kg
+        );
+    }
+}
+
+fn result_value<'a>(row: &'a [String], name: &str) -> &'a str {
+    RESULT_COLUMNS
+        .iter()
+        .position(|column| *column == name)
+        .and_then(|idx| row.get(idx))
+        .map(String::as_str)
+        .unwrap_or("")
 }
 
 fn trunc(s: &str, n: usize) -> String {

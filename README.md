@@ -1,9 +1,10 @@
 # Base Search 1.0
 
-Base Search is a local Windows desktop application for fast search across large
-Excel datasets. It imports spreadsheet files into a local database, builds a
-search index, and lets users find records without fighting slow filters,
-freezing workbooks, or repeated manual searches in Excel.
+Base Search is a local Windows desktop application for fast search and basic
+analytics across large Excel datasets. It imports spreadsheet files into a local
+database, builds a search index, and lets users find, inspect, summarize, and
+export records without fighting slow filters, freezing workbooks, or repeated
+manual searches in Excel.
 
 The first version was built for customs and import datasets, but the core idea
 is broader: take large tabular Excel exports, store them locally, and make them
@@ -18,7 +19,12 @@ on the user's computer.
 - Search across product descriptions, companies, product codes, declaration
   numbers, trademarks, countries, and dates.
 - Filter by year, product code, company, organization code, and country fields.
+- View all imported source columns in the result table, including value, price,
+  weight, rate, and technical customs fields when they exist in the source data.
 - Open a full details view for any result row.
+- Calculate analytics for the current search/filter set: row count, unique
+  companies, total value, weight, quantity, and top recipients, senders,
+  trademarks, product codes, and origin countries.
 - Copy single values, whole rows, or selected rows back into Excel.
 - Export search results to CSV or XLSX.
 - Keep the interface responsive while importing, searching, exporting, or
@@ -64,9 +70,10 @@ If the database file does not exist, Base Search creates it automatically.
 3. Type a query: product description, company name, product code, declaration
    number, trademark, or country.
 4. Narrow results with filters when needed.
-5. Double-click a row to open its full details.
-6. Right-click a row for quick copy and quick filter actions.
-7. Export the current result set to CSV or XLSX.
+5. Open **Analytics** to calculate totals and top groups for the current query.
+6. Double-click a row to open its full details.
+7. Right-click a row for quick copy and quick filter actions.
+8. Export the current result set to CSV or XLSX.
 
 ## Search Syntax
 
@@ -122,6 +129,7 @@ base-search-cli stats  <db>
 base-search-cli peek   <file.xlsx|file.xlsb>
 base-search-cli import <db> <file.xlsx|file.xlsb> [...]
 base-search-cli search <db> [query...] [--limit N] [--year Y] [--code C]
+base-search-cli analytics <db> [query...] [--year Y] [--code C]
 base-search-cli export <db> <out.csv|out.xlsx> [query...]
 ```
 
@@ -156,6 +164,7 @@ target\release\base-search-cli.exe
 - **calamine** for reading Excel files.
 - **SQLite** for local storage in a single database file.
 - **SQLite FTS5** for fast full-text search.
+- **SQLite aggregate queries** for local analytics over the current result set.
 - **xxhash** for duplicate detection.
 - **CSV and XLSX writers** for exporting results.
 

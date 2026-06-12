@@ -77,6 +77,39 @@ pub struct ImportLogEntry {
     pub imported_at: String,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct AnalyticsOverview {
+    pub row_count: u64,
+    pub distinct_senders: u64,
+    pub distinct_recipients: u64,
+    pub distinct_edrpou: u64,
+    pub distinct_trademarks: u64,
+    pub total_value_usd: f64,
+    pub total_gross_kg: f64,
+    pub total_net_kg: f64,
+    pub total_quantity: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AnalyticsGroupRow {
+    pub label: String,
+    pub rows: u64,
+    pub total_value_usd: f64,
+    pub total_net_kg: f64,
+    pub total_gross_kg: f64,
+    pub total_quantity: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Analytics {
+    pub overview: AnalyticsOverview,
+    pub top_recipients: Vec<AnalyticsGroupRow>,
+    pub top_senders: Vec<AnalyticsGroupRow>,
+    pub top_trademarks: Vec<AnalyticsGroupRow>,
+    pub top_product_codes: Vec<AnalyticsGroupRow>,
+    pub top_origin_countries: Vec<AnalyticsGroupRow>,
+}
+
 pub struct Db {
     pub conn: Connection,
 }
@@ -140,6 +173,18 @@ impl Db {
                     (Some(h), Some(n)) => contains_ci(h, n),
                     _ => false,
                 })
+            },
+        )?;
+        self.conn.create_scalar_function(
+            "num_value",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let raw = ctx
+                    .get_raw(0)
+                    .as_str_or_null()
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                Ok(raw.and_then(parse_number))
             },
         )?;
         self.conn.execute_batch(
@@ -472,6 +517,90 @@ impl Db {
         })
     }
 
+    // ---------- analytics ----------
+
+    pub fn analytics(&self, q: &Query, limit: u64) -> rusqlite::Result<Analytics> {
+        let (joins, where_sql, params) = self.build_where(q);
+        let sql = format!(
+            "SELECT
+                COUNT(*),
+                COUNT(DISTINCT NULLIF(TRIM(r.sender), '')),
+                COUNT(DISTINCT NULLIF(TRIM(r.recipient), '')),
+                COUNT(DISTINCT NULLIF(TRIM(r.edrpou), '')),
+                COUNT(DISTINCT NULLIF(TRIM(r.trademark), '')),
+                SUM(num_value(r.currency_control_value)),
+                SUM(num_value(r.gross_kg)),
+                SUM(num_value(r.net_kg)),
+                SUM(num_value(r.quantity))
+             FROM records r{joins}{where_sql}"
+        );
+        let overview = self
+            .conn
+            .query_row(&sql, params_from_iter(params.clone()), |row| {
+                Ok(AnalyticsOverview {
+                    row_count: row.get::<_, i64>(0)? as u64,
+                    distinct_senders: row.get::<_, i64>(1)? as u64,
+                    distinct_recipients: row.get::<_, i64>(2)? as u64,
+                    distinct_edrpou: row.get::<_, i64>(3)? as u64,
+                    distinct_trademarks: row.get::<_, i64>(4)? as u64,
+                    total_value_usd: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                    total_gross_kg: row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                    total_net_kg: row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                    total_quantity: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
+                })
+            })?;
+
+        Ok(Analytics {
+            overview,
+            top_recipients: self.analytics_group(q, "recipient", limit)?,
+            top_senders: self.analytics_group(q, "sender", limit)?,
+            top_trademarks: self.analytics_group(q, "trademark", limit)?,
+            top_product_codes: self.analytics_group(q, "product_code", limit)?,
+            top_origin_countries: self.analytics_group(q, "origin_country", limit)?,
+        })
+    }
+
+    fn analytics_group(
+        &self,
+        q: &Query,
+        column: &str,
+        limit: u64,
+    ) -> rusqlite::Result<Vec<AnalyticsGroupRow>> {
+        let (joins, where_sql, mut params) = self.build_where(q);
+        let non_empty = format!("TRIM(COALESCE(r.{column}, '')) <> ''");
+        let filter_sql = if where_sql.is_empty() {
+            format!(" WHERE {non_empty}")
+        } else {
+            format!("{where_sql} AND {non_empty}")
+        };
+        let sql = format!(
+            "SELECT
+                TRIM(r.{column}) AS label,
+                COUNT(*) AS rows_count,
+                COALESCE(SUM(num_value(r.currency_control_value)), 0.0) AS total_value_usd,
+                COALESCE(SUM(num_value(r.net_kg)), 0.0) AS total_net_kg,
+                COALESCE(SUM(num_value(r.gross_kg)), 0.0) AS total_gross_kg,
+                COALESCE(SUM(num_value(r.quantity)), 0.0) AS total_quantity
+             FROM records r{joins}{filter_sql}
+             GROUP BY TRIM(r.{column})
+             ORDER BY total_value_usd DESC, rows_count DESC, label COLLATE NOCASE
+             LIMIT ?"
+        );
+        params.push((limit as i64).into());
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params), |row| {
+            Ok(AnalyticsGroupRow {
+                label: row.get(0)?,
+                rows: row.get::<_, i64>(1)? as u64,
+                total_value_usd: row.get(2)?,
+                total_net_kg: row.get(3)?,
+                total_gross_kg: row.get(4)?,
+                total_quantity: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     // ---------- statistics ----------
 
     pub fn total_rows(&self) -> u64 {
@@ -634,6 +763,63 @@ pub fn contains_ci(hay: &str, needle_lower: &str) -> bool {
         }
     }
     false
+}
+
+pub fn parse_number(value: &str) -> Option<f64> {
+    let mut compact = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_digit() || matches!(ch, '.' | ',' | '-' | '+') {
+            compact.push(ch);
+        }
+    }
+    if !compact.chars().any(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    let dot_count = compact.matches('.').count();
+    let comma_count = compact.matches(',').count();
+    let decimal_sep = match (dot_count, comma_count) {
+        (0, 0) => None,
+        (0, 1) => decimal_separator_for_single(&compact, ','),
+        (1, 0) => decimal_separator_for_single(&compact, '.'),
+        (0, _) | (_, 0) => None,
+        _ => {
+            let last_dot = compact.rfind('.').unwrap_or(0);
+            let last_comma = compact.rfind(',').unwrap_or(0);
+            Some(if last_dot > last_comma { '.' } else { ',' })
+        }
+    };
+
+    let mut normalized = String::with_capacity(compact.len());
+    let mut sign_written = false;
+    let mut decimal_written = false;
+    for (i, ch) in compact.chars().enumerate() {
+        if ch.is_ascii_digit() {
+            normalized.push(ch);
+        } else if matches!(ch, '-' | '+') && !sign_written && normalized.is_empty() && i == 0 {
+            normalized.push(ch);
+            sign_written = true;
+        } else if Some(ch) == decimal_sep && !decimal_written {
+            normalized.push('.');
+            decimal_written = true;
+        }
+    }
+
+    normalized.parse::<f64>().ok()
+}
+
+fn decimal_separator_for_single(value: &str, sep: char) -> Option<char> {
+    let pos = value.rfind(sep)?;
+    let before = value[..pos].chars().filter(|c| c.is_ascii_digit()).count();
+    let after = value[pos + sep.len_utf8()..]
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .count();
+    if after == 0 || (after == 3 && before > 0) {
+        None
+    } else {
+        Some(sep)
+    }
 }
 
 fn parse_year(value: &str) -> Option<i64> {

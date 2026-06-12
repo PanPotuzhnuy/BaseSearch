@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
 
-use crate::db::{Db, Query};
+use crate::db::{Analytics, Db, Query};
 use crate::export::{self, ExportError};
 use crate::import::{self, FileSummary, ImportPhase};
 
@@ -15,6 +15,7 @@ pub enum WorkerReq {
         q: Box<Query>,
         page: u64,
         generation: u64,
+        include_analytics: bool,
     },
     Stats,
 }
@@ -35,6 +36,7 @@ pub enum Msg {
         ids: Vec<i64>,
         rows: Vec<Vec<String>>,
         total: u64,
+        analytics: Option<Box<Analytics>>,
         ms: u64,
     },
     SearchError {
@@ -75,6 +77,7 @@ pub fn spawn_search_worker(
                     q,
                     page,
                     generation,
+                    include_analytics,
                 } => {
                     let started = Instant::now();
                     let total = match count_cache.as_ref().filter(|(cq, _)| cq == q.as_ref()) {
@@ -83,15 +86,21 @@ pub fn spawn_search_worker(
                     };
                     let result = total.and_then(|total| {
                         count_cache = Some(((*q).clone(), total));
-                        db.search_page(&q, PAGE_SIZE, page * PAGE_SIZE)
-                            .map(|(ids, rows)| (ids, rows, total))
+                        let (ids, rows) = db.search_page(&q, PAGE_SIZE, page * PAGE_SIZE)?;
+                        let analytics = if include_analytics && !q.is_empty() {
+                            Some(Box::new(db.analytics(&q, 10)?))
+                        } else {
+                            None
+                        };
+                        Ok((ids, rows, total, analytics))
                     });
                     let msg = match result {
-                        Ok((ids, rows, total)) => Msg::SearchDone {
+                        Ok((ids, rows, total, analytics)) => Msg::SearchDone {
                             generation,
                             ids,
                             rows,
                             total,
+                            analytics,
                             ms: started.elapsed().as_millis() as u64,
                         },
                         Err(e) => Msg::SearchError {

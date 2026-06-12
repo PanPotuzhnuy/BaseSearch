@@ -4,10 +4,10 @@
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
-use base_search::db::{Db, Filters, Query, build_fts_query, extract_year};
+use base_search::db::{Db, Filters, Query, build_fts_query, extract_year, parse_number};
 use base_search::export;
 use base_search::import::{self, collapse_ws, normalize_date, normalize_value};
-use base_search::schema::{COLUMNS, col_index};
+use base_search::schema::{COLUMNS, RESULT_COLUMNS, col_index};
 use calamine::Reader;
 
 #[test]
@@ -15,6 +15,23 @@ fn public_product_name_is_base_search() {
     assert_eq!(base_search::i18n::UA.app_title, "Base Search");
     assert_eq!(base_search::i18n::RU.app_title, "Base Search");
     assert_eq!(base_search::i18n::EN.app_title, "Base Search");
+}
+
+fn result_col(name: &str) -> usize {
+    RESULT_COLUMNS
+        .iter()
+        .position(|column| *column == name)
+        .unwrap_or_else(|| panic!("missing result column {name}"))
+}
+
+#[test]
+fn result_table_exposes_all_source_columns() {
+    let expected: Vec<&str> = COLUMNS
+        .iter()
+        .map(|column| column.name)
+        .chain(std::iter::once("source_file"))
+        .collect();
+    assert_eq!(RESULT_COLUMNS.as_slice(), expected.as_slice());
 }
 
 /// Creates a test XLSX file with the full schema column set.
@@ -125,7 +142,7 @@ fn import_search_filter_export() {
 
     // The date is normalized to ISO and the year is extracted.
     let (_, rows) = db.search_page(&q("8504"), 10, 0).unwrap();
-    assert_eq!(rows[0][0], "2024-03-17");
+    assert_eq!(rows[0][result_col("declaration_date")], "2024-03-17");
 
     // Filters.
     let filters = Filters {
@@ -236,6 +253,124 @@ fn import_search_filter_export() {
     assert_eq!(range.height(), 5); // header + 4 rows
 }
 
+#[test]
+fn analytics_summarizes_filtered_rows_by_value_and_company() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("analytics.xlsx");
+    let db_path = dir.path().join("data").join("analytics.db");
+    write_test_xlsx(
+        &xlsx,
+        &[
+            vec![
+                ("declaration_number", "24UA100110000101U1"),
+                ("declaration_date", "15.03.2024"),
+                ("sender", "APPLE DISTRIBUTION INTERNATIONAL LTD"),
+                ("edrpou", "11111111"),
+                ("recipient", "ТОВ «АЙФОН УКРАЇНА»"),
+                ("product_code", "8517130000"),
+                ("description", "Apple iPhone 15 smartphone"),
+                ("trade_country", "IE"),
+                ("origin_country", "CN"),
+                ("quantity", "10"),
+                ("gross_kg", "12.5"),
+                ("net_kg", "10"),
+                ("currency_control_value", "1 200.50"),
+                ("trademark", "Apple"),
+            ],
+            vec![
+                ("declaration_number", "24UA100110000102U2"),
+                ("declaration_date", "16.03.2024"),
+                ("sender", "APPLE OPERATIONS EUROPE"),
+                ("edrpou", "22222222"),
+                ("recipient", "ТОВ «ТЕХНО ІМПОРТ»"),
+                ("product_code", "8517130000"),
+                ("description", "Apple iPhone parts"),
+                ("trade_country", "IE"),
+                ("origin_country", "CN"),
+                ("quantity", "2"),
+                ("gross_kg", "3,5"),
+                ("net_kg", "2,5"),
+                ("currency_control_value", "300,25"),
+                ("trademark", "Apple"),
+            ],
+            vec![
+                ("declaration_number", "24UA100110000103U3"),
+                ("declaration_date", "17.03.2024"),
+                ("sender", "SAMSUNG ELECTRONICS"),
+                ("edrpou", "33333333"),
+                ("recipient", "ТОВ «ТЕХНО ІМПОРТ»"),
+                ("product_code", "8517130000"),
+                ("description", "Samsung smartphone"),
+                ("trade_country", "KR"),
+                ("origin_country", "VN"),
+                ("quantity", "5"),
+                ("gross_kg", "7"),
+                ("net_kg", "6"),
+                ("currency_control_value", "700"),
+                ("trademark", "Samsung"),
+            ],
+            vec![
+                ("declaration_number", "25UA100110000104U4"),
+                ("declaration_date", "12.01.2025"),
+                ("sender", "APPLE DISTRIBUTION INTERNATIONAL LTD"),
+                ("edrpou", "11111111"),
+                ("recipient", "ТОВ «АЙФОН УКРАЇНА»"),
+                ("product_code", "8517130000"),
+                ("description", "Apple iPhone 16 smartphone"),
+                ("trade_country", "IE"),
+                ("origin_country", "CN"),
+                ("quantity", "20"),
+                ("gross_kg", "25"),
+                ("net_kg", "20"),
+                ("currency_control_value", "2 400"),
+                ("trademark", "Apple"),
+            ],
+        ],
+    );
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 4);
+
+    let q = Query {
+        text: "Apple".into(),
+        filters: Filters {
+            year: "2024".into(),
+            ..Default::default()
+        },
+    };
+    let analytics = db.analytics(&q, 5).unwrap();
+    assert_eq!(analytics.overview.row_count, 2);
+    assert_eq!(analytics.overview.distinct_senders, 2);
+    assert_eq!(analytics.overview.distinct_recipients, 2);
+    assert_eq!(analytics.overview.distinct_trademarks, 1);
+    assert_close(analytics.overview.total_value_usd, 1500.75);
+    assert_close(analytics.overview.total_gross_kg, 16.0);
+    assert_close(analytics.overview.total_net_kg, 12.5);
+    assert_close(analytics.overview.total_quantity, 12.0);
+
+    assert_eq!(analytics.top_recipients[0].label, "ТОВ «АЙФОН УКРАЇНА»");
+    assert_eq!(analytics.top_recipients[0].rows, 1);
+    assert_close(analytics.top_recipients[0].total_value_usd, 1200.50);
+    assert_eq!(
+        analytics.top_senders[0].label,
+        "APPLE DISTRIBUTION INTERNATIONAL LTD"
+    );
+    assert_eq!(analytics.top_trademarks[0].label, "Apple");
+    assert_eq!(analytics.top_product_codes[0].label, "8517130000");
+    assert_eq!(analytics.top_origin_countries[0].label, "CN");
+    assert_eq!(analytics.top_origin_countries[0].rows, 2);
+}
+
+fn assert_close(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() < 0.0001,
+        "expected {expected}, got {actual}"
+    );
+}
+
 /// Registry-style format: repeated headers, a declaration number split into
 /// three parts, and an Excel serial date.
 #[test]
@@ -304,9 +439,12 @@ fn import_registry_format() {
     };
     let (ids, rows) = db.search_page(&q, 10, 0).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0], "2024-11-01"); // date converted from serial number
-    assert_eq!(rows[0][1], "UA209230/2024/102880"); // declaration number joined
-    assert_eq!(rows[0][6], "37642136"); // EDRPOU is read from the first recipient column
+    assert_eq!(rows[0][result_col("declaration_date")], "2024-11-01"); // date converted from serial number
+    assert_eq!(
+        rows[0][result_col("declaration_number")],
+        "UA209230/2024/102880"
+    ); // declaration number joined
+    assert_eq!(rows[0][result_col("edrpou")], "37642136"); // EDRPOU is read from the first recipient column
 
     let card = db.record_card(ids[0]).unwrap();
     let get = |h: &str| {
@@ -400,9 +538,12 @@ fn import_registry_format_im12_variant() {
     };
     let (ids, rows) = db.search_page(&q, 10, 0).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0], "2024-12-01");
-    assert_eq!(rows[0][1], "UA209060/2024/1479"); // all 3 parts, including the typo column
-    assert_eq!(rows[0][6], "32818783");
+    assert_eq!(rows[0][result_col("declaration_date")], "2024-12-01");
+    assert_eq!(
+        rows[0][result_col("declaration_number")],
+        "UA209060/2024/1479"
+    ); // all 3 parts, including the typo column
+    assert_eq!(rows[0][result_col("edrpou")], "32818783");
 
     let card = db.record_card(ids[0]).unwrap();
     let get = |h: &str| {
@@ -472,8 +613,11 @@ fn import_generic_format_with_title_rows() {
     };
     let (ids, rows) = db.search_page(&q, 10, 0).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0], "2024-03-15");
-    assert_eq!(rows[0][1], "UA100100/2024/55555");
+    assert_eq!(rows[0][result_col("declaration_date")], "2024-03-15");
+    assert_eq!(
+        rows[0][result_col("declaration_number")],
+        "UA100100/2024/55555"
+    );
     let card = db.record_card(ids[0]).unwrap();
     assert!(
         card.fields
@@ -574,4 +718,8 @@ fn value_normalization() {
     assert_eq!(extract_year("15.03.2024"), Some(2024));
     assert_eq!(extract_year("120245"), None);
     assert_eq!(extract_year(""), None);
+    assert_eq!(parse_number("1 234,56"), Some(1234.56));
+    assert_eq!(parse_number("1,234.56"), Some(1234.56));
+    assert_eq!(parse_number("$ 300,25"), Some(300.25));
+    assert_eq!(parse_number(""), None);
 }
