@@ -10,10 +10,10 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use egui_extras::{Column, TableBuilder};
 
 use crate::db::{
-    Analytics, AnalyticsFilterAction, AnalyticsFilterField, AnalyticsGroupRow,
-    AnalyticsMonthRow, AnalyticsPriceMetric, AnalyticsScope, AnalyticsSection,
-    AnalyticsSectionKind, CompanyProfile, Db, Filters, PivotDim, PivotMetric, PivotResult,
-    PriceMetricKind, Query, RecordCard, Undervaluation,
+    Analytics, AnalyticsFilterAction, AnalyticsFilterField, AnalyticsGroupRow, AnalyticsMonthRow,
+    AnalyticsPriceMetric, AnalyticsScope, AnalyticsSection, AnalyticsSectionKind, CompanyProfile,
+    Db, Filters, PivotDim, PivotMetric, PivotResult, PriceMetricKind, Query, RecordCard,
+    Undervaluation, pivot_filter_action,
 };
 use crate::export::ExportError;
 use crate::i18n::{Lang, Tr, fmt, group_digits, help_sections, tr};
@@ -65,7 +65,7 @@ enum MonthMetric {
     Value,
     Rows,
     NetWeight,
-    /// Средняя цена месяца: стоимость / вес нетто.
+    /// Monthly average price: value / net weight.
     AvgPrice,
 }
 
@@ -227,6 +227,10 @@ struct OpState {
 struct StatusLine {
     text: String,
     is_error: bool,
+}
+
+fn invalidate_underpricing_generation(generation: &mut u64) {
+    *generation = generation.wrapping_add(1);
 }
 
 pub struct App {
@@ -447,13 +451,14 @@ impl App {
         };
         self.search_gen += 1;
         self.search_in_flight = true;
-        // Запрос изменился — загруженная аналитика устарела.
+        // The query changed; loaded analytics no longer matches the results.
         self.analytics = None;
         self.analytics_loaded = [false; 6];
         self.analytics_loading = false;
         self.pivot = None;
         self.underpricing = None;
         self.underpricing_loading = false;
+        invalidate_underpricing_generation(&mut self.underpricing_gen);
         let _ = self.search_tx.send(WorkerReq::Search {
             q: Box::new(self.active_query.clone()),
             page: self.page,
@@ -475,7 +480,7 @@ impl App {
         });
     }
 
-    /// Запрашивает активную подвкладку аналитики, если она ещё не загружена.
+    /// Requests the active Analytics sub-tab if it has not been loaded yet.
     fn request_analytics(&mut self) {
         if self.active_query.is_empty() {
             return;
@@ -519,7 +524,7 @@ impl App {
         }
         self.underpricing = None;
         self.underpricing_loading = true;
-        self.underpricing_gen += 1;
+        invalidate_underpricing_generation(&mut self.underpricing_gen);
         let _ = self.search_tx.send(WorkerReq::Underpricing {
             q: Box::new(self.active_query.clone()),
             threshold: 0.5,
@@ -584,8 +589,9 @@ impl App {
                     if generation == self.search_gen {
                         match self.analytics.as_mut() {
                             Some(existing) if self.analytics_gen == generation => {
-                                // Дозагрузка раздела: обзор и месяцы свежие,
-                                // разделы складываются в общий контейнер.
+                                // Load one section at a time: overview and
+                                // months stay fresh, sections are merged into
+                                // the shared analytics container.
                                 existing.overview = analytics.overview;
                                 existing.months = analytics.months;
                                 match scope {
@@ -1322,7 +1328,7 @@ impl App {
             let lang = self.lang;
             let hs_level = self.hs_level;
 
-            // Подвкладки аналитики: каждая — отдельный сфокусированный экран.
+            // Analytics sub-tabs: each one is a focused screen.
             ui.horizontal(|ui| {
                 for v in AnalyticsView::ALL {
                     let label = match v {
@@ -1355,7 +1361,7 @@ impl App {
                     });
                 }
             });
-            // Однострочная сводка — контекст виден на любой подвкладке.
+            // One-line summary keeps context visible on every sub-tab.
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(fmt(
@@ -1415,7 +1421,7 @@ impl App {
                             kpi_tile(
                                 ui,
                                 t.total_value,
-                                format!("{} $", fmt_compact(analytics.overview.total_value_usd)),
+                                fmt_compact(analytics.overview.total_value_usd),
                                 t.total_value_help,
                             );
                             kpi_tile(
@@ -1427,10 +1433,7 @@ impl App {
                             kpi_tile(
                                 ui,
                                 t.avg_value_kg,
-                                format!(
-                                    "{} $/kg",
-                                    fmt_decimal(analytics.overview.avg_value_per_net_kg, 2)
-                                ),
+                                fmt_decimal(analytics.overview.avg_value_per_net_kg, 2),
                                 t.avg_value_kg_help,
                             );
                             kpi_tile(
@@ -1495,27 +1498,20 @@ impl App {
                     }
                     AnalyticsView::Products => {
                         ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(t.products_section_hint).weak().small(),
-                            );
+                            ui.label(egui::RichText::new(t.products_section_hint).weak().small());
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    for (level, label) in [
-                                        (10u8, t.hs_full),
-                                        (6, "6"),
-                                        (4, "4"),
-                                        (2, "2"),
-                                    ] {
+                                    for (level, label) in
+                                        [(10u8, t.hs_full), (6, "6"), (4, "4"), (2, "2")]
+                                    {
                                         if ui.selectable_label(hs_level == level, label).clicked()
                                             && level != hs_level
                                         {
                                             new_hs = Some(level);
                                         }
                                     }
-                                    ui.label(
-                                        egui::RichText::new(t.hs_level_label).weak().small(),
-                                    );
+                                    ui.label(egui::RichText::new(t.hs_level_label).weak().small());
                                 },
                             );
                         });
@@ -1819,7 +1815,7 @@ impl App {
                                         ui.close();
                                     }
                                     ui.separator();
-                                    // Профиль компании по ЕДРПОУ строки.
+                                    // Company profile by the row EDRPOU.
                                     if let Some(col) = result_col_index("edrpou") {
                                         let edrpou = cells[col].trim();
                                         if !edrpou.is_empty()
@@ -1830,8 +1826,9 @@ impl App {
                                                 ))
                                                 .clicked()
                                         {
-                                            menu_action =
-                                                Some(RowMenuAction::OpenProfile(edrpou.to_string()));
+                                            menu_action = Some(RowMenuAction::OpenProfile(
+                                                edrpou.to_string(),
+                                            ));
                                             ui.close();
                                         }
                                     }
@@ -1987,12 +1984,9 @@ impl App {
             });
             if profile.names.len() > 1 {
                 ui.label(
-                    egui::RichText::new(fmt(
-                        t.also_known_as,
-                        &[&profile.names[1..].join(" · ")],
-                    ))
-                    .weak()
-                    .small(),
+                    egui::RichText::new(fmt(t.also_known_as, &[&profile.names[1..].join(" · ")]))
+                        .weak()
+                        .small(),
                 );
             }
             ui.add_space(8.0);
@@ -2015,7 +2009,7 @@ impl App {
                     kpi_tile(
                         ui,
                         t.total_value,
-                        format!("{} $", fmt_compact(profile.overview.total_value_usd)),
+                        fmt_compact(profile.overview.total_value_usd),
                         t.total_value_help,
                     );
                     kpi_tile(
@@ -2027,10 +2021,7 @@ impl App {
                     kpi_tile(
                         ui,
                         t.avg_value_kg,
-                        format!(
-                            "{} $/kg",
-                            fmt_decimal(profile.overview.avg_value_per_net_kg, 2)
-                        ),
+                        fmt_decimal(profile.overview.avg_value_per_net_kg, 2),
                         t.avg_value_kg_help,
                     );
                     kpi_tile(
@@ -2364,8 +2355,7 @@ impl eframe::App for App {
 fn months_chart(ui: &mut egui::Ui, months: &[AnalyticsMonthRow], metric: MonthMetric, lang: Lang) {
     let height = 190.0;
     let width = ui.available_width().max(320.0);
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let visuals = ui.visuals();
     let rounding = egui::CornerRadius::same(5);
     ui.painter().rect(
@@ -2421,7 +2411,7 @@ fn months_chart(ui: &mut egui::Ui, months: &[AnalyticsMonthRow], metric: MonthMe
     };
     let month_font = egui::FontId::new(10.5, egui::FontFamily::Monospace);
     let value_font = egui::FontId::new(10.5, egui::FontFamily::Monospace);
-    // Подписи месяцев прореживаются, чтобы не слипались.
+    // Month labels are thinned out so they do not overlap.
     let label_every = ((42.0 / slot).ceil() as usize).max(1);
 
     for (i, month) in months.iter().enumerate() {
@@ -2454,7 +2444,7 @@ fn months_chart(ui: &mut egui::Ui, months: &[AnalyticsMonthRow], metric: MonthMe
                 visuals.weak_text_color(),
             );
         }
-        // Значение над столбцом, когда место позволяет.
+        // Draw the value above the bar when there is enough room.
         if slot >= 46.0 && value > 0.0 {
             ui.painter().text(
                 egui::pos2(cx, bar.top() - 2.0),
@@ -2474,7 +2464,7 @@ fn months_chart(ui: &mut egui::Ui, months: &[AnalyticsMonthRow], metric: MonthMe
             Lang::En => ("rows", "declarations", "value", "net weight"),
         };
         response.on_hover_text(format!(
-            "{}\n{}: {}\n{}: {}\n{}: {} $\n{}: {} kg",
+            "{}\n{}: {}\n{}: {}\n{}: {}\n{}: {} kg",
             month.month,
             rows_l,
             group_digits(month.rows),
@@ -2533,8 +2523,7 @@ fn analytics_cards(
     lang: Lang,
 ) -> Option<AnalyticsFilterAction> {
     let mut action = None;
-    let sections: Vec<&AnalyticsSection> =
-        sections.iter().filter(|s| !s.rows.is_empty()).collect();
+    let sections: Vec<&AnalyticsSection> = sections.iter().filter(|s| !s.rows.is_empty()).collect();
     if sections.is_empty() {
         return None;
     }
@@ -2576,9 +2565,9 @@ fn analytics_cards(
 /// Card rows as a TSV table that pastes directly into Excel.
 fn section_tsv(section: &AnalyticsSection, lang: Lang) -> String {
     let header = match lang {
-        Lang::Ua => "Назва\tРядків\tДекларацій\tКомпаній\tСума $\tНетто кг\tЧастка %\t$/кг",
-        Lang::Ru => "Название\tСтрок\tДеклараций\tКомпаний\tСумма $\tНетто кг\tДоля %\t$/кг",
-        Lang::En => "Label\tRows\tDeclarations\tCompanies\tValue $\tNet kg\tShare %\t$/kg",
+        Lang::Ua => "Назва\tРядків\tДекларацій\tКомпаній\tФВ вал.контр\tНетто кг\tЧастка %\tФВ/кг",
+        Lang::Ru => "Название\tСтрок\tДеклараций\tКомпаний\tФВ вал.контр\tНетто кг\tДоля %\tФВ/кг",
+        Lang::En => "Label\tRows\tDeclarations\tCompanies\tValue\tNet kg\tShare %\tValue/kg",
     };
     let mut out = String::from(header);
     for row in &section.rows {
@@ -2688,7 +2677,7 @@ fn compact_bar_row(
     let label_font = egui::FontId::new(12.5, egui::FontFamily::Proportional);
     let mono_font = egui::FontId::new(11.5, egui::FontFamily::Monospace);
     let right_text = format!(
-        "{} $ · {}%",
+        "{} · {}%",
         fmt_compact(row.total_value_usd),
         fmt_decimal(row.share_percent, 1)
     );
@@ -2696,7 +2685,10 @@ fn compact_bar_row(
     ui.painter().text(
         egui::pos2(rect.left() + 2.0, rect.top() + 9.0),
         egui::Align2::LEFT_CENTER,
-        trunc_label(&row.label, ((width - right_w - 12.0) / 6.8).max(8.0) as usize),
+        trunc_label(
+            &row.label,
+            ((width - right_w - 12.0) / 6.8).max(8.0) as usize,
+        ),
         label_font,
         visuals.text_color(),
     );
@@ -2735,9 +2727,7 @@ fn price_table(ui: &mut egui::Ui, metrics: &[AnalyticsPriceMetric], lang: Lang) 
                 }
                 ui.label(price_metric_title(metric.kind, lang));
                 ui.label(egui::RichText::new(fmt_decimal(metric.average, 3)).monospace());
-                ui.label(
-                    egui::RichText::new(fmt_decimal(metric.weighted_average, 3)).monospace(),
-                );
+                ui.label(egui::RichText::new(fmt_decimal(metric.weighted_average, 3)).monospace());
                 ui.label(egui::RichText::new(fmt_decimal(metric.median, 3)).monospace());
                 ui.label(
                     egui::RichText::new(format!(
@@ -2835,8 +2825,6 @@ fn pivot_table_ui(
     } else {
         ACCENT
     };
-    let row_field = row_dim.filter_field();
-    let col_field = col_dim.filter_field();
     let total_label = match lang {
         Lang::Ua => "Разом",
         Lang::Ru => "Итого",
@@ -2858,14 +2846,25 @@ fn pivot_table_ui(
                 header.col(|ui| {
                     ui.strong(pivot_dim_label(row_dim, lang));
                 });
-                for label in &pivot.col_labels {
+                for (ci, label) in pivot.col_labels.iter().enumerate() {
                     header.col(|ui| {
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.strong(label.clone());
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let is_others =
+                                pivot.cols_truncated && ci + 1 == pivot.col_labels.len();
+                            let label_text = egui::RichText::new(label.clone()).strong();
+                            if is_others {
+                                ui.label(label_text);
+                            } else if let Some(next) = pivot_filter_action(col_dim, label.clone()) {
+                                let response = ui
+                                    .add(egui::Label::new(label_text).sense(egui::Sense::click()))
+                                    .on_hover_text(pivot_click_hint(lang));
+                                if response.clicked() {
+                                    action = Some(next);
+                                }
+                            } else {
+                                ui.label(label_text);
+                            }
+                        });
                     });
                 }
                 header.col(|ui| {
@@ -2883,13 +2882,14 @@ fn pivot_table_ui(
                                     .truncate()
                                     .sense(egui::Sense::click()),
                             );
-                            if let Some(field) = row_field {
+                            let is_others =
+                                pivot.rows_truncated && ri + 1 == pivot.row_labels.len();
+                            if !is_others
+                                && let Some(next) = pivot_filter_action(row_dim, row_label.clone())
+                            {
                                 let resp = resp.on_hover_text(pivot_click_hint(lang));
                                 if resp.clicked() {
-                                    action = Some(AnalyticsFilterAction {
-                                        field,
-                                        value: row_label.clone(),
-                                    });
+                                    action = Some(next);
                                 }
                             }
                         });
@@ -2904,9 +2904,12 @@ fn pivot_table_ui(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        egui::RichText::new(pivot_fmt(pivot.row_totals[ri], metric))
-                                            .monospace()
-                                            .strong(),
+                                        egui::RichText::new(pivot_fmt(
+                                            pivot.row_totals[ri],
+                                            metric,
+                                        ))
+                                        .monospace()
+                                        .strong(),
                                     );
                                 },
                             );
@@ -2924,9 +2927,12 @@ fn pivot_table_ui(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        egui::RichText::new(pivot_fmt(pivot.col_totals[ci], metric))
-                                            .monospace()
-                                            .strong(),
+                                        egui::RichText::new(pivot_fmt(
+                                            pivot.col_totals[ci],
+                                            metric,
+                                        ))
+                                        .monospace()
+                                        .strong(),
                                     );
                                 },
                             );
@@ -2944,7 +2950,6 @@ fn pivot_table_ui(
                 });
             });
     });
-    let _ = col_field;
     action
 }
 
@@ -2955,20 +2960,13 @@ fn paint_pivot_cell(
     accent: egui::Color32,
     metric: PivotMetric,
 ) {
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 20.0),
-        egui::Sense::hover(),
-    );
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
     if value > 0.0 {
         let intensity = (value / max_cell).clamp(0.0, 1.0) as f32;
         // Stronger fill for larger cells (heatmap).
         let alpha = (18.0 + intensity * 150.0) as u8;
-        let fill = egui::Color32::from_rgba_unmultiplied(
-            accent.r(),
-            accent.g(),
-            accent.b(),
-            alpha,
-        );
+        let fill = egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), alpha);
         ui.painter()
             .rect_filled(rect.shrink(1.0), egui::CornerRadius::same(2), fill);
         let text_color = ui.visuals().text_color();
@@ -3173,7 +3171,8 @@ fn underpricing_table(
                             });
                             tr_row.col(|ui| {
                                 ui.label(
-                                    egui::RichText::new(fmt_decimal(row.code_median, 2)).monospace(),
+                                    egui::RichText::new(fmt_decimal(row.code_median, 2))
+                                        .monospace(),
                                 );
                             });
                             tr_row.col(|ui| {
@@ -3275,7 +3274,7 @@ fn row_hover_text(row: &AnalyticsGroupRow, lang: Lang) -> String {
     let counts = row_counts_label(row, lang);
     match lang {
         Lang::Ua => format!(
-            "{}\n{}\nСума: {} $\nНетто: {} кг\nЧастка: {}%\nСередня ціна: {} $/кг\nНатисніть, щоб відфільтрувати результати.",
+            "{}\n{}\nФВ вал.контр: {}\nНетто: {} кг\nЧастка: {}%\nФВ/кг: {}\nНатисніть, щоб відфільтрувати результати.",
             row.label,
             counts,
             fmt_decimal(row.total_value_usd, 2),
@@ -3284,7 +3283,7 @@ fn row_hover_text(row: &AnalyticsGroupRow, lang: Lang) -> String {
             fmt_decimal(row.avg_value_per_net_kg, 2)
         ),
         Lang::Ru => format!(
-            "{}\n{}\nСумма: {} $\nНетто: {} кг\nДоля: {}%\nСредняя цена: {} $/кг\nНажмите, чтобы отфильтровать результаты.",
+            "{}\n{}\nФВ вал.контр: {}\nНетто: {} кг\nДоля: {}%\nФВ/кг: {}\nНажмите, чтобы отфильтровать результаты.",
             row.label,
             counts,
             fmt_decimal(row.total_value_usd, 2),
@@ -3293,7 +3292,7 @@ fn row_hover_text(row: &AnalyticsGroupRow, lang: Lang) -> String {
             fmt_decimal(row.avg_value_per_net_kg, 2)
         ),
         Lang::En => format!(
-            "{}\n{}\nValue: {} $\nNet: {} kg\nShare: {}%\nAverage price: {} $/kg\nClick to filter results.",
+            "{}\n{}\nValue: {}\nNet: {} kg\nShare: {}%\nValue/kg: {}\nClick to filter results.",
             row.label,
             counts,
             fmt_decimal(row.total_value_usd, 2),
@@ -3525,4 +3524,19 @@ fn setup_style(ctx: &egui::Context) {
     ctx.style_mut_of(egui::Theme::Light, |style| {
         style.visuals.faint_bg_color = egui::Color32::from_gray(244);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::invalidate_underpricing_generation;
+
+    #[test]
+    fn invalidating_underpricing_generation_rejects_stale_results() {
+        let mut generation = 7;
+        let stale_generation = generation;
+
+        invalidate_underpricing_generation(&mut generation);
+
+        assert_ne!(generation, stale_generation);
+    }
 }

@@ -259,7 +259,7 @@ fn cmd_analytics(db_path: &Path, args: &[String]) -> Result<(), String> {
         analytics.overview.distinct_edrpou
     );
     println!(
-        "Value: {:.2} $  net: {:.3} kg  gross: {:.3} kg  avg: {:.2} $/kg  quantity: {:.3}",
+        "Value: {:.2}  net: {:.3} kg  gross: {:.3} kg  value/kg: {:.2}  quantity: {:.3}",
         analytics.overview.total_value_usd,
         analytics.overview.total_net_kg,
         analytics.overview.total_gross_kg,
@@ -298,7 +298,7 @@ fn print_group(rows: &[AnalyticsGroupRow]) {
     }
     for row in rows {
         println!(
-            "  {} | rows {} | decl {} | companies {} | share {:.1}% | {:.2} $ | net {:.3} kg | {:.2} $/kg",
+            "  {} | rows {} | decl {} | companies {} | share {:.1}% | value {:.2} | net {:.3} kg | value/kg {:.2}",
             row.label,
             row.rows,
             row.declarations,

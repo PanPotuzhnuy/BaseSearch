@@ -7,8 +7,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
 
 use crate::db::{
-    Analytics, AnalyticsScope, CompanyProfile, Db, PivotDim, PivotMetric, PivotResult, Query,
-    Undervaluation, analytics_should_run,
+    Analytics, AnalyticsScope, CompanyProfile, Db, PivotDim, PivotLimits, PivotMetric, PivotResult,
+    Query, Undervaluation, analytics_should_run,
 };
 use crate::export::{self, ExportError};
 use crate::import::{self, FileSummary, ImportPhase};
@@ -30,7 +30,10 @@ pub enum WorkerReq {
         generation: u64,
     },
     /// Company dossier for one EDRPOU.
-    Profile { edrpou: String, generation: u64 },
+    Profile {
+        edrpou: String,
+        generation: u64,
+    },
     /// Cross-tab of the current query.
     Pivot {
         q: Box<Query>,
@@ -198,7 +201,14 @@ pub fn spawn_search_worker(
                     if !analytics_should_run(&q) {
                         continue;
                     }
-                    let msg = match db.pivot(&q, row_dim, col_dim, metric, 25, 18, &others_label) {
+                    let msg = match db.pivot(
+                        &q,
+                        row_dim,
+                        col_dim,
+                        metric,
+                        PivotLimits { rows: 25, cols: 18 },
+                        &others_label,
+                    ) {
                         Ok(pivot) => Msg::PivotDone {
                             generation,
                             pivot: Box::new(pivot),

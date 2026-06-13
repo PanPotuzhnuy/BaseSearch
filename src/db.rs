@@ -169,14 +169,14 @@ pub struct AnalyticsPriceMetric {
     pub minimum: f64,
     pub maximum: f64,
     pub weighted_average: f64,
-    /// Робастные показатели: медиана и квартили устойчивы к выбросам
-    /// и ошибкам в исходных данных, в отличие от min/max.
+    /// Robust statistics: median and quartiles are less sensitive to outliers
+    /// and source-data mistakes than min/max.
     pub median: f64,
     pub p25: f64,
     pub p75: f64,
 }
 
-/// SQLite-агрегат: собирает значения и возвращает "p25|p50|p75".
+/// SQLite aggregate: collects values and returns "p25|p50|p75".
 struct PercentilesAggregate;
 
 impl rusqlite::functions::Aggregate<Vec<f64>, Option<String>> for PercentilesAggregate {
@@ -375,11 +375,27 @@ impl PivotDim {
     }
 }
 
+pub fn pivot_filter_action(
+    dim: PivotDim,
+    value: impl Into<String>,
+) -> Option<AnalyticsFilterAction> {
+    dim.filter_field().map(|field| AnalyticsFilterAction {
+        field,
+        value: value.into(),
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PivotMetric {
     Value,
     Rows,
     NetKg,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PivotLimits {
+    pub rows: usize,
+    pub cols: usize,
 }
 
 impl PivotMetric {
@@ -498,14 +514,14 @@ impl Db {
                 Ok(raw.and_then(parse_number))
             },
         )?;
-        // Перцентили одним проходом: "p25|p50|p75" или NULL без значений.
+        // Percentiles in one pass: "p25|p50|p75", or NULL with no values.
         self.conn.create_aggregate_function(
             "pctl_text",
             1,
             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
             PercentilesAggregate,
         )?;
-        // Медиана как число — для соединений и фильтров в SQL.
+        // Numeric median for SQL joins and filters.
         self.conn.create_aggregate_function(
             "median_num",
             1,
@@ -909,8 +925,10 @@ impl Db {
                         overview,
                     )?,
                 ];
-                analytics.top_recipients =
-                    section_rows(&analytics.company_sections, AnalyticsSectionKind::Recipients);
+                analytics.top_recipients = section_rows(
+                    &analytics.company_sections,
+                    AnalyticsSectionKind::Recipients,
+                );
                 analytics.top_senders =
                     section_rows(&analytics.company_sections, AnalyticsSectionKind::Senders);
             }
@@ -946,8 +964,10 @@ impl Db {
                         overview,
                     )?,
                 ];
-                analytics.top_trademarks =
-                    section_rows(&analytics.product_sections, AnalyticsSectionKind::Trademarks);
+                analytics.top_trademarks = section_rows(
+                    &analytics.product_sections,
+                    AnalyticsSectionKind::Trademarks,
+                );
                 analytics.top_product_codes = section_rows(
                     &analytics.product_sections,
                     AnalyticsSectionKind::ProductCodes,
@@ -1075,8 +1095,7 @@ impl Db {
     /// Returns the most recent 48 months in chronological order.
     fn analytics_months(&self, q: &Query) -> rusqlite::Result<Vec<AnalyticsMonthRow>> {
         let (joins, where_sql, params) = self.build_where(q);
-        let month_filter =
-            "TRIM(r.declaration_date) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]*'";
+        let month_filter = "TRIM(r.declaration_date) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]*'";
         let filter_sql = if where_sql.is_empty() {
             format!(" WHERE {month_filter}")
         } else {
@@ -1189,7 +1208,11 @@ impl Db {
         limit: u64,
     ) -> rusqlite::Result<Undervaluation> {
         let (joins, where_sql, params) = self.build_where(q);
-        let cond = if where_sql.is_empty() { " WHERE" } else { " AND" };
+        let cond = if where_sql.is_empty() {
+            " WHERE"
+        } else {
+            " AND"
+        };
         // priced: one row per declaration line with a usable $/kg.
         // code_stats: median $/kg and sample count per product code.
         let sql = format!(
@@ -1256,8 +1279,7 @@ impl Db {
         row_dim: PivotDim,
         col_dim: PivotDim,
         metric: PivotMetric,
-        max_rows: usize,
-        max_cols: usize,
+        limits: PivotLimits,
         others_label: &str,
     ) -> rusqlite::Result<PivotResult> {
         let (joins, where_sql, params) = self.build_where(q);
@@ -1279,8 +1301,10 @@ impl Db {
         let mut rows = stmt.query(params_from_iter(params))?;
 
         // Accumulate into maps, then rank rows and columns by total.
-        let mut row_totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-        let mut col_totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        let mut row_totals: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        let mut col_totals: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
         let mut triples: Vec<(String, String, f64)> = Vec::new();
         while let Some(row) = rows.next()? {
             let rk: String = row.get(0)?;
@@ -1291,26 +1315,27 @@ impl Db {
             triples.push((rk, ck, v));
         }
 
-        let rank = |totals: &std::collections::HashMap<String, f64>, limit: usize, sort_label: bool| {
-            let mut items: Vec<(String, f64)> =
-                totals.iter().map(|(k, v)| (k.clone(), *v)).collect();
-            if sort_label {
-                items.sort_by(|a, b| a.0.cmp(&b.0));
-            } else {
-                items.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-            }
-            let truncated = items.len() > limit;
-            items.truncate(limit);
-            (
-                items.into_iter().map(|(k, _)| k).collect::<Vec<_>>(),
-                truncated,
-            )
-        };
+        let rank =
+            |totals: &std::collections::HashMap<String, f64>, limit: usize, sort_label: bool| {
+                let mut items: Vec<(String, f64)> =
+                    totals.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                if sort_label {
+                    items.sort_by(|a, b| a.0.cmp(&b.0));
+                } else {
+                    items.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                }
+                let truncated = items.len() > limit;
+                items.truncate(limit);
+                (
+                    items.into_iter().map(|(k, _)| k).collect::<Vec<_>>(),
+                    truncated,
+                )
+            };
 
         // Months/years read naturally in chronological order; others by size.
         let col_chrono = matches!(col_dim, PivotDim::Month | PivotDim::Year);
-        let (row_labels, rows_truncated) = rank(&row_totals, max_rows, false);
-        let (col_labels, cols_truncated) = rank(&col_totals, max_cols, col_chrono);
+        let (row_labels, rows_truncated) = rank(&row_totals, limits.rows, false);
+        let (col_labels, cols_truncated) = rank(&col_totals, limits.cols, col_chrono);
 
         let row_index: std::collections::HashMap<&str, usize> = row_labels
             .iter()

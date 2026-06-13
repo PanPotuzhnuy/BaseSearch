@@ -133,12 +133,12 @@ summary (rows · value · net weight · period) stays visible on every sub-tab.
 
 | Sub-tab | What it answers |
 |---|---|
-| **Overview** | Headline numbers (rows, declarations, companies, value, weight, average $/kg, distinct codes and countries) plus a **monthly dynamics** bar chart. Switch the chart metric between value ($), rows, net weight, and **average price ($/kg)** — the price line is what reveals price trends and dumping. Hover a bar for the full month. |
+| **Overview** | Headline numbers (rows, declarations, companies, source value, weight, value per kg, distinct codes and countries) plus a **monthly dynamics** bar chart. Switch the chart metric between source value, rows, net weight, and **value per kg**. Hover a bar for the full month. |
 | **Companies** | Who received/imported, who sent, and which organization codes dominate. |
 | **Goods** | Which product codes, brands, and product groups dominate. Codes can be grouped by HS level — **2 / 4 / 6 digits or full** — to see structure from chapter down to exact code. |
 | **Countries** | Origin, dispatch, and trade countries for the matching shipments. |
 | **Prices** | Per price field: average, weighted average, **median, and the P25–P75 range** with the value count. Below the table, a **price-undervaluation scan** lists declarations priced per kg far below the median for their own product code — the classic signal of customs undervaluation (or a data-entry error). |
-| **Pivot** | A **cross-tab**: pick any dimension for rows and any for columns (company, EDRPOU, product code, trademark, origin/dispatch/trade country, month, year) and a value (value $, rows, net weight). The result is a heatmap with row, column, and grand totals; row/column labels drill into the Results table, and the whole matrix copies into Excel. |
+| **Pivot** | A **cross-tab**: pick any dimension for rows and any for columns (company, EDRPOU, product code, trademark, origin/dispatch/trade country, month, year) and a value (source value, rows, net weight). The result is a heatmap with row, column, and grand totals; row/column labels drill into the Results table, and the whole matrix copies into Excel. |
 
 Only the active sub-tab is calculated, which keeps the tab fast even on very
 broad queries. Companies, Goods, and Countries are shown as side-by-side cards
@@ -159,7 +159,7 @@ search term or filter before running large calculations.
 
 Right-click any result row and choose **Company profile** (by EDRPOU) to open a
 one-screen dossier for that importer: all name variants seen for the code,
-headline numbers (rows, declarations, value, net weight, average $/kg, distinct
+headline numbers (rows, declarations, value, net weight, value per kg, distinct
 product codes and suppliers), a monthly dynamics chart, and the company's top
 product codes, suppliers, and origin countries. Any card row drills back into
 the filtered Results table, so "tell me everything about this company, then show
@@ -309,7 +309,7 @@ application executable.
   suppliers, and origin countries; opened from the row context menu.
 - **Price-undervaluation scan.** Flags declarations priced per kg far below
   the median for their own product code — a customs undervaluation signal.
-- **Deeper analytics for real work:** average-price ($/kg) metric on the
+- **Deeper analytics for real work:** value-per-kg metric on the
   monthly chart (price trends and dumping), HS-code grouping by 2/4/6/full
   digits, median and P25–P75 in the price table instead of misleading
   min/max, a copy-table button on every card (pastes into Excel), and an

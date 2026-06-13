@@ -5,9 +5,9 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use base_search::db::{
-    AnalyticsFilterField, AnalyticsScope, AnalyticsSectionKind, Db, Filters, PivotDim,
+    AnalyticsFilterField, AnalyticsScope, AnalyticsSectionKind, Db, Filters, PivotDim, PivotLimits,
     PivotMetric, PriceMetricKind, Query, analytics_should_run, build_fts_query, extract_year,
-    fts_prefix_terms, parse_number,
+    fts_prefix_terms, parse_number, pivot_filter_action,
 };
 use base_search::export;
 use base_search::import::{self, collapse_ws, normalize_date, normalize_value};
@@ -36,6 +36,20 @@ fn result_table_exposes_all_source_columns() {
         .chain(std::iter::once("source_file"))
         .collect();
     assert_eq!(RESULT_COLUMNS.as_slice(), expected.as_slice());
+}
+
+#[test]
+fn pivot_dimension_labels_map_to_filter_actions() {
+    let action = pivot_filter_action(PivotDim::TradeCountry, "IE").unwrap();
+    assert_eq!(action.field, AnalyticsFilterField::TradeCountry);
+    assert_eq!(action.value, "IE");
+
+    let action = pivot_filter_action(PivotDim::Recipient, "ТОВ ЕППЛ УКРАЇНА").unwrap();
+    assert_eq!(action.field, AnalyticsFilterField::Recipient);
+    assert_eq!(action.value, "ТОВ ЕППЛ УКРАЇНА");
+
+    assert_eq!(pivot_filter_action(PivotDim::Month, "2024-03"), None);
+    assert_eq!(pivot_filter_action(PivotDim::Year, "2024"), None);
 }
 
 /// Creates a test XLSX file with the full schema column set.
@@ -418,7 +432,10 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
     assert_eq!(profile.overview.row_count, 2);
     assert_close(profile.overview.total_value_usd, 3600.5);
     assert_eq!(profile.top_products[0].label, "8517130000");
-    assert_eq!(profile.top_senders[0].label, "APPLE DISTRIBUTION INTERNATIONAL LTD");
+    assert_eq!(
+        profile.top_senders[0].label,
+        "APPLE DISTRIBUTION INTERNATIONAL LTD"
+    );
     assert_eq!(profile.top_origin_countries[0].label, "CN");
     // Both months in which this company imported are present.
     let months: Vec<&str> = profile.months.iter().map(|m| m.month.as_str()).collect();
@@ -431,12 +448,11 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
             PivotDim::Recipient,
             PivotDim::OriginCountry,
             PivotMetric::Rows,
-            25,
-            18,
+            PivotLimits { rows: 25, cols: 18 },
             "others",
         )
         .unwrap();
-    // Two recipients (АЙФОН УКРАЇНА, ТЕХНО ІМПОРТ), one origin country (CN).
+    // Two recipients, one origin country.
     assert_eq!(pivot.col_labels, vec!["CN".to_string()]);
     assert_eq!(pivot.row_labels.len(), 2);
     assert_eq!(pivot.grand_total, 3.0);
@@ -452,12 +468,14 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
             PivotDim::Recipient,
             PivotDim::Month,
             PivotMetric::Value,
-            25,
-            18,
+            PivotLimits { rows: 25, cols: 18 },
             "others",
         )
         .unwrap();
-    assert_eq!(pivot_m.col_labels, vec!["2024-03".to_string(), "2025-01".to_string()]);
+    assert_eq!(
+        pivot_m.col_labels,
+        vec!["2024-03".to_string(), "2025-01".to_string()]
+    );
     // Apple value only: 1200.50 + 300.25 (2024-03) + 2400 (2025-01).
     assert_close(pivot_m.grand_total, 3900.75);
 }
@@ -482,7 +500,10 @@ fn undervaluation_flags_rows_below_code_median() {
     .enumerate()
     {
         rows.push(vec![
-            ("declaration_number", Box::leak(format!("24UA{i:09}U1").into_boxed_str()) as &str),
+            (
+                "declaration_number",
+                Box::leak(format!("24UA{i:09}U1").into_boxed_str()) as &str,
+            ),
             ("declaration_date", "15.03.2024"),
             ("sender", "FOREIGN SUPPLIER LTD"),
             ("edrpou", "55550000"),
@@ -501,9 +522,7 @@ fn undervaluation_flags_rows_below_code_median() {
     assert_eq!(summary.error, None);
     assert_eq!(summary.imported, 6);
 
-    let uv = db
-        .undervaluation(&Query::default(), 0.5, 5, 100)
-        .unwrap();
+    let uv = db.undervaluation(&Query::default(), 0.5, 5, 100).unwrap();
     assert_eq!(uv.checked_codes, 1);
     assert_eq!(uv.rows.len(), 1);
     let flagged = &uv.rows[0];
