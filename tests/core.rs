@@ -5,8 +5,8 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use base_search::db::{
-    AnalyticsFilterField, AnalyticsSectionKind, Db, Filters, PriceMetricKind, Query,
-    analytics_should_run, build_fts_query, extract_year, parse_number,
+    AnalyticsFilterField, AnalyticsScope, AnalyticsSectionKind, Db, Filters, PriceMetricKind,
+    Query, analytics_should_run, build_fts_query, extract_year, parse_number,
 };
 use base_search::export;
 use base_search::import::{self, collapse_ws, normalize_date, normalize_value};
@@ -387,6 +387,28 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
     assert_eq!(months, vec!["2024-03", "2025-01"]);
     assert_eq!(analytics_all.months[1].rows, 1);
     assert_close(analytics_all.months[1].total_value_usd, 2400.0);
+
+    // Robust price stats: per-kg prices for the three Apple rows are
+    // 120.0, 120.05 and 120.1, so the median is the middle value.
+    let price = &analytics_all.price_sections[0];
+    assert_eq!(price.kind, PriceMetricKind::ValuePerNetKg);
+    assert_eq!(price.count, 3);
+    assert_close(price.median, 120.05);
+    assert_close(price.p25, 120.05);
+    assert_close(price.p75, 120.1);
+
+    // Product codes grouped at the 4-digit HS level.
+    let products = db
+        .analytics_scoped(&q_all, 5, Some(AnalyticsScope::Products), 4)
+        .unwrap();
+    assert_eq!(products.top_product_codes[0].label, "8517");
+    assert_eq!(products.top_product_codes[0].rows, 3);
+
+    // Overview-only scope skips the heavy section queries.
+    let overview_only = db.analytics_scoped(&q_all, 5, None, 10).unwrap();
+    assert_eq!(overview_only.overview.row_count, 3);
+    assert!(overview_only.company_sections.is_empty());
+    assert!(overview_only.price_sections.is_empty());
 }
 
 #[test]

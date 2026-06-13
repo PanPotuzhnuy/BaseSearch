@@ -169,6 +169,50 @@ pub struct AnalyticsPriceMetric {
     pub minimum: f64,
     pub maximum: f64,
     pub weighted_average: f64,
+    /// Робастные показатели: медиана и квартили устойчивы к выбросам
+    /// и ошибкам в исходных данных, в отличие от min/max.
+    pub median: f64,
+    pub p25: f64,
+    pub p75: f64,
+}
+
+/// SQLite-агрегат: собирает значения и возвращает "p25|p50|p75".
+struct PercentilesAggregate;
+
+impl rusqlite::functions::Aggregate<Vec<f64>, Option<String>> for PercentilesAggregate {
+    fn init(&self, _ctx: &mut rusqlite::functions::Context<'_>) -> rusqlite::Result<Vec<f64>> {
+        Ok(Vec::new())
+    }
+
+    fn step(
+        &self,
+        ctx: &mut rusqlite::functions::Context<'_>,
+        acc: &mut Vec<f64>,
+    ) -> rusqlite::Result<()> {
+        if let Some(value) = ctx.get::<Option<f64>>(0)?
+            && value.is_finite()
+        {
+            acc.push(value);
+        }
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        _ctx: &mut rusqlite::functions::Context<'_>,
+        acc: Option<Vec<f64>>,
+    ) -> rusqlite::Result<Option<String>> {
+        let mut values = acc.unwrap_or_default();
+        if values.is_empty() {
+            return Ok(None);
+        }
+        values.sort_unstable_by(f64::total_cmp);
+        let pick = |p: f64| {
+            let idx = ((values.len() - 1) as f64 * p).round() as usize;
+            values[idx.min(values.len() - 1)]
+        };
+        Ok(Some(format!("{}|{}|{}", pick(0.25), pick(0.5), pick(0.75))))
+    }
 }
 
 /// Analytics category computed independently, so the GUI can load only
@@ -302,6 +346,13 @@ impl Db {
                     .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
                 Ok(raw.and_then(parse_number))
             },
+        )?;
+        // Перцентили одним проходом: "p25|p50|p75" или NULL без значений.
+        self.conn.create_aggregate_function(
+            "pctl_text",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            PercentilesAggregate,
         )?;
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta (
@@ -639,10 +690,10 @@ impl Db {
     /// The GUI requests one scope at a time via [`Db::analytics_scoped`],
     /// which is several times cheaper on broad queries.
     pub fn analytics(&self, q: &Query, limit: u64) -> rusqlite::Result<Analytics> {
-        let mut analytics = self.analytics_scoped(q, limit, AnalyticsScope::Companies)?;
-        let products = self.analytics_scoped(q, limit, AnalyticsScope::Products)?;
-        let countries = self.analytics_scoped(q, limit, AnalyticsScope::Countries)?;
-        let prices = self.analytics_scoped(q, limit, AnalyticsScope::Prices)?;
+        let mut analytics = self.analytics_scoped(q, limit, Some(AnalyticsScope::Companies), 10)?;
+        let products = self.analytics_scoped(q, limit, Some(AnalyticsScope::Products), 10)?;
+        let countries = self.analytics_scoped(q, limit, Some(AnalyticsScope::Countries), 10)?;
+        let prices = self.analytics_scoped(q, limit, Some(AnalyticsScope::Prices), 10)?;
         analytics.product_sections = products.product_sections;
         analytics.top_trademarks = products.top_trademarks;
         analytics.top_product_codes = products.top_product_codes;
@@ -653,11 +704,15 @@ impl Db {
     }
 
     /// Overview, monthly dynamics and the sections of a single scope.
+    /// `scope = None` computes only the overview and months (for the
+    /// Overview tab). `hs_level` groups product codes by their first
+    /// 2/4/6 digits; 10 keeps full codes.
     pub fn analytics_scoped(
         &self,
         q: &Query,
         limit: u64,
-        scope: AnalyticsScope,
+        scope: Option<AnalyticsScope>,
+        hs_level: u8,
     ) -> rusqlite::Result<Analytics> {
         let overview = self.analytics_overview(q)?;
         let months = self.analytics_months(q)?;
@@ -668,7 +723,8 @@ impl Db {
         };
         let overview = &analytics.overview;
         match scope {
-            AnalyticsScope::Companies => {
+            None => {}
+            Some(AnalyticsScope::Companies) => {
                 analytics.company_sections = vec![
                     self.analytics_group(
                         q,
@@ -700,12 +756,17 @@ impl Db {
                 analytics.top_senders =
                     section_rows(&analytics.company_sections, AnalyticsSectionKind::Senders);
             }
-            AnalyticsScope::Products => {
+            Some(AnalyticsScope::Products) => {
+                let code_expr = if hs_level >= 10 {
+                    "r.product_code".to_string()
+                } else {
+                    format!("SUBSTR(TRIM(r.product_code), 1, {})", hs_level.clamp(2, 8))
+                };
                 analytics.product_sections = vec![
                     self.analytics_group(
                         q,
                         AnalyticsSectionKind::ProductCodes,
-                        "r.product_code",
+                        &code_expr,
                         AnalyticsFilterField::ProductCode,
                         limit,
                         overview,
@@ -734,7 +795,7 @@ impl Db {
                     AnalyticsSectionKind::ProductCodes,
                 );
             }
-            AnalyticsScope::Countries => {
+            Some(AnalyticsScope::Countries) => {
                 analytics.country_sections = vec![
                     self.analytics_group(
                         q,
@@ -766,7 +827,7 @@ impl Db {
                     AnalyticsSectionKind::OriginCountries,
                 );
             }
-            AnalyticsScope::Prices => {
+            Some(AnalyticsScope::Prices) => {
                 analytics.price_sections = vec![
                     self.price_metric(
                         q,
@@ -982,7 +1043,8 @@ impl Db {
                 SUM(CASE WHEN price IS NOT NULL AND weight IS NOT NULL AND weight > 0
                     THEN price * weight ELSE 0 END),
                 SUM(CASE WHEN price IS NOT NULL AND weight IS NOT NULL AND weight > 0
-                    THEN weight ELSE 0 END)
+                    THEN weight ELSE 0 END),
+                pctl_text(price)
              FROM (
                 SELECT {price_expr} AS price, num_value(r.net_kg) AS weight
                 FROM records r{joins}{where_sql}
@@ -991,6 +1053,15 @@ impl Db {
         self.conn.query_row(&sql, params_from_iter(params), |row| {
             let weighted_sum = row.get::<_, Option<f64>>(4)?.unwrap_or(0.0);
             let weighted_kg = row.get::<_, Option<f64>>(5)?.unwrap_or(0.0);
+            let pctls: Option<String> = row.get(6)?;
+            let mut parts = pctls
+                .as_deref()
+                .unwrap_or("")
+                .split('|')
+                .map(|p| p.parse::<f64>().unwrap_or(0.0));
+            let p25 = parts.next().unwrap_or(0.0);
+            let median = parts.next().unwrap_or(0.0);
+            let p75 = parts.next().unwrap_or(0.0);
             Ok(AnalyticsPriceMetric {
                 kind,
                 count: row.get::<_, i64>(0)? as u64,
@@ -998,6 +1069,9 @@ impl Db {
                 minimum: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
                 maximum: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
                 weighted_average: ratio(weighted_sum, weighted_kg),
+                median,
+                p25,
+                p75,
             })
         })
     }

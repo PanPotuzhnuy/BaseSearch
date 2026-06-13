@@ -92,33 +92,29 @@ Analytics always follows the same query and filters as the Results table. For
 example, if the user searches for `Apple` and filters year `2024`, the Analytics
 tab is calculated only for those matching rows.
 
-The top block, **Answer for current query**, shows the main numbers:
+The Analytics tab is split into focused sub-tabs, so each screen answers one
+kind of question instead of cramming everything into one long page. A one-line
+summary (rows · value · net weight · period) stays visible on every sub-tab.
 
-- product rows, which are table rows, not declaration count;
-- unique declarations;
-- recipients, senders, and organization codes;
-- total value from the source value field when it is present;
-- net and gross weight;
-- average value per net kilogram;
-- counts of product codes, trademarks, and countries.
-
-Everything below the tiles fits on one screen — no endless scrolling:
-
-| Block | What it answers |
+| Sub-tab | What it answers |
 |---|---|
-| Monthly dynamics | How value, rows, or net weight changed month to month: seasonality, spikes, when imports started or stopped. Switch the metric above the chart; hover a bar for the full numbers. |
-| Companies | Who received/imported, who sent, and which organization codes are most important. |
-| Goods | Which product codes, brands, and short product groups dominate. |
-| Countries | Origin, dispatch, and trade countries for the matching shipments. |
-| Prices | Average, weighted, minimum, and maximum price indicators where source fields are filled. |
+| **Overview** | Headline numbers (rows, declarations, companies, value, weight, average $/kg, distinct codes and countries) plus a **monthly dynamics** bar chart. Switch the chart metric between value ($), rows, net weight, and **average price ($/kg)** — the price line is what reveals price trends and dumping. Hover a bar for the full month. |
+| **Companies** | Who received/imported, who sent, and which organization codes dominate. |
+| **Goods** | Which product codes, brands, and product groups dominate. Codes can be grouped by HS level — **2 / 4 / 6 digits or full** — to see structure from chapter down to exact code. |
+| **Countries** | Origin, dispatch, and trade countries for the matching shipments. |
+| **Prices** | Per price field: average, weighted average, **median, and the P25–P75 range** with the value count. Median and quartiles are robust to the outliers and data-entry errors that make raw min/max useless. |
 
-Companies, Goods, Countries, and Prices are switchable categories: only the
-active one is calculated, which keeps the tab fast even on very broad queries.
-A category is shown as side-by-side cards with compact share rows — each row
-shows its value and share, the full numbers (rows, declarations, companies,
-weight, average price) appear on hover, and clicking a row applies the matching
-filter back to the Results table. The period covered by the matching rows is
-shown above the tiles.
+Only the active sub-tab is calculated, which keeps the tab fast even on very
+broad queries. Companies, Goods, and Countries are shown as side-by-side cards
+with compact share rows — each row shows its value and share, the full numbers
+(rows, declarations, companies, weight, average price) appear on hover, and
+clicking a row applies the matching filter back to the Results table. Each card
+has a **copy-table button** that puts the whole top list on the clipboard as a
+tab-separated table, ready to paste into Excel or a report.
+
+Values and prices are shown exactly as they appear in the source files: in the
+41-column layout the "value" can be in the contract currency rather than only
+USD, which the tab notes explicitly so totals are not misread.
 
 To avoid heavy full-database grouping by accident, the Analytics tab asks for a
 search term or filter before running large calculations.
@@ -235,15 +231,18 @@ application executable.
   Linux (X11 and Wayland), and macOS. System fonts are picked per OS with a
   safe built-in fallback; the database location falls back to the home
   directory when the install folder is read-only.
-- **Analytics redesigned as a one-screen dashboard.** Companies, Goods,
-  Countries, and Prices became switchable categories with side-by-side
-  compact cards instead of one long scrolling list. Only the active category
-  is calculated — on broad queries the tab now responds several times faster.
-  Added a period summary, "top N = X% of volume" footers, and a
-  weighted-average column in the price table.
-- **Monthly dynamics chart.** The Analytics tab opens with a bar chart of the
-  matched rows grouped by month, switchable between value ($), row count, and
-  net weight, with hover details for every month.
+- **Analytics restructured into focused sub-tabs.** Overview, Companies,
+  Goods, Countries, and Prices are now separate screens instead of one long
+  scrolling page, with a persistent one-line summary. Only the active sub-tab
+  is calculated, so the tab stays fast on broad queries.
+- **Deeper analytics for real work:** average-price ($/kg) metric on the
+  monthly chart (price trends and dumping), HS-code grouping by 2/4/6/full
+  digits, median and P25–P75 in the price table instead of misleading
+  min/max, a copy-table button on every card (pastes into Excel), and an
+  explicit note about contract-currency values.
+- **Monthly dynamics chart.** The Overview sub-tab shows a bar chart of the
+  matched rows grouped by month, switchable between value ($), row count,
+  net weight, and average price, with hover details for every month.
 - **Continuous integration.** Every commit is tested and built on all three
   platforms; binaries are published as workflow artifacts.
 

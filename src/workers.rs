@@ -17,11 +17,13 @@ pub enum WorkerReq {
         generation: u64,
     },
     /// One analytics category for the current query; cheap enough to
-    /// request lazily as the user switches scope chips.
+    /// request lazily as the user switches tabs. `scope = None` loads
+    /// only the overview and the monthly dynamics.
     Analytics {
         q: Box<Query>,
         limit: u64,
-        scope: AnalyticsScope,
+        scope: Option<AnalyticsScope>,
+        hs_level: u8,
         generation: u64,
     },
     Stats,
@@ -51,7 +53,7 @@ pub enum Msg {
     },
     AnalyticsDone {
         generation: u64,
-        scope: AnalyticsScope,
+        scope: Option<AnalyticsScope>,
         analytics: Box<Analytics>,
     },
     Stats(u64),
@@ -119,12 +121,13 @@ pub fn spawn_search_worker(
                     q,
                     limit,
                     scope,
+                    hs_level,
                     generation,
                 } => {
                     if !analytics_should_run(&q) {
                         continue;
                     }
-                    let msg = match db.analytics_scoped(&q, limit, scope) {
+                    let msg = match db.analytics_scoped(&q, limit, scope, hs_level) {
                         Ok(analytics) => Msg::AnalyticsDone {
                             generation,
                             scope,
