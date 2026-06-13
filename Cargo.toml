@@ -1,6 +1,6 @@
 [package]
 name = "base-search"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 description = "Base Search — локальный поиск по большим Excel-базам"
 license = "MIT"

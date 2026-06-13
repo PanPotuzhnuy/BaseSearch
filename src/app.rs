@@ -595,11 +595,7 @@ impl App {
         self.pivot = None;
         self.analytics_loaded[AnalyticsView::Pivot.index()] = false;
         self.analytics_loading = true;
-        let others = match self.lang {
-            Lang::Ua => "інші",
-            Lang::Ru => "прочие",
-            Lang::En => "others",
-        };
+        let others = self.t().others;
         let _ = self.search_tx.send(WorkerReq::Pivot {
             q: Box::new(self.active_query.clone()),
             row_dim: self.pivot_row_dim,
@@ -2661,11 +2657,13 @@ fn months_chart(ui: &mut egui::Ui, months: &[AnalyticsMonthRow], metric: MonthMe
 
     if let Some(i) = hovered {
         let month = &months[i];
-        let (rows_l, decls_l, value_l, weight_l) = match lang {
-            Lang::Ua => ("рядків", "декларацій", "вартість", "вага нетто"),
-            Lang::Ru => ("строк", "деклараций", "стоимость", "вес нетто"),
-            Lang::En => ("rows", "declarations", "value", "net weight"),
-        };
+        let t = tr(lang);
+        let (rows_l, decls_l, value_l, weight_l) = (
+            t.chart_rows,
+            t.chart_declarations,
+            t.chart_value,
+            t.chart_net_weight,
+        );
         response.on_hover_text(format!(
             "{}\n{}: {}\n{}: {}\n{}: {}\n{}: {} kg",
             month.month,
@@ -2781,17 +2779,7 @@ fn section_tsv(section: &AnalyticsSection, lang: Lang) -> String {
 }
 
 fn group_rows_tsv(rows: &[&AnalyticsGroupRow], lang: Lang) -> String {
-    let header = match lang {
-        Lang::Ua => {
-            "Назва\tРядків\tДекларацій\tКомпаній\tФВ вал.контр\tНетто кг\tБрутто кг\tКількість\tЧастка %\tФВ/кг"
-        }
-        Lang::Ru => {
-            "Название\tСтрок\tДеклараций\tКомпаний\tФВ вал.контр\tНетто кг\tБрутто кг\tКоличество\tДоля %\tФВ/кг"
-        }
-        Lang::En => {
-            "Label\tRows\tDeclarations\tCompanies\tValue\tNet kg\tGross kg\tQuantity\tShare %\tValue/kg"
-        }
-    };
+    let header = tr(lang).group_tsv_header;
     let mut out = String::from(header);
     for row in rows {
         out.push('\n');
@@ -2813,27 +2801,15 @@ fn group_rows_tsv(rows: &[&AnalyticsGroupRow], lang: Lang) -> String {
 }
 
 fn copy_table_hover(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => "Копіювати таблицю (вставляється в Excel)",
-        Lang::Ru => "Копировать таблицу (вставляется в Excel)",
-        Lang::En => "Copy table (pastes into Excel)",
-    }
+    tr(lang).copy_table_hover
 }
 
 fn all_rows_button(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => "Усі",
-        Lang::Ru => "Все",
-        Lang::En => "All",
-    }
+    tr(lang).all_label
 }
 
 fn all_rows_hover(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => "Відкрити повний список цієї секції",
-        Lang::Ru => "Открыть полный список этой секции",
-        Lang::En => "Open the full list for this section",
-    }
+    tr(lang).all_rows_hover
 }
 
 fn analytics_card(
@@ -3229,19 +3205,11 @@ fn pivot_dim_label(dim: PivotDim, lang: Lang) -> &'static str {
         PivotDim::Sender => t.sender,
         PivotDim::Edrpou => t.edrpou,
         PivotDim::ProductCode => t.product_code,
-        PivotDim::Trademark => match lang {
-            Lang::Ua => "Торгова марка",
-            Lang::Ru => "Торговая марка",
-            Lang::En => "Trademark",
-        },
+        PivotDim::Trademark => t.trademark,
         PivotDim::OriginCountry => t.origin_country,
         PivotDim::DispatchCountry => t.dispatch_country,
         PivotDim::TradeCountry => t.trade_country,
-        PivotDim::Month => match lang {
-            Lang::Ua => "Місяць",
-            Lang::Ru => "Месяц",
-            Lang::En => "Month",
-        },
+        PivotDim::Month => t.month,
         PivotDim::Year => t.year,
     }
 }
@@ -3304,11 +3272,7 @@ fn pivot_table_ui(
     } else {
         ACCENT
     };
-    let total_label = match lang {
-        Lang::Ua => "Разом",
-        Lang::Ru => "Итого",
-        Lang::En => "Total",
-    };
+    let total_label = tr(lang).total;
 
     egui::ScrollArea::both().show(ui, |ui| {
         let mut builder = TableBuilder::new(ui)
@@ -3467,20 +3431,12 @@ fn pivot_fmt(value: f64, metric: PivotMetric) -> String {
 }
 
 fn pivot_click_hint(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => "Натисніть, щоб відфільтрувати результати",
-        Lang::Ru => "Нажмите, чтобы отфильтровать результаты",
-        Lang::En => "Click to filter results",
-    }
+    tr(lang).pivot_click_hint
 }
 
 /// Pivot matrix as TSV, ready to paste into Excel.
 fn pivot_tsv(pivot: &PivotResult, row_dim: PivotDim, _col_dim: PivotDim, lang: Lang) -> String {
-    let total_label = match lang {
-        Lang::Ua => "Разом",
-        Lang::Ru => "Итого",
-        Lang::En => "Total",
-    };
+    let total_label = tr(lang).total;
     let mut out = String::new();
     out.push_str(pivot_dim_label(row_dim, lang));
     for c in &pivot.col_labels {
@@ -3545,27 +3501,11 @@ fn underpricing_table(
         tr(lang).year,
         tr(lang).recipient,
         tr(lang).product_code,
-        match lang {
-            Lang::Ua => "Опис",
-            Lang::Ru => "Описание",
-            Lang::En => "Description",
-        },
+        tr(lang).description,
     );
-    let price_h = match lang {
-        Lang::Ua => "$/кг",
-        Lang::Ru => "$/кг",
-        Lang::En => "$/kg",
-    };
-    let median_h = match lang {
-        Lang::Ua => "медіана",
-        Lang::Ru => "медиана",
-        Lang::En => "median",
-    };
-    let below_h = match lang {
-        Lang::Ua => "нижче на",
-        Lang::Ru => "ниже на",
-        Lang::En => "below by",
-    };
+    let price_h = tr(lang).per_kg;
+    let median_h = tr(lang).median;
+    let below_h = tr(lang).below_by;
     let _ = date_h;
     egui::ScrollArea::horizontal()
         .id_salt("underpricing_scroll")
@@ -3671,268 +3611,126 @@ fn underpricing_table(
 }
 
 fn price_header_median(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => "медіана",
-        Lang::Ru => "медиана",
-        Lang::En => "median",
-    }
+    tr(lang).median
 }
 
 fn price_header_weighted(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => "сер. зважена",
-        Lang::Ru => "ср. взвешенная",
-        Lang::En => "weighted avg",
-    }
+    tr(lang).weighted_avg
 }
 
 fn top_share_pattern(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => "Топ {} = {}% обсягу",
-        Lang::Ru => "Топ {} = {}% объёма",
-        Lang::En => "Top {} = {}% of volume",
-    }
+    tr(lang).top_share_pattern
 }
 
 fn group_explorer_title(kind: AnalyticsSectionKind, lang: Lang) -> String {
-    match lang {
-        Lang::Ua => format!("Усі: {}", section_title(kind, lang)),
-        Lang::Ru => format!("Все: {}", section_title(kind, lang)),
-        Lang::En => format!("All: {}", section_title(kind, lang)),
-    }
+    fmt(tr(lang).group_all_title, &[section_title(kind, lang)])
 }
 
 fn group_explorer_hint(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => {
-            "Повний список для поточного запиту. Натисніть рядок, щоб відфільтрувати результати."
-        }
-        Lang::Ru => {
-            "Полный список для текущего запроса. Нажмите строку, чтобы отфильтровать результаты."
-        }
-        Lang::En => "Full list for the current query. Click a row to filter results.",
-    }
+    tr(lang).group_explorer_hint
 }
 
 fn group_search_hint(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => "Шукати всередині цього списку",
-        Lang::Ru => "Искать внутри этого списка",
-        Lang::En => "Search inside this list",
-    }
+    tr(lang).group_search_hint
 }
 
 fn group_explorer_count(rows: u64, limited: bool, lang: Lang) -> String {
-    match (lang, limited) {
-        (Lang::Ua, true) => format!("Завантажено перші {} груп", group_digits(rows)),
-        (Lang::Ru, true) => format!("Загружены первые {} групп", group_digits(rows)),
-        (Lang::En, true) => format!("Loaded first {} groups", group_digits(rows)),
-        (Lang::Ua, false) => format!("Завантажено {} рядків групування", group_digits(rows)),
-        (Lang::Ru, false) => format!("Загружено {} строк группировки", group_digits(rows)),
-        (Lang::En, false) => format!("Loaded {} grouped rows", group_digits(rows)),
-    }
+    let pattern = if limited {
+        tr(lang).group_loaded_first
+    } else {
+        tr(lang).group_loaded_rows
+    };
+    fmt(pattern, &[&group_digits(rows)])
 }
 
 fn group_visible_count(visible: u64, total: u64, limited: bool, lang: Lang) -> String {
-    match (lang, limited) {
-        (Lang::Ua, true) => format!(
-            "Показано {} із перших {}",
-            group_digits(visible),
-            group_digits(total)
-        ),
-        (Lang::Ru, true) => format!(
-            "Показано {} из первых {}",
-            group_digits(visible),
-            group_digits(total)
-        ),
-        (Lang::En, true) => format!(
-            "Showing {} of first {}",
-            group_digits(visible),
-            group_digits(total)
-        ),
-        (Lang::Ua, false) => format!(
-            "Показано {} із {}",
-            group_digits(visible),
-            group_digits(total)
-        ),
-        (Lang::Ru, false) => format!(
-            "Показано {} из {}",
-            group_digits(visible),
-            group_digits(total)
-        ),
-        (Lang::En, false) => format!(
-            "Showing {} of {}",
-            group_digits(visible),
-            group_digits(total)
-        ),
-    }
+    let pattern = if limited {
+        tr(lang).group_showing_first
+    } else {
+        tr(lang).group_showing
+    };
+    fmt(pattern, &[&group_digits(visible), &group_digits(total)])
 }
 
 fn copy_visible_label(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => "Копіювати видимі",
-        Lang::Ru => "Копировать видимые",
-        Lang::En => "Copy visible",
-    }
+    tr(lang).copy_visible
 }
 
 fn label_header(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => "Назва",
-        Lang::Ru => "Название",
-        Lang::En => "Label",
-    }
+    tr(lang).col_label
 }
 
 fn companies_header(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => "Компаній",
-        Lang::Ru => "Компаний",
-        Lang::En => "Companies",
-    }
+    tr(lang).col_companies
 }
 
 fn share_header(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => "Частка",
-        Lang::Ru => "Доля",
-        Lang::En => "Share",
-    }
+    tr(lang).col_share
 }
 
 fn section_title(kind: AnalyticsSectionKind, lang: Lang) -> &'static str {
-    match (kind, lang) {
-        (AnalyticsSectionKind::Recipients, Lang::Ua) => "Одержувачі / хто ввозив",
-        (AnalyticsSectionKind::Recipients, Lang::Ru) => "Получатели / кто ввозил",
-        (AnalyticsSectionKind::Recipients, Lang::En) => "Recipients / importers",
-        (AnalyticsSectionKind::Senders, Lang::Ua) => "Відправники",
-        (AnalyticsSectionKind::Senders, Lang::Ru) => "Отправители",
-        (AnalyticsSectionKind::Senders, Lang::En) => "Senders",
-        (AnalyticsSectionKind::Edrpou, Lang::Ua) => "ЄДРПОУ",
-        (AnalyticsSectionKind::Edrpou, Lang::Ru) => "ЕДРПОУ",
-        (AnalyticsSectionKind::Edrpou, Lang::En) => "EDRPOU",
-        (AnalyticsSectionKind::ProductCodes, Lang::Ua) => "Коди УКТЗЕД",
-        (AnalyticsSectionKind::ProductCodes, Lang::Ru) => "Коды УКТЗЕД",
-        (AnalyticsSectionKind::ProductCodes, Lang::En) => "Product codes",
-        (AnalyticsSectionKind::Trademarks, Lang::Ua) => "Торгові марки",
-        (AnalyticsSectionKind::Trademarks, Lang::Ru) => "Торговые марки",
-        (AnalyticsSectionKind::Trademarks, Lang::En) => "Trademarks",
-        (AnalyticsSectionKind::ProductGroups, Lang::Ua) => "Групи за описом",
-        (AnalyticsSectionKind::ProductGroups, Lang::Ru) => "Группы по описанию",
-        (AnalyticsSectionKind::ProductGroups, Lang::En) => "Description groups",
-        (AnalyticsSectionKind::OriginCountries, Lang::Ua) => "Країни походження",
-        (AnalyticsSectionKind::OriginCountries, Lang::Ru) => "Страны происхождения",
-        (AnalyticsSectionKind::OriginCountries, Lang::En) => "Origin countries",
-        (AnalyticsSectionKind::DispatchCountries, Lang::Ua) => "Країни відправлення",
-        (AnalyticsSectionKind::DispatchCountries, Lang::Ru) => "Страны отправления",
-        (AnalyticsSectionKind::DispatchCountries, Lang::En) => "Dispatch countries",
-        (AnalyticsSectionKind::TradeCountries, Lang::Ua) => "Країни торгівлі",
-        (AnalyticsSectionKind::TradeCountries, Lang::Ru) => "Страны торговли",
-        (AnalyticsSectionKind::TradeCountries, Lang::En) => "Trade countries",
+    let t = tr(lang);
+    match kind {
+        AnalyticsSectionKind::Recipients => t.sec_recipients,
+        AnalyticsSectionKind::Senders => t.sec_senders,
+        AnalyticsSectionKind::Edrpou => t.sec_edrpou,
+        AnalyticsSectionKind::ProductCodes => t.sec_product_codes,
+        AnalyticsSectionKind::Trademarks => t.sec_trademarks,
+        AnalyticsSectionKind::ProductGroups => t.sec_product_groups,
+        AnalyticsSectionKind::OriginCountries => t.sec_origin_countries,
+        AnalyticsSectionKind::DispatchCountries => t.sec_dispatch_countries,
+        AnalyticsSectionKind::TradeCountries => t.sec_trade_countries,
     }
 }
 
 fn row_counts_label(row: &AnalyticsGroupRow, lang: Lang) -> String {
-    match lang {
-        Lang::Ua => format!(
-            "рядків {} | декларацій {} | компаній {}",
-            group_digits(row.rows),
-            group_digits(row.declarations),
-            group_digits(row.companies)
-        ),
-        Lang::Ru => format!(
-            "строк {} | деклараций {} | компаний {}",
-            group_digits(row.rows),
-            group_digits(row.declarations),
-            group_digits(row.companies)
-        ),
-        Lang::En => format!(
-            "rows {} | declarations {} | companies {}",
-            group_digits(row.rows),
-            group_digits(row.declarations),
-            group_digits(row.companies)
-        ),
-    }
+    fmt(
+        tr(lang).row_counts,
+        &[
+            &group_digits(row.rows),
+            &group_digits(row.declarations),
+            &group_digits(row.companies),
+        ],
+    )
 }
 
 fn row_hover_text(row: &AnalyticsGroupRow, lang: Lang) -> String {
     let counts = row_counts_label(row, lang);
-    match lang {
-        Lang::Ua => format!(
-            "{}\n{}\nФВ вал.контр: {}\nНетто: {} кг\nЧастка: {}%\nФВ/кг: {}\nНатисніть, щоб відфільтрувати результати.",
-            row.label,
-            counts,
-            fmt_decimal(row.total_value_usd, 2),
-            fmt_decimal(row.total_net_kg, 3),
-            fmt_decimal(row.share_percent, 2),
-            fmt_decimal(row.avg_value_per_net_kg, 2)
-        ),
-        Lang::Ru => format!(
-            "{}\n{}\nФВ вал.контр: {}\nНетто: {} кг\nДоля: {}%\nФВ/кг: {}\nНажмите, чтобы отфильтровать результаты.",
-            row.label,
-            counts,
-            fmt_decimal(row.total_value_usd, 2),
-            fmt_decimal(row.total_net_kg, 3),
-            fmt_decimal(row.share_percent, 2),
-            fmt_decimal(row.avg_value_per_net_kg, 2)
-        ),
-        Lang::En => format!(
-            "{}\n{}\nValue: {}\nNet: {} kg\nShare: {}%\nValue/kg: {}\nClick to filter results.",
-            row.label,
-            counts,
-            fmt_decimal(row.total_value_usd, 2),
-            fmt_decimal(row.total_net_kg, 3),
-            fmt_decimal(row.share_percent, 2),
-            fmt_decimal(row.avg_value_per_net_kg, 2)
-        ),
-    }
+    fmt(
+        tr(lang).row_hover,
+        &[
+            &row.label,
+            &counts,
+            &fmt_decimal(row.total_value_usd, 2),
+            &fmt_decimal(row.total_net_kg, 3),
+            &fmt_decimal(row.share_percent, 2),
+            &fmt_decimal(row.avg_value_per_net_kg, 2),
+        ],
+    )
 }
 
 fn price_metric_title(kind: PriceMetricKind, lang: Lang) -> &'static str {
-    match (kind, lang) {
-        (PriceMetricKind::ValuePerNetKg, Lang::Ua) => "ФВ / нетто",
-        (PriceMetricKind::ValuePerNetKg, Lang::Ru) => "ФВ / нетто",
-        (PriceMetricKind::ValuePerNetKg, Lang::En) => "Value / net kg",
-        (PriceMetricKind::RfvUsdKg, Lang::Ua) => "РФВ $/кг",
-        (PriceMetricKind::RfvUsdKg, Lang::Ru) => "РФВ $/кг",
-        (PriceMetricKind::RfvUsdKg, Lang::En) => "RFV $/kg",
-        (PriceMetricKind::RmvNetUsdKg, Lang::Ua) => "РМВ нетто $/кг",
-        (PriceMetricKind::RmvNetUsdKg, Lang::Ru) => "РМВ нетто $/кг",
-        (PriceMetricKind::RmvNetUsdKg, Lang::En) => "RMV net $/kg",
-        (PriceMetricKind::RmvUsdExtraUnit, Lang::Ua) => "РМВ $/дод.од.",
-        (PriceMetricKind::RmvUsdExtraUnit, Lang::Ru) => "РМВ $/доп.ед.",
-        (PriceMetricKind::RmvUsdExtraUnit, Lang::En) => "RMV $/extra unit",
-        (PriceMetricKind::RmvGrossUsdKg, Lang::Ua) => "РМВ брутто $/кг",
-        (PriceMetricKind::RmvGrossUsdKg, Lang::Ru) => "РМВ брутто $/кг",
-        (PriceMetricKind::RmvGrossUsdKg, Lang::En) => "RMV gross $/kg",
-        (PriceMetricKind::MinBaseUsdKg, Lang::Ua) => "Мін. база $/кг",
-        (PriceMetricKind::MinBaseUsdKg, Lang::Ru) => "Мин. база $/кг",
-        (PriceMetricKind::MinBaseUsdKg, Lang::En) => "Min base $/kg",
+    let t = tr(lang);
+    match kind {
+        PriceMetricKind::ValuePerNetKg => t.pm_value_per_net_kg,
+        PriceMetricKind::RfvUsdKg => t.pm_rfv,
+        PriceMetricKind::RmvNetUsdKg => t.pm_rmv_net,
+        PriceMetricKind::RmvUsdExtraUnit => t.pm_rmv_extra_unit,
+        PriceMetricKind::RmvGrossUsdKg => t.pm_rmv_gross,
+        PriceMetricKind::MinBaseUsdKg => t.pm_min_base,
     }
 }
 
 fn price_header_metric(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => "показник",
-        Lang::Ru => "показатель",
-        Lang::En => "metric",
-    }
+    tr(lang).price_header_metric
 }
 
 fn price_header_avg(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => "середнє",
-        Lang::Ru => "среднее",
-        Lang::En => "average",
-    }
+    tr(lang).price_header_avg
 }
 
 fn price_header_count(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Ua => "значень",
-        Lang::Ru => "значений",
-        Lang::En => "values",
-    }
+    tr(lang).price_header_count
 }
 
 fn fmt_decimal(value: f64, decimals: usize) -> String {
@@ -4053,6 +3851,58 @@ fn load_first_font(
     }
 }
 
+/// CJK-capable system fonts per OS, tried in order. Used only as a fallback so
+/// the Chinese interface renders; these ship by default on Windows and macOS,
+/// and come from the Noto/WenQuanYi packages on Linux.
+fn cjk_font_candidates() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        &[
+            "C:\\Windows\\Fonts\\msyh.ttc",
+            "C:\\Windows\\Fonts\\msyh.ttf",
+            "C:\\Windows\\Fonts\\simsun.ttc",
+            "C:\\Windows\\Fonts\\simhei.ttf",
+        ]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        &[
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/Library/Fonts/Arial Unicode.ttf",
+        ]
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        &[
+            "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
+        ]
+    }
+}
+
+/// Inserts the first available CJK font as a fallback at the end of both font
+/// families. Missing on a machine only affects Chinese; all other text uses the
+/// primary fonts as before.
+fn load_cjk_fallback(fonts: &mut egui::FontDefinitions, candidates: &[&str]) {
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            let key = "cjk-fallback".to_owned();
+            fonts
+                .font_data
+                .insert(key.clone(), Arc::new(egui::FontData::from_owned(bytes)));
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts.families.entry(family).or_default().push(key.clone());
+            }
+            return;
+        }
+    }
+}
+
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let (proportional, monospace) = system_font_candidates();
@@ -4070,6 +3920,10 @@ fn setup_fonts(ctx: &egui::Context) {
         "system-mono",
         monospace,
     );
+    // CJK fallback so the Chinese interface renders without bundling a large
+    // font. Appended after the primary families, so it is used only for glyphs
+    // the primary font lacks (Latin/Cyrillic stay on the system font).
+    load_cjk_fallback(&mut fonts, cjk_font_candidates());
     ctx.set_fonts(fonts);
 }
 

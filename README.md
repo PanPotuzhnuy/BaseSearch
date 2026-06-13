@@ -1,4 +1,4 @@
-# Base Search 1.1
+# Base Search 1.1.1
 
 [![CI](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml)
 
@@ -38,7 +38,9 @@ on the user's computer.
 - Export search results to CSV or XLSX.
 - Keep the interface responsive while importing, searching, exporting, or
   cleaning the database.
-- Use light/dark theme, adjustable UI scale, and RU/UA/EN interface language.
+- Use light/dark theme, adjustable UI scale, and a 13-language interface
+  (English by default; also Ukrainian, Russian, German, Spanish, French,
+  Polish, Portuguese, Romanian, Hungarian, Bulgarian, Belarusian, and Chinese).
 - Run fully locally with no server and no cloud upload.
 
 ## Why Not Just Excel?
@@ -58,6 +60,10 @@ That makes repeated search and filtering much faster and more predictable.
 
 ## Quick Start
 
+On macOS and Linux, the bundled `start.sh` script sets everything up in one
+guided step — it shows each action in the terminal, installs what is missing,
+builds the app, and opens it. The copy-paste blocks below use it.
+
 ### Windows
 
 Run the prebuilt application — no install needed:
@@ -68,37 +74,36 @@ dist\BaseSearch\BaseSearch.exe
 
 ### macOS (copy-paste)
 
-Paste the whole block into Terminal. It installs the Rust toolchain if it is
-missing, then builds and launches the app:
+Paste this block into Terminal. The guided `start.sh` script checks your
+system, installs the Rust toolchain if it is missing, builds the app while
+narrating each step, and then launches it:
 
 ```bash
 xcode-select --install 2>/dev/null || true
-command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-. "$HOME/.cargo/env"
 git clone https://github.com/PanPotuzhnuy/BaseSearch.git
 cd BaseSearch
-cargo run --release
+./start.sh
 ```
 
-After the first build, just run `./run.sh` from the project folder to start it
-again (or `./run.sh cli stats data/base_search.db` for the command-line tool).
+Run `./start.sh` again anytime to reopen the app — finished steps are skipped,
+so it starts almost instantly. For the command-line tool use
+`./run.sh cli stats data/base_search.db`.
 
-### Linux (Debian / Ubuntu, copy-paste)
+### Linux (copy-paste)
+
+The guided `start.sh` script installs the GUI build libraries (it detects
+apt, dnf, or pacman), installs the Rust toolchain if missing, builds the app
+step by step, and launches it. You only need git to clone first:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y build-essential pkg-config \
-  libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev \
-  libxcb-xfixes0-dev curl git
-command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-. "$HOME/.cargo/env"
+sudo apt-get update && sudo apt-get install -y git   # Debian / Ubuntu
 git clone https://github.com/PanPotuzhnuy/BaseSearch.git
 cd BaseSearch
-cargo run --release
+./start.sh
 ```
 
-On Fedora the dependencies are `gcc pkgconf-pkg-config libxkbcommon-devel
-wayland-devel libxcb-devel`; on Arch, `base-devel libxkbcommon wayland libxcb`.
-After the first build, `./run.sh` launches the app.
+On Fedora use `sudo dnf install -y git`; on Arch, `sudo pacman -S --needed git`.
+Run `./start.sh` again anytime to reopen the app.
 
 ### Where the data lives
 
@@ -262,11 +267,12 @@ cargo build --release
 ```
 
 Release binaries are created in `target/release/`: `BaseSearch` and
-`base-search-cli` (with `.exe` on Windows). On macOS and Linux you can also use
-the bundled helper script, which builds and launches in one step:
+`base-search-cli` (with `.exe` on Windows). On macOS and Linux two helper
+scripts are bundled:
 
 ```bash
-./run.sh              # build (release) and run the app
+./start.sh            # guided first run: checks tools, installs, builds, launches
+./run.sh              # quiet build (release) and run, for repeat use
 ./run.sh cli stats data/base_search.db   # run the command-line tool
 ```
 
@@ -297,6 +303,22 @@ selected local spreadsheets and writes a local SQLite database beside the
 application executable.
 
 ## Changelog
+
+### 1.1.1
+
+- **Guided first-run script for macOS and Linux.** `./start.sh` narrates each
+  step in the terminal — it checks the OS, installs the Rust toolchain (and the
+  Linux GUI libraries) only when missing, builds the app, and launches it — so
+  a non-technical user can set everything up with a single command.
+- **13 interface languages, English by default.** The app now starts in
+  English everywhere; the interface is also available in Ukrainian, Russian,
+  German, Spanish, French, Polish, Portuguese, Romanian, Hungarian, Bulgarian,
+  Belarusian, and Chinese, switchable any time in Settings.
+- **CJK font fallback.** Base Search uses system CJK fonts when available so
+  the Chinese interface renders without bundling a large font into the binary.
+- **Localization cleanup.** UI strings that used to be hardcoded in the app are
+  centralized in the translation layer, so every supported language gets the
+  analytics labels, tooltips, pivot text, price labels, and quick guide.
 
 ### 1.1
 

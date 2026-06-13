@@ -1,0 +1,3 @@
+# Keep shell scripts LF-only so they run on macOS and Linux regardless of the
+# committer's core.autocrlf setting. A CRLF here would break the shebang.
+*.sh text eol=lf
