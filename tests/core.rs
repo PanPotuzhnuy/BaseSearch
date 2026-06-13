@@ -463,6 +463,57 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
 }
 
 #[test]
+fn undervaluation_flags_rows_below_code_median() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("under.xlsx");
+    let db_path = dir.path().join("data").join("under.db");
+    // Six rows with the same product code: five around 10 $/kg and one at
+    // 1 $/kg (10 USD / 10 kg) which should be flagged.
+    let mut rows = Vec::new();
+    for (i, (value, net)) in [
+        ("100", "10"),
+        ("105", "10"),
+        ("98", "10"),
+        ("102", "10"),
+        ("110", "10"),
+        ("10", "10"), // the outlier: 1 $/kg vs ~10 median
+    ]
+    .iter()
+    .enumerate()
+    {
+        rows.push(vec![
+            ("declaration_number", Box::leak(format!("24UA{i:09}U1").into_boxed_str()) as &str),
+            ("declaration_date", "15.03.2024"),
+            ("sender", "FOREIGN SUPPLIER LTD"),
+            ("edrpou", "55550000"),
+            ("recipient", "ТОВ «Тест»"),
+            ("product_code", "1234567890"),
+            ("description", "Тестовий товар"),
+            ("net_kg", net),
+            ("currency_control_value", value),
+        ]);
+    }
+    write_test_xlsx(&xlsx, &rows);
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 6);
+
+    let uv = db
+        .undervaluation(&Query::default(), 0.5, 5, 100)
+        .unwrap();
+    assert_eq!(uv.checked_codes, 1);
+    assert_eq!(uv.rows.len(), 1);
+    let flagged = &uv.rows[0];
+    assert_eq!(flagged.product_code, "1234567890");
+    assert_close(flagged.price_per_kg, 1.0);
+    assert_close(flagged.code_median, 10.2); // median of {9.8,10,10.2,10.5,11,1} sorted -> index 3 = 10.2
+    assert!(flagged.ratio < 0.5);
+}
+
+#[test]
 fn analytics_builds_decision_sections_for_trade_questions() {
     let dir = tempfile::tempdir().unwrap();
     let xlsx = dir.path().join("analytics_sections.xlsx");

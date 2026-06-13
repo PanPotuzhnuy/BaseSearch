@@ -270,6 +270,64 @@ pub struct Analytics {
     pub top_origin_countries: Vec<AnalyticsGroupRow>,
 }
 
+/// SQLite aggregate: median of the values as a number.
+struct MedianAggregate;
+
+impl rusqlite::functions::Aggregate<Vec<f64>, Option<f64>> for MedianAggregate {
+    fn init(&self, _ctx: &mut rusqlite::functions::Context<'_>) -> rusqlite::Result<Vec<f64>> {
+        Ok(Vec::new())
+    }
+
+    fn step(
+        &self,
+        ctx: &mut rusqlite::functions::Context<'_>,
+        acc: &mut Vec<f64>,
+    ) -> rusqlite::Result<()> {
+        if let Some(value) = ctx.get::<Option<f64>>(0)?
+            && value.is_finite()
+        {
+            acc.push(value);
+        }
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        _ctx: &mut rusqlite::functions::Context<'_>,
+        acc: Option<Vec<f64>>,
+    ) -> rusqlite::Result<Option<f64>> {
+        let mut values = acc.unwrap_or_default();
+        if values.is_empty() {
+            return Ok(None);
+        }
+        values.sort_unstable_by(f64::total_cmp);
+        Ok(Some(values[values.len() / 2]))
+    }
+}
+
+/// One declaration flagged as potentially undervalued: its price per kg is
+/// well below the median for the same product code.
+#[derive(Clone, Debug, Default)]
+pub struct UndervaluedRow {
+    pub id: i64,
+    pub declaration_date: String,
+    pub declaration_number: String,
+    pub recipient: String,
+    pub product_code: String,
+    pub description: String,
+    pub price_per_kg: f64,
+    pub code_median: f64,
+    /// price_per_kg / code_median (0.3 means 30% of the typical price).
+    pub ratio: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Undervaluation {
+    pub rows: Vec<UndervaluedRow>,
+    /// Number of distinct product codes that had enough samples to judge.
+    pub checked_codes: u64,
+}
+
 /// Dimension for the pivot table (rows or columns).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PivotDim {
@@ -446,6 +504,13 @@ impl Db {
             1,
             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
             PercentilesAggregate,
+        )?;
+        // Медиана как число — для соединений и фильтров в SQL.
+        self.conn.create_aggregate_function(
+            "median_num",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            MedianAggregate,
         )?;
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta (
@@ -1109,6 +1174,75 @@ impl Db {
             top_products,
             top_senders,
             top_origin_countries,
+        })
+    }
+
+    /// Finds declarations whose customs value per kg is far below the median
+    /// for the same product code — a classic signal of undervaluation. Only
+    /// codes with at least `min_samples` priced rows are judged, so a lone
+    /// declaration cannot flag itself. Rows are returned most-undervalued first.
+    pub fn undervaluation(
+        &self,
+        q: &Query,
+        threshold: f64,
+        min_samples: u64,
+        limit: u64,
+    ) -> rusqlite::Result<Undervaluation> {
+        let (joins, where_sql, params) = self.build_where(q);
+        let cond = if where_sql.is_empty() { " WHERE" } else { " AND" };
+        // priced: one row per declaration line with a usable $/kg.
+        // code_stats: median $/kg and sample count per product code.
+        let sql = format!(
+            "WITH priced AS (
+                SELECT r.id AS id,
+                    TRIM(r.product_code) AS code,
+                    num_value(r.currency_control_value) / num_value(r.net_kg) AS price,
+                    r.declaration_date AS dt,
+                    r.declaration_number AS num,
+                    r.recipient AS recipient,
+                    r.description AS descr
+                FROM records r{joins}{where_sql}{cond}
+                    TRIM(r.product_code) <> ''
+                    AND num_value(r.net_kg) > 0
+                    AND num_value(r.currency_control_value) > 0
+             ),
+             code_stats AS (
+                SELECT code, median_num(price) AS med, COUNT(*) AS n
+                FROM priced GROUP BY code HAVING n >= ?
+             )
+             SELECT p.id, p.dt, p.num, p.recipient, p.code, p.descr,
+                    p.price, c.med, p.price / c.med AS ratio
+             FROM priced p JOIN code_stats c ON c.code = p.code
+             WHERE c.med > 0 AND p.price < c.med * ?
+             ORDER BY ratio ASC
+             LIMIT ?"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind: Vec<rusqlite::types::Value> = params;
+        bind.push((min_samples as i64).into());
+        bind.push(threshold.into());
+        bind.push((limit as i64).into());
+        let mut rows = stmt.query(params_from_iter(bind))?;
+        let mut out = Vec::new();
+        let mut codes = std::collections::HashSet::new();
+        while let Some(row) = rows.next()? {
+            let code: String = row.get(4)?;
+            codes.insert(code.clone());
+            out.push(UndervaluedRow {
+                id: row.get(0)?,
+                declaration_date: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                declaration_number: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                recipient: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                product_code: code,
+                description: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                price_per_kg: row.get(6)?,
+                code_median: row.get(7)?,
+                ratio: row.get(8)?,
+            });
+        }
+        Ok(Undervaluation {
+            rows: out,
+            checked_codes: codes.len() as u64,
         })
     }
 

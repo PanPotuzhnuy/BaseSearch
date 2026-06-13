@@ -13,7 +13,7 @@ use crate::db::{
     Analytics, AnalyticsFilterAction, AnalyticsFilterField, AnalyticsGroupRow,
     AnalyticsMonthRow, AnalyticsPriceMetric, AnalyticsScope, AnalyticsSection,
     AnalyticsSectionKind, CompanyProfile, Db, Filters, PivotDim, PivotMetric, PivotResult,
-    PriceMetricKind, Query, RecordCard,
+    PriceMetricKind, Query, RecordCard, Undervaluation,
 };
 use crate::export::ExportError;
 use crate::i18n::{Lang, Tr, fmt, group_digits, tr};
@@ -261,6 +261,10 @@ pub struct App {
     pivot_row_dim: PivotDim,
     pivot_col_dim: PivotDim,
     pivot_metric: PivotMetric,
+    /// Undervaluation scan (in the Prices sub-tab).
+    underpricing: Option<Undervaluation>,
+    underpricing_loading: bool,
+    underpricing_gen: u64,
     selected: HashSet<usize>,
     select_anchor: Option<usize>,
     visible_cols: Vec<bool>,
@@ -358,6 +362,9 @@ impl App {
             pivot_row_dim: PivotDim::Recipient,
             pivot_col_dim: PivotDim::Month,
             pivot_metric: PivotMetric::Value,
+            underpricing: None,
+            underpricing_loading: false,
+            underpricing_gen: 0,
             selected: HashSet::new(),
             select_anchor: None,
             visible_cols,
@@ -438,6 +445,8 @@ impl App {
         self.analytics_loaded = [false; 6];
         self.analytics_loading = false;
         self.pivot = None;
+        self.underpricing = None;
+        self.underpricing_loading = false;
         let _ = self.search_tx.send(WorkerReq::Search {
             q: Box::new(self.active_query.clone()),
             page: self.page,
@@ -492,6 +501,22 @@ impl App {
             scope: self.analytics_view.scope(),
             hs_level: self.hs_level,
             generation: self.search_gen,
+        });
+    }
+
+    /// Scans the current query for declarations priced far below the median
+    /// for their product code.
+    fn request_underpricing(&mut self) {
+        if self.active_query.is_empty() {
+            return;
+        }
+        self.underpricing = None;
+        self.underpricing_loading = true;
+        self.underpricing_gen += 1;
+        let _ = self.search_tx.send(WorkerReq::Underpricing {
+            q: Box::new(self.active_query.clone()),
+            threshold: 0.5,
+            generation: self.underpricing_gen,
         });
     }
 
@@ -610,6 +635,12 @@ impl App {
                         self.analytics_gen = generation;
                         self.analytics_loaded[AnalyticsView::Pivot.index()] = true;
                         self.analytics_loading = false;
+                    }
+                }
+                Msg::UnderpricingDone { generation, result } => {
+                    if generation == self.underpricing_gen {
+                        self.underpricing = Some(*result);
+                        self.underpricing_loading = false;
                     }
                 }
                 Msg::Stats(total) => self.db_total_rows = Some(total),
@@ -768,6 +799,15 @@ impl App {
         let Some(id) = self.row_ids.get(row_index).copied() else {
             return;
         };
+        if let Some(db) = &self.lite_db
+            && let Ok(card) = db.record_card(id)
+        {
+            self.card = Some(card);
+            self.card_open = true;
+        }
+    }
+
+    fn open_card_by_id(&mut self, id: i64) {
         if let Some(db) = &self.lite_db
             && let Ok(card) = db.record_card(id)
         {
@@ -1256,6 +1296,8 @@ impl App {
             let mut new_pivot_col: Option<PivotDim> = None;
             let mut new_pivot_metric: Option<PivotMetric> = None;
             let mut copy_pivot = false;
+            let mut scan_underpricing = false;
+            let mut open_card_id: Option<i64> = None;
             let p_row = self.pivot_row_dim;
             let p_col = self.pivot_col_dim;
             let p_metric = self.pivot_metric;
@@ -1487,6 +1529,36 @@ impl App {
                             price_table(ui, &analytics.price_sections, lang);
                             ui.add_space(8.0);
                             ui.label(egui::RichText::new(t.currency_note).weak().small());
+
+                            ui.add_space(14.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(t.underpricing_title).strong());
+                            ui.label(egui::RichText::new(t.underpricing_hint).weak().small());
+                            ui.add_space(6.0);
+                            match &self.underpricing {
+                                _ if self.underpricing_loading => {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(t.searching);
+                                    });
+                                }
+                                Some(uv) => {
+                                    if let Some(id) =
+                                        underpricing_table(ui, uv, lang, &mut scan_underpricing)
+                                    {
+                                        open_card_id = Some(id);
+                                    }
+                                }
+                                None => {
+                                    if ui
+                                        .button(format!("\u{1F6A9} {}", t.underpricing_scan))
+                                        .clicked()
+                                    {
+                                        scan_underpricing = true;
+                                    }
+                                }
+                            }
                         }
                     }
                     AnalyticsView::Pivot => {
@@ -1580,6 +1652,12 @@ impl App {
             if copy_pivot && let Some(pivot) = &self.pivot {
                 let tsv = pivot_tsv(pivot, self.pivot_row_dim, self.pivot_col_dim, self.lang);
                 ui.ctx().copy_text(tsv);
+            }
+            if scan_underpricing {
+                self.request_underpricing();
+            }
+            if let Some(id) = open_card_id {
+                self.open_card_by_id(id);
             }
             if show_more {
                 self.analytics_limit = 50;
@@ -2223,6 +2301,7 @@ impl eframe::App for App {
             || self.search_in_flight
             || self.analytics_loading
             || self.profile_loading
+            || self.underpricing_loading
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
@@ -2901,6 +2980,165 @@ fn pivot_tsv(pivot: &PivotResult, row_dim: PivotDim, _col_dim: PivotDim, lang: L
     out.push('\t');
     out.push_str(&format!("{:.2}", pivot.grand_total));
     out
+}
+
+/// Table of flagged undervalued declarations. Returns a record id when a row
+/// is clicked (to open its card). `rescan` is set if the user asks to refresh.
+fn underpricing_table(
+    ui: &mut egui::Ui,
+    uv: &Undervaluation,
+    lang: Lang,
+    rescan: &mut bool,
+) -> Option<i64> {
+    let mut open_id = None;
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(fmt(
+                tr(lang).underpricing_found,
+                &[
+                    &group_digits(uv.rows.len() as u64),
+                    &group_digits(uv.checked_codes),
+                ],
+            ))
+            .weak()
+            .small(),
+        );
+        if ui.small_button(tr(lang).underpricing_rescan).clicked() {
+            *rescan = true;
+        }
+    });
+    if uv.rows.is_empty() {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(tr(lang).underpricing_none).weak());
+        return None;
+    }
+    ui.add_space(4.0);
+    let (date_h, recip_h, code_h, desc_h) = (
+        tr(lang).year,
+        tr(lang).recipient,
+        tr(lang).product_code,
+        match lang {
+            Lang::Ua => "Опис",
+            Lang::Ru => "Описание",
+            Lang::En => "Description",
+        },
+    );
+    let price_h = match lang {
+        Lang::Ua => "$/кг",
+        Lang::Ru => "$/кг",
+        Lang::En => "$/kg",
+    };
+    let median_h = match lang {
+        Lang::Ua => "медіана",
+        Lang::Ru => "медиана",
+        Lang::En => "median",
+    };
+    let below_h = match lang {
+        Lang::Ua => "нижче на",
+        Lang::Ru => "ниже на",
+        Lang::En => "below by",
+    };
+    let _ = date_h;
+    egui::ScrollArea::horizontal()
+        .id_salt("underpricing_scroll")
+        .show(ui, |ui| {
+            TableBuilder::new(ui)
+                .striped(true)
+                .sense(egui::Sense::click())
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::initial(82.0).at_least(70.0))
+                .column(Column::initial(180.0).at_least(100.0).clip(true))
+                .column(Column::initial(96.0).at_least(70.0))
+                .column(Column::initial(300.0).at_least(120.0).clip(true))
+                .column(Column::initial(70.0).at_least(50.0))
+                .column(Column::initial(70.0).at_least(50.0))
+                .column(Column::initial(72.0).at_least(56.0))
+                .header(24.0, |mut h| {
+                    h.col(|ui| {
+                        ui.strong(header_for("declaration_date"));
+                    });
+                    h.col(|ui| {
+                        ui.strong(recip_h);
+                    });
+                    h.col(|ui| {
+                        ui.strong(code_h);
+                    });
+                    h.col(|ui| {
+                        ui.strong(desc_h);
+                    });
+                    h.col(|ui| {
+                        ui.strong(price_h);
+                    });
+                    h.col(|ui| {
+                        ui.strong(median_h);
+                    });
+                    h.col(|ui| {
+                        ui.strong(below_h);
+                    });
+                })
+                .body(|mut body| {
+                    for row in &uv.rows {
+                        body.row(22.0, |mut tr_row| {
+                            let mut clicked = false;
+                            tr_row.col(|ui| {
+                                clicked |= ui
+                                    .add(egui::Label::new(&row.declaration_date).selectable(false))
+                                    .clicked();
+                            });
+                            tr_row.col(|ui| {
+                                clicked |= ui
+                                    .add(
+                                        egui::Label::new(&row.recipient)
+                                            .selectable(false)
+                                            .truncate(),
+                                    )
+                                    .clicked();
+                            });
+                            tr_row.col(|ui| {
+                                clicked |= ui
+                                    .add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&row.product_code).monospace(),
+                                        )
+                                        .selectable(false),
+                                    )
+                                    .clicked();
+                            });
+                            tr_row.col(|ui| {
+                                clicked |= ui
+                                    .add(
+                                        egui::Label::new(&row.description)
+                                            .selectable(false)
+                                            .truncate(),
+                                    )
+                                    .clicked();
+                            });
+                            tr_row.col(|ui| {
+                                ui.label(
+                                    egui::RichText::new(fmt_decimal(row.price_per_kg, 2))
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(200, 60, 60)),
+                                );
+                            });
+                            tr_row.col(|ui| {
+                                ui.label(
+                                    egui::RichText::new(fmt_decimal(row.code_median, 2)).monospace(),
+                                );
+                            });
+                            tr_row.col(|ui| {
+                                let pct = ((1.0 - row.ratio) * 100.0).round() as i64;
+                                ui.label(
+                                    egui::RichText::new(format!("{pct}%")).monospace().strong(),
+                                );
+                            });
+                            if clicked {
+                                open_id = Some(row.id);
+                            }
+                        });
+                    }
+                });
+        });
+    open_id
 }
 
 fn price_header_median(lang: Lang) -> &'static str {

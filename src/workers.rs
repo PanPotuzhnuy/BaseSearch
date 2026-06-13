@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::db::{
     Analytics, AnalyticsScope, CompanyProfile, Db, PivotDim, PivotMetric, PivotResult, Query,
-    analytics_should_run,
+    Undervaluation, analytics_should_run,
 };
 use crate::export::{self, ExportError};
 use crate::import::{self, FileSummary, ImportPhase};
@@ -38,6 +38,12 @@ pub enum WorkerReq {
         col_dim: PivotDim,
         metric: PivotMetric,
         others_label: String,
+        generation: u64,
+    },
+    /// Undervaluation scan over the current query.
+    Underpricing {
+        q: Box<Query>,
+        threshold: f64,
         generation: u64,
     },
     Stats,
@@ -77,6 +83,10 @@ pub enum Msg {
     PivotDone {
         generation: u64,
         pivot: Box<PivotResult>,
+    },
+    UnderpricingDone {
+        generation: u64,
+        result: Box<Undervaluation>,
     },
     Stats(u64),
     Import(ImportEvent),
@@ -192,6 +202,27 @@ pub fn spawn_search_worker(
                         Ok(pivot) => Msg::PivotDone {
                             generation,
                             pivot: Box::new(pivot),
+                        },
+                        Err(e) => Msg::SearchError {
+                            generation,
+                            message: e.to_string(),
+                        },
+                    };
+                    let _ = tx.send(msg);
+                    ctx.request_repaint();
+                }
+                WorkerReq::Underpricing {
+                    q,
+                    threshold,
+                    generation,
+                } => {
+                    if !analytics_should_run(&q) {
+                        continue;
+                    }
+                    let msg = match db.undervaluation(&q, threshold, 5, 200) {
+                        Ok(result) => Msg::UnderpricingDone {
+                            generation,
+                            result: Box::new(result),
                         },
                         Err(e) => Msg::SearchError {
                             generation,

@@ -102,7 +102,8 @@ summary (rows · value · net weight · period) stays visible on every sub-tab.
 | **Companies** | Who received/imported, who sent, and which organization codes dominate. |
 | **Goods** | Which product codes, brands, and product groups dominate. Codes can be grouped by HS level — **2 / 4 / 6 digits or full** — to see structure from chapter down to exact code. |
 | **Countries** | Origin, dispatch, and trade countries for the matching shipments. |
-| **Prices** | Per price field: average, weighted average, **median, and the P25–P75 range** with the value count. Median and quartiles are robust to the outliers and data-entry errors that make raw min/max useless. |
+| **Prices** | Per price field: average, weighted average, **median, and the P25–P75 range** with the value count. Below the table, a **price-undervaluation scan** lists declarations priced per kg far below the median for their own product code — the classic signal of customs undervaluation (or a data-entry error). |
+| **Pivot** | A **cross-tab**: pick any dimension for rows and any for columns (company, EDRPOU, product code, trademark, origin/dispatch/trade country, month, year) and a value (value $, rows, net weight). The result is a heatmap with row, column, and grand totals; row/column labels drill into the Results table, and the whole matrix copies into Excel. |
 
 Only the active sub-tab is calculated, which keeps the tab fast even on very
 broad queries. Companies, Goods, and Countries are shown as side-by-side cards
@@ -118,6 +119,16 @@ USD, which the tab notes explicitly so totals are not misread.
 
 To avoid heavy full-database grouping by accident, the Analytics tab asks for a
 search term or filter before running large calculations.
+
+## Company Dossier
+
+Right-click any result row and choose **Company profile** (by EDRPOU) to open a
+one-screen dossier for that importer: all name variants seen for the code,
+headline numbers (rows, declarations, value, net weight, average $/kg, distinct
+product codes and suppliers), a monthly dynamics chart, and the company's top
+product codes, suppliers, and origin countries. Any card row drills back into
+the filtered Results table, so "tell me everything about this company, then show
+me the underlying lines" is a couple of clicks.
 
 ## Search Syntax
 
@@ -232,17 +243,23 @@ application executable.
   safe built-in fallback; the database location falls back to the home
   directory when the install folder is read-only.
 - **Analytics restructured into focused sub-tabs.** Overview, Companies,
-  Goods, Countries, and Prices are now separate screens instead of one long
-  scrolling page, with a persistent one-line summary. Only the active sub-tab
-  is calculated, so the tab stays fast on broad queries.
+  Goods, Countries, Prices, and Pivot are separate screens instead of one
+  long scrolling page, with a persistent one-line summary. Only the active
+  sub-tab is calculated, so the tab stays fast on broad queries.
+- **Pivot cross-tab.** Cross-tabulate any dimension by any other (company,
+  EDRPOU, code, trademark, country, month, year) for value / rows / net
+  weight, as a heatmap with totals; labels drill into results and the matrix
+  copies into Excel.
+- **Company dossier.** A one-screen profile per importer (by EDRPOU) with
+  name variants, headline numbers, monthly dynamics, and top products,
+  suppliers, and origin countries; opened from the row context menu.
+- **Price-undervaluation scan.** Flags declarations priced per kg far below
+  the median for their own product code — a customs undervaluation signal.
 - **Deeper analytics for real work:** average-price ($/kg) metric on the
   monthly chart (price trends and dumping), HS-code grouping by 2/4/6/full
   digits, median and P25–P75 in the price table instead of misleading
   min/max, a copy-table button on every card (pastes into Excel), and an
   explicit note about contract-currency values.
-- **Monthly dynamics chart.** The Overview sub-tab shows a bar chart of the
-  matched rows grouped by month, switchable between value ($), row count,
-  net weight, and average price, with hover details for every month.
 - **Continuous integration.** Every commit is tested and built on all three
   platforms; binaries are published as workflow artifacts.
 
