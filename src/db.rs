@@ -1606,18 +1606,25 @@ pub fn build_fts_query(input: &str) -> String {
 
 /// Prefix FTS terms for a filter value: `JYSK Ukraine` -> `"jysk"* "ukraine"*`.
 /// Returns None when the value cannot produce reliable terms, such as 1-char tokens.
-fn fts_prefix_terms(value: &str) -> Option<String> {
+pub fn fts_prefix_terms(value: &str) -> Option<String> {
+    // Short tokens (single letters in names like "S A", "Z O O", initials)
+    // are dropped, not fatal: we still narrow by the distinctive long tokens
+    // through FTS, and cyr_contains does the exact substring check afterwards.
+    // Returning None here would disable FTS narrowing entirely and force a
+    // full-table cyr_contains scan over every row — far too slow on big bases.
     let mut terms: Vec<String> = Vec::new();
     let mut current = String::new();
     for ch in value.chars().chain(std::iter::once(' ')) {
         if ch.is_alphanumeric() {
             current.push(ch);
         } else if !current.is_empty() {
-            if current.chars().count() < 2 {
-                return None;
+            if current.chars().count() >= 3 {
+                terms.push(format!("\"{current}\"*"));
             }
-            terms.push(format!("\"{current}\"*"));
             current.clear();
+        }
+        if terms.len() >= 8 {
+            break;
         }
     }
     if terms.is_empty() {

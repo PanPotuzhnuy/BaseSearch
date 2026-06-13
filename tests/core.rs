@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use base_search::db::{
     AnalyticsFilterField, AnalyticsScope, AnalyticsSectionKind, Db, Filters, PivotDim,
     PivotMetric, PriceMetricKind, Query, analytics_should_run, build_fts_query, extract_year,
-    parse_number,
+    fts_prefix_terms, parse_number,
 };
 use base_search::export;
 use base_search::import::{self, collapse_ws, normalize_date, normalize_value};
@@ -1034,6 +1034,71 @@ fn contains_ci_works() {
     assert!(!contains_ci("ТОВ «Вінтаж»", "вино"));
     assert!(!contains_ci("", "вино"));
     assert!(contains_ci("ааб", "аб")); // overlapping prefix
+}
+
+#[test]
+fn fts_prefix_terms_keeps_long_tokens() {
+    // Company names full of one- and two-letter tokens must still produce FTS
+    // prefix terms from their distinctive long words — otherwise the filter
+    // falls back to a full-table scan (the v1.1 slowdown).
+    let terms = fts_prefix_terms("JYSK SP Z O O METEORYTOWA 13 GDANSK").unwrap();
+    assert!(terms.contains("\"JYSK\"*"));
+    assert!(terms.contains("\"METEORYTOWA\"*"));
+    assert!(terms.contains("\"GDANSK\"*"));
+    // Short tokens are dropped, not fatal.
+    assert!(!terms.contains("\"Z\""));
+    assert!(!terms.contains("\"SP\"*"));
+    // A name made only of short tokens yields no usable terms.
+    assert_eq!(fts_prefix_terms("S A"), None);
+    assert_eq!(fts_prefix_terms(""), None);
+}
+
+/// A sender/recipient filter must return the same rows whether or not FTS
+/// narrowing kicks in, even when the name is full of short tokens.
+#[test]
+fn sender_filter_with_short_tokens_is_correct() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("senders.xlsx");
+    let db_path = dir.path().join("data").join("senders.db");
+    write_test_xlsx(
+        &xlsx,
+        &[
+            vec![
+                ("declaration_number", "24UA0000001U1"),
+                ("declaration_date", "15.03.2024"),
+                ("sender", "JYSK SP Z O O METEORYTOWA 13 GDANSK"),
+                ("edrpou", "10000001"),
+                ("recipient", "ТОВ «Перший»"),
+                ("product_code", "9405500000"),
+                ("description", "Світильники"),
+            ],
+            vec![
+                ("declaration_number", "24UA0000002U2"),
+                ("declaration_date", "16.03.2024"),
+                ("sender", "OTHER COMPANY LLC"),
+                ("edrpou", "10000002"),
+                ("recipient", "ТОВ «Другий»"),
+                ("product_code", "9405500000"),
+                ("description", "Світильники інші"),
+            ],
+        ],
+    );
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+
+    let filters = Filters {
+        sender: "JYSK SP Z O O METEORYTOWA 13 GDANSK".into(),
+        ..Default::default()
+    };
+    let q = Query {
+        text: String::new(),
+        filters,
+    };
+    assert_eq!(db.count(&q).unwrap(), 1);
+    let (_, rows) = db.search_page(&q, 10, 0).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][result_col("edrpou")], "10000001");
 }
 
 #[test]
