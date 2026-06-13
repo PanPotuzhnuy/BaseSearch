@@ -148,6 +148,14 @@ clicking a row applies the matching filter back to the Results table. Each card
 has a **copy-table button** that puts the whole top list on the clipboard as a
 tab-separated table, ready to paste into Excel or a report.
 
+When the top list is not enough, each Companies, Goods, and Countries card also
+has an **All** button. It opens an on-demand drill-down window for that exact
+section: search inside the grouped list, sort by rows, declarations, companies,
+value, weight, share, or value per kg, copy the visible rows to Excel, or click
+a row to apply it as a Results filter. To keep the UI responsive on very broad
+queries, the drill-down window loads up to the first 20,000 groups and says so
+explicitly if that safety limit is reached.
+
 Values and prices are shown exactly as they appear in the source files: in the
 41-column layout the "value" can be in the contract currency rather than only
 USD, which the tab notes explicitly so totals are not misread.

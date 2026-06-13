@@ -900,27 +900,24 @@ impl Db {
             None => {}
             Some(AnalyticsScope::Companies) => {
                 analytics.company_sections = vec![
-                    self.analytics_group(
+                    self.analytics_section_with_overview(
                         q,
                         AnalyticsSectionKind::Recipients,
-                        "r.recipient",
-                        AnalyticsFilterField::Recipient,
+                        hs_level,
                         limit,
                         overview,
                     )?,
-                    self.analytics_group(
+                    self.analytics_section_with_overview(
                         q,
                         AnalyticsSectionKind::Senders,
-                        "r.sender",
-                        AnalyticsFilterField::Sender,
+                        hs_level,
                         limit,
                         overview,
                     )?,
-                    self.analytics_group(
+                    self.analytics_section_with_overview(
                         q,
                         AnalyticsSectionKind::Edrpou,
-                        "r.edrpou",
-                        AnalyticsFilterField::Edrpou,
+                        hs_level,
                         limit,
                         overview,
                     )?,
@@ -933,33 +930,25 @@ impl Db {
                     section_rows(&analytics.company_sections, AnalyticsSectionKind::Senders);
             }
             Some(AnalyticsScope::Products) => {
-                let code_expr = if hs_level >= 10 {
-                    "r.product_code".to_string()
-                } else {
-                    format!("SUBSTR(TRIM(r.product_code), 1, {})", hs_level.clamp(2, 8))
-                };
                 analytics.product_sections = vec![
-                    self.analytics_group(
+                    self.analytics_section_with_overview(
                         q,
                         AnalyticsSectionKind::ProductCodes,
-                        &code_expr,
-                        AnalyticsFilterField::ProductCode,
+                        hs_level,
                         limit,
                         overview,
                     )?,
-                    self.analytics_group(
+                    self.analytics_section_with_overview(
                         q,
                         AnalyticsSectionKind::Trademarks,
-                        "r.trademark",
-                        AnalyticsFilterField::Trademark,
+                        hs_level,
                         limit,
                         overview,
                     )?,
-                    self.analytics_group(
+                    self.analytics_section_with_overview(
                         q,
                         AnalyticsSectionKind::ProductGroups,
-                        "SUBSTR(TRIM(r.description), 1, 80)",
-                        AnalyticsFilterField::Description,
+                        hs_level,
                         limit,
                         overview,
                     )?,
@@ -975,27 +964,24 @@ impl Db {
             }
             Some(AnalyticsScope::Countries) => {
                 analytics.country_sections = vec![
-                    self.analytics_group(
+                    self.analytics_section_with_overview(
                         q,
                         AnalyticsSectionKind::OriginCountries,
-                        "r.origin_country",
-                        AnalyticsFilterField::OriginCountry,
+                        hs_level,
                         limit,
                         overview,
                     )?,
-                    self.analytics_group(
+                    self.analytics_section_with_overview(
                         q,
                         AnalyticsSectionKind::DispatchCountries,
-                        "r.dispatch_country",
-                        AnalyticsFilterField::DispatchCountry,
+                        hs_level,
                         limit,
                         overview,
                     )?,
-                    self.analytics_group(
+                    self.analytics_section_with_overview(
                         q,
                         AnalyticsSectionKind::TradeCountries,
-                        "r.trade_country",
-                        AnalyticsFilterField::TradeCountry,
+                        hs_level,
                         limit,
                         overview,
                     )?,
@@ -1042,6 +1028,29 @@ impl Db {
             }
         }
         Ok(analytics)
+    }
+
+    pub fn analytics_section(
+        &self,
+        q: &Query,
+        kind: AnalyticsSectionKind,
+        hs_level: u8,
+        limit: u64,
+    ) -> rusqlite::Result<AnalyticsSection> {
+        let overview = self.analytics_overview(q)?;
+        self.analytics_section_with_overview(q, kind, hs_level, limit, &overview)
+    }
+
+    fn analytics_section_with_overview(
+        &self,
+        q: &Query,
+        kind: AnalyticsSectionKind,
+        hs_level: u8,
+        limit: u64,
+        overview: &AnalyticsOverview,
+    ) -> rusqlite::Result<AnalyticsSection> {
+        let (label_expr, filter_field) = analytics_section_grouping(kind, hs_level);
+        self.analytics_group(q, kind, &label_expr, filter_field, limit, overview)
     }
 
     fn analytics_overview(&self, q: &Query) -> rusqlite::Result<AnalyticsOverview> {
@@ -1699,6 +1708,46 @@ fn section_rows(
         .find(|section| section.kind == kind)
         .map(|section| section.rows.clone())
         .unwrap_or_default()
+}
+
+fn analytics_section_grouping(
+    kind: AnalyticsSectionKind,
+    hs_level: u8,
+) -> (String, AnalyticsFilterField) {
+    match kind {
+        AnalyticsSectionKind::Recipients => {
+            ("r.recipient".to_string(), AnalyticsFilterField::Recipient)
+        }
+        AnalyticsSectionKind::Senders => ("r.sender".to_string(), AnalyticsFilterField::Sender),
+        AnalyticsSectionKind::Edrpou => ("r.edrpou".to_string(), AnalyticsFilterField::Edrpou),
+        AnalyticsSectionKind::ProductCodes => {
+            let expr = if hs_level >= 10 {
+                "r.product_code".to_string()
+            } else {
+                format!("SUBSTR(TRIM(r.product_code), 1, {})", hs_level.clamp(2, 8))
+            };
+            (expr, AnalyticsFilterField::ProductCode)
+        }
+        AnalyticsSectionKind::Trademarks => {
+            ("r.trademark".to_string(), AnalyticsFilterField::Trademark)
+        }
+        AnalyticsSectionKind::ProductGroups => (
+            "SUBSTR(TRIM(r.description), 1, 80)".to_string(),
+            AnalyticsFilterField::Description,
+        ),
+        AnalyticsSectionKind::OriginCountries => (
+            "r.origin_country".to_string(),
+            AnalyticsFilterField::OriginCountry,
+        ),
+        AnalyticsSectionKind::DispatchCountries => (
+            "r.dispatch_country".to_string(),
+            AnalyticsFilterField::DispatchCountry,
+        ),
+        AnalyticsSectionKind::TradeCountries => (
+            "r.trade_country".to_string(),
+            AnalyticsFilterField::TradeCountry,
+        ),
+    }
 }
 
 fn ratio(numerator: f64, denominator: f64) -> f64 {

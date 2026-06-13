@@ -24,6 +24,7 @@ use crate::workers::{self, ImportEvent, Msg, PAGE_SIZE, WorkerReq};
 /// Interface accent color.
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(37, 99, 235);
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const FULL_SECTION_LIMIT: u64 = 20_000;
 
 /// Action from the table row context menu.
 enum RowMenuAction {
@@ -56,6 +57,35 @@ enum CellKind {
 enum AppTab {
     Results,
     Analytics,
+}
+
+enum AnalyticsCardAction {
+    Filter(AnalyticsFilterAction),
+    Explore(AnalyticsSectionKind),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GroupSort {
+    Label,
+    Rows,
+    Declarations,
+    Companies,
+    Value,
+    NetKg,
+    GrossKg,
+    Quantity,
+    Share,
+    ValuePerKg,
+}
+
+struct GroupExplorerState {
+    kind: AnalyticsSectionKind,
+    generation: u64,
+    loading: bool,
+    rows: Vec<AnalyticsGroupRow>,
+    label_filter: String,
+    sort: GroupSort,
+    descending: bool,
 }
 
 /// Metric displayed in the monthly dynamics chart.
@@ -259,6 +289,7 @@ pub struct App {
     analytics_loading: bool,
     /// Product code grouping level: 2/4/6 digits or 10 for full codes.
     hs_level: u8,
+    group_explorer: Option<GroupExplorerState>,
     month_metric: MonthMetric,
     /// Pivot (cross-tab) state.
     pivot: Option<PivotResult>,
@@ -367,6 +398,7 @@ impl App {
             analytics_loaded: [false; 6],
             analytics_loading: false,
             hs_level: 10,
+            group_explorer: None,
             month_metric: MonthMetric::default(),
             pivot: None,
             pivot_row_dim: PivotDim::Recipient,
@@ -455,6 +487,7 @@ impl App {
         self.analytics = None;
         self.analytics_loaded = [false; 6];
         self.analytics_loading = false;
+        self.group_explorer = None;
         self.pivot = None;
         self.underpricing = None;
         self.underpricing_loading = false;
@@ -511,6 +544,28 @@ impl App {
             q: Box::new(self.active_query.clone()),
             limit: self.analytics_limit,
             scope: self.analytics_view.scope(),
+            hs_level: self.hs_level,
+            generation: self.search_gen,
+        });
+    }
+
+    fn open_group_explorer(&mut self, kind: AnalyticsSectionKind) {
+        if self.active_query.is_empty() {
+            return;
+        }
+        self.group_explorer = Some(GroupExplorerState {
+            kind,
+            generation: self.search_gen,
+            loading: true,
+            rows: Vec::new(),
+            label_filter: String::new(),
+            sort: GroupSort::Value,
+            descending: true,
+        });
+        let _ = self.search_tx.send(WorkerReq::AnalyticsSection {
+            q: Box::new(self.active_query.clone()),
+            kind,
+            limit: FULL_SECTION_LIMIT,
             hs_level: self.hs_level,
             generation: self.search_gen,
         });
@@ -620,6 +675,18 @@ impl App {
                         self.analytics_loading = false;
                     }
                 }
+                Msg::AnalyticsSectionDone {
+                    generation,
+                    section,
+                } => {
+                    if let Some(explorer) = &mut self.group_explorer
+                        && explorer.generation == generation
+                        && explorer.kind == section.kind
+                    {
+                        explorer.rows = section.rows;
+                        explorer.loading = false;
+                    }
+                }
                 Msg::SearchError {
                     generation,
                     message,
@@ -631,6 +698,11 @@ impl App {
                             text: format!("{}: {message}", self.t().error),
                             is_error: true,
                         };
+                    }
+                    if let Some(explorer) = &mut self.group_explorer
+                        && explorer.generation == generation
+                    {
+                        explorer.loading = false;
                     }
                 }
                 Msg::ProfileDone {
@@ -1308,6 +1380,7 @@ impl App {
             };
 
             let mut action: Option<AnalyticsFilterAction> = None;
+            let mut card_action: Option<AnalyticsCardAction> = None;
             let mut show_more = false;
             let mut new_metric: Option<MonthMetric> = None;
             let mut new_view: Option<AnalyticsView> = None;
@@ -1493,7 +1566,7 @@ impl App {
                                 ui.spinner();
                             });
                         } else if let Some(next) = analytics_cards(ui, sections, lang) {
-                            action = Some(next);
+                            card_action = Some(next);
                         }
                     }
                     AnalyticsView::Products => {
@@ -1524,7 +1597,7 @@ impl App {
                         } else if let Some(next) =
                             analytics_cards(ui, &analytics.product_sections, lang)
                         {
-                            action = Some(next);
+                            card_action = Some(next);
                         }
                     }
                     AnalyticsView::Prices => {
@@ -1676,6 +1749,12 @@ impl App {
             }
             if let Some(action) = action {
                 self.apply_analytics_filter(action);
+            }
+            if let Some(card_action) = card_action {
+                match card_action {
+                    AnalyticsCardAction::Filter(action) => self.apply_analytics_filter(action),
+                    AnalyticsCardAction::Explore(kind) => self.open_group_explorer(kind),
+                }
             }
         });
         if need_request {
@@ -2061,8 +2140,10 @@ impl App {
                         rows: profile.top_origin_countries.clone(),
                     },
                 ];
-                if let Some(next) = analytics_cards(ui, &sections, lang) {
-                    action = Some(next);
+                if let Some(next) = analytics_cards_with_options(ui, &sections, lang, false)
+                    && let AnalyticsCardAction::Filter(filter) = next
+                {
+                    action = Some(filter);
                 }
                 ui.add_space(8.0);
             });
@@ -2083,6 +2164,122 @@ impl App {
         if let Some(action) = action {
             // Drill from a dossier card into filtered results.
             self.close_profile();
+            self.apply_analytics_filter(action);
+        }
+    }
+
+    fn ui_group_explorer_window(&mut self, ctx: &egui::Context) {
+        let lang = self.lang;
+        let t = self.t();
+        let Some(explorer) = self.group_explorer.as_mut() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut close = false;
+        let mut filter_action: Option<AnalyticsFilterAction> = None;
+        let title = group_explorer_title(explorer.kind, lang);
+        egui::Window::new(title)
+            .id(egui::Id::new(format!(
+                "analytics_group_explorer_{:?}",
+                explorer.kind
+            )))
+            .open(&mut open)
+            .default_width(980.0)
+            .default_height(620.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if explorer.loading {
+                        ui.spinner();
+                        ui.label(t.searching);
+                    } else {
+                        ui.label(egui::RichText::new(group_explorer_count(
+                            explorer.rows.len() as u64,
+                            explorer.rows.len() as u64 >= FULL_SECTION_LIMIT,
+                            lang,
+                        )));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(t.close).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.label(
+                    egui::RichText::new(group_explorer_hint(lang))
+                        .weak()
+                        .small(),
+                );
+                ui.add_space(6.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut explorer.label_filter)
+                        .hint_text(group_search_hint(lang))
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(6.0);
+
+                if explorer.loading {
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| {
+                        ui.spinner();
+                    });
+                    return;
+                }
+                if explorer.rows.is_empty() {
+                    ui.label(egui::RichText::new(t.nothing_found).weak());
+                    return;
+                }
+
+                let needle = explorer.label_filter.trim().to_lowercase();
+                let mut visible_rows: Vec<&AnalyticsGroupRow> = explorer
+                    .rows
+                    .iter()
+                    .filter(|row| needle.is_empty() || row.label.to_lowercase().contains(&needle))
+                    .collect();
+                sort_group_rows(&mut visible_rows, explorer.sort, explorer.descending);
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(group_visible_count(
+                            visible_rows.len() as u64,
+                            explorer.rows.len() as u64,
+                            explorer.rows.len() as u64 >= FULL_SECTION_LIMIT,
+                            lang,
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button(format!("\u{29C9} {}", copy_visible_label(lang)))
+                            .on_hover_text(copy_table_hover(lang))
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(group_rows_tsv(&visible_rows, lang));
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+
+                if visible_rows.is_empty() {
+                    ui.label(egui::RichText::new(t.nothing_found).weak());
+                } else if let Some(next) = group_explorer_table(
+                    ui,
+                    &visible_rows,
+                    &mut explorer.sort,
+                    &mut explorer.descending,
+                    lang,
+                ) {
+                    filter_action = Some(next);
+                }
+            });
+
+        if !open || close {
+            self.group_explorer = None;
+        }
+        if let Some(action) = filter_action {
+            self.group_explorer = None;
             self.apply_analytics_filter(action);
         }
     }
@@ -2331,6 +2528,7 @@ impl eframe::App for App {
             }
         }
         self.ui_card_window(&ctx);
+        self.ui_group_explorer_window(&ctx);
         self.ui_import_report(&ctx);
         self.ui_settings_window(&ctx);
         self.ui_help_window(&ctx);
@@ -2344,6 +2542,11 @@ impl eframe::App for App {
             || self.analytics_loading
             || self.profile_loading
             || self.underpricing_loading
+            || self
+                .group_explorer
+                .as_ref()
+                .map(|explorer| explorer.loading)
+                .unwrap_or(false)
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
@@ -2521,7 +2724,16 @@ fn analytics_cards(
     ui: &mut egui::Ui,
     sections: &[AnalyticsSection],
     lang: Lang,
-) -> Option<AnalyticsFilterAction> {
+) -> Option<AnalyticsCardAction> {
+    analytics_cards_with_options(ui, sections, lang, true)
+}
+
+fn analytics_cards_with_options(
+    ui: &mut egui::Ui,
+    sections: &[AnalyticsSection],
+    lang: Lang,
+    allow_explore: bool,
+) -> Option<AnalyticsCardAction> {
     let mut action = None;
     let sections: Vec<&AnalyticsSection> = sections.iter().filter(|s| !s.rows.is_empty()).collect();
     if sections.is_empty() {
@@ -2549,7 +2761,7 @@ fn analytics_cards(
                         |ui| {
                             ui.set_min_width(card_w);
                             ui.set_max_width(card_w);
-                            if let Some(next) = analytics_card(ui, section, lang) {
+                            if let Some(next) = analytics_card(ui, section, lang, allow_explore) {
                                 action = Some(next);
                             }
                         },
@@ -2564,22 +2776,35 @@ fn analytics_cards(
 
 /// Card rows as a TSV table that pastes directly into Excel.
 fn section_tsv(section: &AnalyticsSection, lang: Lang) -> String {
+    let rows: Vec<&AnalyticsGroupRow> = section.rows.iter().collect();
+    group_rows_tsv(&rows, lang)
+}
+
+fn group_rows_tsv(rows: &[&AnalyticsGroupRow], lang: Lang) -> String {
     let header = match lang {
-        Lang::Ua => "Назва\tРядків\tДекларацій\tКомпаній\tФВ вал.контр\tНетто кг\tЧастка %\tФВ/кг",
-        Lang::Ru => "Название\tСтрок\tДеклараций\tКомпаний\tФВ вал.контр\tНетто кг\tДоля %\tФВ/кг",
-        Lang::En => "Label\tRows\tDeclarations\tCompanies\tValue\tNet kg\tShare %\tValue/kg",
+        Lang::Ua => {
+            "Назва\tРядків\tДекларацій\tКомпаній\tФВ вал.контр\tНетто кг\tБрутто кг\tКількість\tЧастка %\tФВ/кг"
+        }
+        Lang::Ru => {
+            "Название\tСтрок\tДеклараций\tКомпаний\tФВ вал.контр\tНетто кг\tБрутто кг\tКоличество\tДоля %\tФВ/кг"
+        }
+        Lang::En => {
+            "Label\tRows\tDeclarations\tCompanies\tValue\tNet kg\tGross kg\tQuantity\tShare %\tValue/kg"
+        }
     };
     let mut out = String::from(header);
-    for row in &section.rows {
+    for row in rows {
         out.push('\n');
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+            "{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
             row.label,
             row.rows,
             row.declarations,
             row.companies,
             row.total_value_usd,
             row.total_net_kg,
+            row.total_gross_kg,
+            row.total_quantity,
             row.share_percent,
             row.avg_value_per_net_kg
         ));
@@ -2595,11 +2820,28 @@ fn copy_table_hover(lang: Lang) -> &'static str {
     }
 }
 
+fn all_rows_button(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Усі",
+        Lang::Ru => "Все",
+        Lang::En => "All",
+    }
+}
+
+fn all_rows_hover(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Відкрити повний список цієї секції",
+        Lang::Ru => "Открыть полный список этой секции",
+        Lang::En => "Open the full list for this section",
+    }
+}
+
 fn analytics_card(
     ui: &mut egui::Ui,
     section: &AnalyticsSection,
     lang: Lang,
-) -> Option<AnalyticsFilterAction> {
+    allow_explore: bool,
+) -> Option<AnalyticsCardAction> {
     let mut action = None;
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::same(8))
@@ -2615,12 +2857,20 @@ fn analytics_card(
                     {
                         ui.ctx().copy_text(section_tsv(section, lang));
                     }
+                    if allow_explore
+                        && ui
+                            .small_button(all_rows_button(lang))
+                            .on_hover_text(all_rows_hover(lang))
+                            .clicked()
+                    {
+                        action = Some(AnalyticsCardAction::Explore(section.kind));
+                    }
                 });
             });
             ui.add_space(4.0);
             for row in &section.rows {
                 if let Some(next) = compact_bar_row(ui, row, lang) {
-                    action = Some(next);
+                    action = Some(AnalyticsCardAction::Filter(next));
                 }
             }
             let total_share: f64 = section.rows.iter().map(|r| r.share_percent).sum();
@@ -2706,6 +2956,235 @@ fn compact_bar_row(
     } else {
         None
     }
+}
+
+fn group_explorer_table(
+    ui: &mut egui::Ui,
+    rows: &[&AnalyticsGroupRow],
+    sort: &mut GroupSort,
+    descending: &mut bool,
+    lang: Lang,
+) -> Option<AnalyticsFilterAction> {
+    let t = tr(lang);
+    let mut action = None;
+    egui::ScrollArea::horizontal()
+        .id_salt("group_explorer_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .sense(egui::Sense::click())
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::initial(270.0).at_least(140.0).clip(true))
+                .column(Column::initial(82.0).at_least(64.0))
+                .column(Column::initial(104.0).at_least(78.0))
+                .column(Column::initial(94.0).at_least(70.0))
+                .column(Column::initial(110.0).at_least(86.0))
+                .column(Column::initial(98.0).at_least(74.0))
+                .column(Column::initial(98.0).at_least(74.0))
+                .column(Column::initial(96.0).at_least(72.0))
+                .column(Column::initial(82.0).at_least(62.0))
+                .column(Column::initial(96.0).at_least(72.0))
+                .header(24.0, |mut header| {
+                    header.col(|ui| {
+                        sortable_group_header(
+                            ui,
+                            label_header(lang),
+                            GroupSort::Label,
+                            sort,
+                            descending,
+                        );
+                    });
+                    header.col(|ui| {
+                        sortable_group_header(ui, t.rows_label, GroupSort::Rows, sort, descending);
+                    });
+                    header.col(|ui| {
+                        sortable_group_header(
+                            ui,
+                            t.declarations_label,
+                            GroupSort::Declarations,
+                            sort,
+                            descending,
+                        );
+                    });
+                    header.col(|ui| {
+                        sortable_group_header(
+                            ui,
+                            companies_header(lang),
+                            GroupSort::Companies,
+                            sort,
+                            descending,
+                        );
+                    });
+                    header.col(|ui| {
+                        sortable_group_header(
+                            ui,
+                            t.total_value,
+                            GroupSort::Value,
+                            sort,
+                            descending,
+                        );
+                    });
+                    header.col(|ui| {
+                        sortable_group_header(ui, t.net_weight, GroupSort::NetKg, sort, descending);
+                    });
+                    header.col(|ui| {
+                        sortable_group_header(
+                            ui,
+                            t.gross_weight,
+                            GroupSort::GrossKg,
+                            sort,
+                            descending,
+                        );
+                    });
+                    header.col(|ui| {
+                        sortable_group_header(
+                            ui,
+                            t.quantity,
+                            GroupSort::Quantity,
+                            sort,
+                            descending,
+                        );
+                    });
+                    header.col(|ui| {
+                        sortable_group_header(
+                            ui,
+                            share_header(lang),
+                            GroupSort::Share,
+                            sort,
+                            descending,
+                        );
+                    });
+                    header.col(|ui| {
+                        sortable_group_header(
+                            ui,
+                            t.avg_value_kg,
+                            GroupSort::ValuePerKg,
+                            sort,
+                            descending,
+                        );
+                    });
+                })
+                .body(|body| {
+                    body.rows(24.0, rows.len(), |mut table_row| {
+                        let row = rows[table_row.index()];
+                        let mut clicked = false;
+                        table_row.col(|ui| {
+                            clicked |= group_text_cell(ui, &row.label, row, lang);
+                        });
+                        table_row.col(|ui| {
+                            clicked |= group_numeric_cell(ui, group_digits(row.rows), row, lang);
+                        });
+                        table_row.col(|ui| {
+                            clicked |=
+                                group_numeric_cell(ui, group_digits(row.declarations), row, lang);
+                        });
+                        table_row.col(|ui| {
+                            clicked |=
+                                group_numeric_cell(ui, group_digits(row.companies), row, lang);
+                        });
+                        table_row.col(|ui| {
+                            clicked |=
+                                group_numeric_cell(ui, fmt_compact(row.total_value_usd), row, lang);
+                        });
+                        table_row.col(|ui| {
+                            clicked |=
+                                group_numeric_cell(ui, fmt_compact(row.total_net_kg), row, lang);
+                        });
+                        table_row.col(|ui| {
+                            clicked |=
+                                group_numeric_cell(ui, fmt_compact(row.total_gross_kg), row, lang);
+                        });
+                        table_row.col(|ui| {
+                            clicked |=
+                                group_numeric_cell(ui, fmt_compact(row.total_quantity), row, lang);
+                        });
+                        table_row.col(|ui| {
+                            clicked |= group_numeric_cell(
+                                ui,
+                                format!("{}%", fmt_decimal(row.share_percent, 1)),
+                                row,
+                                lang,
+                            );
+                        });
+                        table_row.col(|ui| {
+                            clicked |= group_numeric_cell(
+                                ui,
+                                fmt_decimal(row.avg_value_per_net_kg, 2),
+                                row,
+                                lang,
+                            );
+                        });
+                        if clicked {
+                            action = row.filter_action.clone();
+                        }
+                    });
+                });
+        });
+    action
+}
+
+fn sortable_group_header(
+    ui: &mut egui::Ui,
+    label: &str,
+    column: GroupSort,
+    current: &mut GroupSort,
+    descending: &mut bool,
+) {
+    let selected = *current == column;
+    let arrow = if selected {
+        if *descending { " ▼" } else { " ▲" }
+    } else {
+        ""
+    };
+    if ui.small_button(format!("{label}{arrow}")).clicked() {
+        if selected {
+            *descending = !*descending;
+        } else {
+            *current = column;
+            *descending = column != GroupSort::Label;
+        }
+    }
+}
+
+fn group_text_cell(ui: &mut egui::Ui, text: &str, row: &AnalyticsGroupRow, lang: Lang) -> bool {
+    ui.add(egui::Label::new(text).selectable(false).truncate())
+        .on_hover_text(row_hover_text(row, lang))
+        .clicked()
+}
+
+fn group_numeric_cell(
+    ui: &mut egui::Ui,
+    text: String,
+    row: &AnalyticsGroupRow,
+    lang: Lang,
+) -> bool {
+    ui.add(egui::Label::new(egui::RichText::new(text).monospace()).selectable(false))
+        .on_hover_text(row_hover_text(row, lang))
+        .clicked()
+}
+
+fn sort_group_rows(rows: &mut [&AnalyticsGroupRow], sort: GroupSort, descending: bool) {
+    rows.sort_by(|a, b| {
+        let ord = match sort {
+            GroupSort::Label => a.label.to_lowercase().cmp(&b.label.to_lowercase()),
+            GroupSort::Rows => a.rows.cmp(&b.rows),
+            GroupSort::Declarations => a.declarations.cmp(&b.declarations),
+            GroupSort::Companies => a.companies.cmp(&b.companies),
+            GroupSort::Value => cmp_f64(a.total_value_usd, b.total_value_usd),
+            GroupSort::NetKg => cmp_f64(a.total_net_kg, b.total_net_kg),
+            GroupSort::GrossKg => cmp_f64(a.total_gross_kg, b.total_gross_kg),
+            GroupSort::Quantity => cmp_f64(a.total_quantity, b.total_quantity),
+            GroupSort::Share => cmp_f64(a.share_percent, b.share_percent),
+            GroupSort::ValuePerKg => cmp_f64(a.avg_value_per_net_kg, b.avg_value_per_net_kg),
+        };
+        if descending { ord.reverse() } else { ord }
+    });
+}
+
+fn cmp_f64(a: f64, b: f64) -> std::cmp::Ordering {
+    a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
 }
 
 fn price_table(ui: &mut egui::Ui, metrics: &[AnalyticsPriceMetric], lang: Lang) {
@@ -3212,6 +3691,112 @@ fn top_share_pattern(lang: Lang) -> &'static str {
         Lang::Ua => "Топ {} = {}% обсягу",
         Lang::Ru => "Топ {} = {}% объёма",
         Lang::En => "Top {} = {}% of volume",
+    }
+}
+
+fn group_explorer_title(kind: AnalyticsSectionKind, lang: Lang) -> String {
+    match lang {
+        Lang::Ua => format!("Усі: {}", section_title(kind, lang)),
+        Lang::Ru => format!("Все: {}", section_title(kind, lang)),
+        Lang::En => format!("All: {}", section_title(kind, lang)),
+    }
+}
+
+fn group_explorer_hint(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => {
+            "Повний список для поточного запиту. Натисніть рядок, щоб відфільтрувати результати."
+        }
+        Lang::Ru => {
+            "Полный список для текущего запроса. Нажмите строку, чтобы отфильтровать результаты."
+        }
+        Lang::En => "Full list for the current query. Click a row to filter results.",
+    }
+}
+
+fn group_search_hint(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Шукати всередині цього списку",
+        Lang::Ru => "Искать внутри этого списка",
+        Lang::En => "Search inside this list",
+    }
+}
+
+fn group_explorer_count(rows: u64, limited: bool, lang: Lang) -> String {
+    match (lang, limited) {
+        (Lang::Ua, true) => format!("Завантажено перші {} груп", group_digits(rows)),
+        (Lang::Ru, true) => format!("Загружены первые {} групп", group_digits(rows)),
+        (Lang::En, true) => format!("Loaded first {} groups", group_digits(rows)),
+        (Lang::Ua, false) => format!("Завантажено {} рядків групування", group_digits(rows)),
+        (Lang::Ru, false) => format!("Загружено {} строк группировки", group_digits(rows)),
+        (Lang::En, false) => format!("Loaded {} grouped rows", group_digits(rows)),
+    }
+}
+
+fn group_visible_count(visible: u64, total: u64, limited: bool, lang: Lang) -> String {
+    match (lang, limited) {
+        (Lang::Ua, true) => format!(
+            "Показано {} із перших {}",
+            group_digits(visible),
+            group_digits(total)
+        ),
+        (Lang::Ru, true) => format!(
+            "Показано {} из первых {}",
+            group_digits(visible),
+            group_digits(total)
+        ),
+        (Lang::En, true) => format!(
+            "Showing {} of first {}",
+            group_digits(visible),
+            group_digits(total)
+        ),
+        (Lang::Ua, false) => format!(
+            "Показано {} із {}",
+            group_digits(visible),
+            group_digits(total)
+        ),
+        (Lang::Ru, false) => format!(
+            "Показано {} из {}",
+            group_digits(visible),
+            group_digits(total)
+        ),
+        (Lang::En, false) => format!(
+            "Showing {} of {}",
+            group_digits(visible),
+            group_digits(total)
+        ),
+    }
+}
+
+fn copy_visible_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Копіювати видимі",
+        Lang::Ru => "Копировать видимые",
+        Lang::En => "Copy visible",
+    }
+}
+
+fn label_header(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Назва",
+        Lang::Ru => "Название",
+        Lang::En => "Label",
+    }
+}
+
+fn companies_header(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Компаній",
+        Lang::Ru => "Компаний",
+        Lang::En => "Companies",
+    }
+}
+
+fn share_header(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Частка",
+        Lang::Ru => "Доля",
+        Lang::En => "Share",
     }
 }
 

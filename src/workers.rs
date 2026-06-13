@@ -7,8 +7,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
 
 use crate::db::{
-    Analytics, AnalyticsScope, CompanyProfile, Db, PivotDim, PivotLimits, PivotMetric, PivotResult,
-    Query, Undervaluation, analytics_should_run,
+    Analytics, AnalyticsScope, AnalyticsSection, AnalyticsSectionKind, CompanyProfile, Db,
+    PivotDim, PivotLimits, PivotMetric, PivotResult, Query, Undervaluation, analytics_should_run,
 };
 use crate::export::{self, ExportError};
 use crate::import::{self, FileSummary, ImportPhase};
@@ -26,6 +26,14 @@ pub enum WorkerReq {
         q: Box<Query>,
         limit: u64,
         scope: Option<AnalyticsScope>,
+        hs_level: u8,
+        generation: u64,
+    },
+    /// Full grouped list for one analytics card; loaded on demand for drill-down.
+    AnalyticsSection {
+        q: Box<Query>,
+        kind: AnalyticsSectionKind,
+        limit: u64,
         hs_level: u8,
         generation: u64,
     },
@@ -78,6 +86,10 @@ pub enum Msg {
         generation: u64,
         scope: Option<AnalyticsScope>,
         analytics: Box<Analytics>,
+    },
+    AnalyticsSectionDone {
+        generation: u64,
+        section: Box<AnalyticsSection>,
     },
     ProfileDone {
         generation: u64,
@@ -167,6 +179,29 @@ pub fn spawn_search_worker(
                             generation,
                             scope,
                             analytics: Box::new(analytics),
+                        },
+                        Err(e) => Msg::SearchError {
+                            generation,
+                            message: e.to_string(),
+                        },
+                    };
+                    let _ = tx.send(msg);
+                    ctx.request_repaint();
+                }
+                WorkerReq::AnalyticsSection {
+                    q,
+                    kind,
+                    limit,
+                    hs_level,
+                    generation,
+                } => {
+                    if !analytics_should_run(&q) {
+                        continue;
+                    }
+                    let msg = match db.analytics_section(&q, kind, hs_level, limit) {
+                        Ok(section) => Msg::AnalyticsSectionDone {
+                            generation,
+                            section: Box::new(section),
                         },
                         Err(e) => Msg::SearchError {
                             generation,

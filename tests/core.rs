@@ -68,6 +68,23 @@ fn write_test_xlsx(path: &Path, rows: &[Vec<(&str, &str)>]) {
     workbook.save(path).unwrap();
 }
 
+fn write_owned_test_xlsx(path: &Path, rows: &[Vec<(String, String)>]) {
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    for (col, def) in COLUMNS.iter().enumerate() {
+        sheet.write_string(0, col as u16, def.header).unwrap();
+    }
+    for (r, row) in rows.iter().enumerate() {
+        for (name, value) in row {
+            let col = col_index(name).unwrap() as u16;
+            sheet
+                .write_string(r as u32 + 1, col, value.as_str())
+                .unwrap();
+        }
+    }
+    workbook.save(path).unwrap();
+}
+
 fn sample_rows() -> Vec<Vec<(&'static str, &'static str)>> {
     vec![
         vec![
@@ -530,6 +547,76 @@ fn undervaluation_flags_rows_below_code_median() {
     assert_close(flagged.price_per_kg, 1.0);
     assert_close(flagged.code_median, 10.2); // median of {9.8,10,10.2,10.5,11,1} sorted -> index 3 = 10.2
     assert!(flagged.ratio < 0.5);
+}
+
+#[test]
+fn analytics_section_can_load_all_group_rows_beyond_visible_top() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("many_recipients.xlsx");
+    let db_path = dir.path().join("data").join("many_recipients.db");
+    let rows: Vec<Vec<(String, String)>> = (1..=12)
+        .map(|idx| {
+            vec![
+                (
+                    "declaration_number".to_string(),
+                    format!("24UA100110{:06}U1", idx),
+                ),
+                ("declaration_date".to_string(), "15.03.2024".to_string()),
+                (
+                    "sender".to_string(),
+                    "APPLE DISTRIBUTION INTERNATIONAL LTD".to_string(),
+                ),
+                ("edrpou".to_string(), format!("{idx:08}")),
+                ("recipient".to_string(), format!("APPLE IMPORTER {idx:02}")),
+                ("product_code".to_string(), "8517130000".to_string()),
+                (
+                    "description".to_string(),
+                    "Apple iPhone smartphone".to_string(),
+                ),
+                ("trade_country".to_string(), "IE".to_string()),
+                ("dispatch_country".to_string(), "IE".to_string()),
+                ("origin_country".to_string(), "CN".to_string()),
+                ("quantity".to_string(), "1".to_string()),
+                ("gross_kg".to_string(), "1.2".to_string()),
+                ("net_kg".to_string(), "1".to_string()),
+                (
+                    "currency_control_value".to_string(),
+                    (idx * 100).to_string(),
+                ),
+                ("trademark".to_string(), "Apple".to_string()),
+            ]
+        })
+        .collect();
+    write_owned_test_xlsx(&xlsx, &rows);
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 12);
+
+    let q = Query {
+        text: "Apple".into(),
+        filters: Filters {
+            year: "2024".into(),
+            ..Default::default()
+        },
+    };
+    let top = db
+        .analytics_scoped(&q, 5, Some(AnalyticsScope::Companies), 10)
+        .unwrap();
+    let top_recipients = analytics_section(&top.company_sections, AnalyticsSectionKind::Recipients);
+    assert_eq!(top_recipients.rows.len(), 5);
+
+    let full = db
+        .analytics_section(&q, AnalyticsSectionKind::Recipients, 10, 50)
+        .unwrap();
+    assert_eq!(full.rows.len(), 12);
+    assert_eq!(full.rows[0].label, "APPLE IMPORTER 12");
+    assert_eq!(full.rows[11].label, "APPLE IMPORTER 01");
+    let filter = full.rows[0].filter_action.as_ref().unwrap();
+    assert_eq!(filter.field, AnalyticsFilterField::Recipient);
+    assert_eq!(filter.value, "APPLE IMPORTER 12");
 }
 
 #[test]
