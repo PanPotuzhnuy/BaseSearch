@@ -16,7 +16,7 @@ use crate::db::{
     PriceMetricKind, Query, RecordCard, Undervaluation,
 };
 use crate::export::ExportError;
-use crate::i18n::{Lang, Tr, fmt, group_digits, tr};
+use crate::i18n::{Lang, Tr, fmt, group_digits, help_sections, tr};
 use crate::import::{FileSummary, ImportPhase};
 use crate::schema::{RESULT_COLUMNS, header_for};
 use crate::workers::{self, ImportEvent, Msg, PAGE_SIZE, WorkerReq};
@@ -281,6 +281,7 @@ pub struct App {
     card: Option<RecordCard>,
     card_open: bool,
     show_settings: bool,
+    show_help: bool,
     confirm_clear: bool,
 
     /// Open company dossier; `None` means the normal Results/Analytics view.
@@ -306,6 +307,11 @@ impl App {
             .and_then(|db| db.meta_get("lang"))
             .map(|c| Lang::from_code(&c))
             .unwrap_or_default();
+        // Show the quick guide automatically on the very first launch.
+        let first_run = lite_db
+            .as_ref()
+            .map(|db| db.meta_get("help_seen").is_none())
+            .unwrap_or(false);
         let theme = lite_db.as_ref().and_then(|db| db.meta_get("theme"));
         cc.egui_ctx.set_theme(match theme.as_deref() {
             Some("dark") => egui::Theme::Dark,
@@ -378,6 +384,7 @@ impl App {
             card: None,
             card_open: false,
             show_settings: false,
+            show_help: first_run,
             confirm_clear: false,
             profile: None,
             profile_loading: false,
@@ -947,6 +954,13 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("\u{2699}").on_hover_text(t.settings).clicked() {
                             self.show_settings = !self.show_settings;
+                        }
+                        if ui
+                            .button("?")
+                            .on_hover_text(format!("{} (F1)", t.help))
+                            .clicked()
+                        {
+                            self.show_help = true;
                         }
                         ui.separator();
                         if let Some(total) = self.db_total_rows {
@@ -2135,6 +2149,39 @@ impl App {
         }
     }
 
+    fn ui_help_window(&mut self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+        // Remember that the guide has been seen, so it won't auto-open again.
+        self.persist("help_seen", "1");
+        let t = self.t();
+        let mut open = self.show_help;
+        egui::Window::new(format!("? {}", t.help))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(560.0)
+            .default_height(520.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for section in help_sections(self.lang) {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(section.title).strong().size(15.0));
+                        ui.add_space(2.0);
+                        for item in section.items {
+                            ui.horizontal_top(|ui| {
+                                ui.label(egui::RichText::new("•").weak());
+                                ui.label(*item);
+                            });
+                        }
+                        ui.add_space(6.0);
+                    }
+                });
+            });
+        self.show_help = open;
+    }
+
     fn ui_settings_window(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
             return;
@@ -2295,7 +2342,11 @@ impl eframe::App for App {
         self.ui_card_window(&ctx);
         self.ui_import_report(&ctx);
         self.ui_settings_window(&ctx);
+        self.ui_help_window(&ctx);
         self.ui_confirm_clear(&ctx);
+        if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+            self.show_help = true;
+        }
         // Safety repaint: refresh regularly while a background operation runs.
         if self.op.is_some()
             || self.search_in_flight

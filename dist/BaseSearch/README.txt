@@ -1,9 +1,12 @@
-Base Search 1.0
+Base Search 1.1
 ===============
 
 How to run
 ----------
 Double-click BaseSearch.exe.
+
+A short built-in guide opens on first run; reopen it any time with the
+"?" button or the F1 key.
 
 What this folder contains
 -------------------------
@@ -20,9 +23,11 @@ Basic workflow
 5. Open Analytics to understand the current search: rows, declarations,
    companies, value, net/gross weight, average value per kg, product codes,
    brands, countries, and price indicators.
-   The Analytics tab is split into Companies, Goods, Countries, and Prices.
-   Click an analytics row to apply its filter back to the results.
-6. Double-click a row to see all imported fields.
+   The Analytics tab is split into Overview, Companies, Goods, Countries,
+   Prices, and Pivot. Click an analytics row to apply its filter back to the
+   results.
+6. Double-click a row to see all imported fields; right-click for quick
+   filters and the company profile.
 7. Export matching rows to CSV or XLSX when needed.
 
 Privacy

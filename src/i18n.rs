@@ -159,6 +159,7 @@ pub struct Tr {
     pub version_label: &'static str,
     /// Selected rows count label.
     pub selected_n: &'static str,
+    pub help: &'static str,
     /// "Период: {} — {} ({} мес.)"
     pub period_of: &'static str,
     pub tab_overview: &'static str,
@@ -305,6 +306,7 @@ pub static UA: Tr = Tr {
     db_cleared: "Базу очищено",
     version_label: "Версія",
     selected_n: "вибрано: {}",
+    help: "Довідка",
     period_of: "Період: {} — {} ({} міс.)",
     tab_overview: "Огляд",
     mini_summary: "{} рядків · {} $ · {} кг нетто",
@@ -447,6 +449,7 @@ pub static RU: Tr = Tr {
     db_cleared: "База очищена",
     version_label: "Версия",
     selected_n: "выбрано: {}",
+    help: "Справка",
     period_of: "Период: {} — {} ({} мес.)",
     tab_overview: "Обзор",
     mini_summary: "{} строк · {} $ · {} кг нетто",
@@ -589,6 +592,7 @@ pub static EN: Tr = Tr {
     db_cleared: "Database cleared",
     version_label: "Version",
     selected_n: "selected: {}",
+    help: "Help",
     period_of: "Period: {} — {} ({} mo.)",
     tab_overview: "Overview",
     mini_summary: "{} rows · {} $ · {} kg net",
@@ -626,6 +630,133 @@ pub fn tr(lang: Lang) -> &'static Tr {
         Lang::En => &EN,
     }
 }
+
+/// One block of the in-app quick guide.
+pub struct HelpSection {
+    pub title: &'static str,
+    pub items: &'static [&'static str],
+}
+
+/// Short, practical quick guide shown in the Help window — the basic
+/// interactions, not a hand-holding manual.
+pub fn help_sections(lang: Lang) -> &'static [HelpSection] {
+    match lang {
+        Lang::Ua => HELP_UA,
+        Lang::Ru => HELP_RU,
+        Lang::En => HELP_EN,
+    }
+}
+
+static HELP_UA: &[HelpSection] = &[
+    HelpSection {
+        title: "Пошук",
+        items: &[
+            "Введіть запит і натисніть Enter або «Знайти». Кілька слів — усі мають збігтися.",
+            "слово* — пошук за початком слова. Число від 4 цифр шукається як початок коду.",
+            "«Фільтри» — рік, код, ЄДРПОУ, компанії, країни. «Колонки» — які стовпці показувати.",
+        ],
+    },
+    HelpSection {
+        title: "Таблиця результатів",
+        items: &[
+            "Подвійний клік по рядку — повна картка запису.",
+            "Права кнопка миші — копіювати, швидкі фільтри та «Профіль компанії».",
+            "Клік — виділити рядок; Ctrl+клік — додати; Shift+клік — діапазон.",
+            "Ctrl+C — копіювати виділені рядки (вставляються в Excel).",
+        ],
+    },
+    HelpSection {
+        title: "Аналітика",
+        items: &[
+            "Вкладка «Аналітика» рахується за поточним запитом і фільтрами.",
+            "Підвкладки: Огляд, Компанії, Товари, Країни, Ціни, Зведена.",
+            "Клік по рядку картки або підпису зведеної таблиці — фільтрує результати.",
+            "Кнопка копіювання кладе таблицю у буфер для Excel.",
+        ],
+    },
+    HelpSection {
+        title: "Імпорт, експорт, налаштування",
+        items: &[
+            "«Імпорт Excel» — додати файли (.xlsx, .xlsb). Повторні файли пропускаються.",
+            "«Експорт» — зберегти знайдене у CSV або XLSX.",
+            "Шестерня: мова, тема, масштаб (Ctrl + / Ctrl −), очищення бази.",
+        ],
+    },
+];
+
+static HELP_RU: &[HelpSection] = &[
+    HelpSection {
+        title: "Поиск",
+        items: &[
+            "Введите запрос и нажмите Enter или «Найти». Несколько слов — все должны встретиться.",
+            "слово* — поиск по началу слова. Число от 4 цифр ищется как начало кода.",
+            "«Фильтры» — год, код, ЕДРПОУ, компании, страны. «Колонки» — какие столбцы показывать.",
+        ],
+    },
+    HelpSection {
+        title: "Таблица результатов",
+        items: &[
+            "Двойной клик по строке — полная карточка записи.",
+            "Правая кнопка мыши — копировать, быстрые фильтры и «Профиль компании».",
+            "Клик — выделить строку; Ctrl+клик — добавить; Shift+клик — диапазон.",
+            "Ctrl+C — копировать выделенные строки (вставляются в Excel).",
+        ],
+    },
+    HelpSection {
+        title: "Аналитика",
+        items: &[
+            "Вкладка «Аналитика» считается по текущему запросу и фильтрам.",
+            "Подвкладки: Обзор, Компании, Товары, Страны, Цены, Сводная.",
+            "Клик по строке карточки или подписи сводной таблицы — фильтрует результаты.",
+            "Кнопка копирования кладёт таблицу в буфер для Excel.",
+        ],
+    },
+    HelpSection {
+        title: "Импорт, экспорт, настройки",
+        items: &[
+            "«Импорт Excel» — добавить файлы (.xlsx, .xlsb). Повторные файлы пропускаются.",
+            "«Экспорт» — сохранить найденное в CSV или XLSX.",
+            "Шестерёнка: язык, тема, масштаб (Ctrl + / Ctrl −), очистка базы.",
+        ],
+    },
+];
+
+static HELP_EN: &[HelpSection] = &[
+    HelpSection {
+        title: "Search",
+        items: &[
+            "Type a query and press Enter or “Search”. Multiple words must all be present.",
+            "word* — prefix search. A number with 4+ digits is treated as a code prefix.",
+            "“Filters” — year, code, EDRPOU, companies, countries. “Columns” — which columns to show.",
+        ],
+    },
+    HelpSection {
+        title: "Results table",
+        items: &[
+            "Double-click a row to open the full record card.",
+            "Right-click — copy, quick filters, and “Company profile”.",
+            "Click — select a row; Ctrl+click — add; Shift+click — range.",
+            "Ctrl+C — copy the selected rows (they paste into Excel).",
+        ],
+    },
+    HelpSection {
+        title: "Analytics",
+        items: &[
+            "The Analytics tab is computed for the current query and filters.",
+            "Sub-tabs: Overview, Companies, Goods, Countries, Prices, Pivot.",
+            "Click a card row or a pivot label to filter the results.",
+            "The copy button puts the table on the clipboard for Excel.",
+        ],
+    },
+    HelpSection {
+        title: "Import, export, settings",
+        items: &[
+            "“Import Excel” — add files (.xlsx, .xlsb). Duplicate files are skipped.",
+            "“Export” — save the results to CSV or XLSX.",
+            "Gear: language, theme, zoom (Ctrl + / Ctrl −), clear the database.",
+        ],
+    },
+];
 
 /// Replaces consecutive "{}" placeholders with the provided arguments.
 pub fn fmt(pattern: &str, args: &[&str]) -> String {

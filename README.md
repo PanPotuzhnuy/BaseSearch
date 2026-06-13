@@ -130,6 +130,15 @@ product codes, suppliers, and origin countries. Any card row drills back into
 the filtered Results table, so "tell me everything about this company, then show
 me the underlying lines" is a couple of clicks.
 
+## Built-in Quick Guide
+
+A short guide opens automatically on the first run and is available any time
+from the **?** button or by pressing **F1**. It covers the basic interactions —
+search syntax, double-click for the record card, right-click for quick filters
+and the company profile, click / Ctrl+click / Shift+click selection with Ctrl+C
+copy, the Analytics sub-tabs, and import/export/settings — in the chosen
+interface language.
+
 ## Search Syntax
 
 - `wine bottle` means both words must be present.
