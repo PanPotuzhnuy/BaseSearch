@@ -270,6 +270,99 @@ pub struct Analytics {
     pub top_origin_countries: Vec<AnalyticsGroupRow>,
 }
 
+/// Dimension for the pivot table (rows or columns).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PivotDim {
+    Recipient,
+    Sender,
+    Edrpou,
+    ProductCode,
+    Trademark,
+    OriginCountry,
+    DispatchCountry,
+    TradeCountry,
+    Month,
+    Year,
+}
+
+impl PivotDim {
+    fn sql(self) -> &'static str {
+        match self {
+            PivotDim::Recipient => "TRIM(r.recipient)",
+            PivotDim::Sender => "TRIM(r.sender)",
+            PivotDim::Edrpou => "TRIM(r.edrpou)",
+            PivotDim::ProductCode => "TRIM(r.product_code)",
+            PivotDim::Trademark => "TRIM(r.trademark)",
+            PivotDim::OriginCountry => "TRIM(r.origin_country)",
+            PivotDim::DispatchCountry => "TRIM(r.dispatch_country)",
+            PivotDim::TradeCountry => "TRIM(r.trade_country)",
+            PivotDim::Month => "SUBSTR(TRIM(r.declaration_date), 1, 7)",
+            PivotDim::Year => "CAST(r.year AS TEXT)",
+        }
+    }
+
+    /// The filter field this dimension maps to, for drill-down clicks.
+    pub fn filter_field(self) -> Option<AnalyticsFilterField> {
+        match self {
+            PivotDim::Recipient => Some(AnalyticsFilterField::Recipient),
+            PivotDim::Sender => Some(AnalyticsFilterField::Sender),
+            PivotDim::Edrpou => Some(AnalyticsFilterField::Edrpou),
+            PivotDim::ProductCode => Some(AnalyticsFilterField::ProductCode),
+            PivotDim::Trademark => Some(AnalyticsFilterField::Trademark),
+            PivotDim::OriginCountry => Some(AnalyticsFilterField::OriginCountry),
+            PivotDim::DispatchCountry => Some(AnalyticsFilterField::DispatchCountry),
+            PivotDim::TradeCountry => Some(AnalyticsFilterField::TradeCountry),
+            PivotDim::Month | PivotDim::Year => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PivotMetric {
+    Value,
+    Rows,
+    NetKg,
+}
+
+impl PivotMetric {
+    fn sql(self) -> &'static str {
+        match self {
+            PivotMetric::Value => "COALESCE(SUM(num_value(r.currency_control_value)), 0.0)",
+            PivotMetric::Rows => "CAST(COUNT(*) AS REAL)",
+            PivotMetric::NetKg => "COALESCE(SUM(num_value(r.net_kg)), 0.0)",
+        }
+    }
+}
+
+/// Cross-tab: a matrix of one dimension by another for a chosen metric.
+#[derive(Clone, Debug, Default)]
+pub struct PivotResult {
+    pub row_labels: Vec<String>,
+    pub col_labels: Vec<String>,
+    /// cells[row][col].
+    pub cells: Vec<Vec<f64>>,
+    pub row_totals: Vec<f64>,
+    pub col_totals: Vec<f64>,
+    pub grand_total: f64,
+    /// True when low-ranked rows/columns were folded into an "others" bucket.
+    pub rows_truncated: bool,
+    pub cols_truncated: bool,
+}
+
+/// Single-company dossier built for one EDRPOU: everything an analyst needs
+/// to answer "tell me everything about this importer" on one screen.
+#[derive(Clone, Debug, Default)]
+pub struct CompanyProfile {
+    pub edrpou: String,
+    /// All recipient-name variants seen for this EDRPOU.
+    pub names: Vec<String>,
+    pub overview: AnalyticsOverview,
+    pub months: Vec<AnalyticsMonthRow>,
+    pub top_products: Vec<AnalyticsGroupRow>,
+    pub top_senders: Vec<AnalyticsGroupRow>,
+    pub top_origin_countries: Vec<AnalyticsGroupRow>,
+}
+
 pub struct Db {
     pub conn: Connection,
 }
@@ -949,6 +1042,193 @@ impl Db {
         let mut months: Vec<AnalyticsMonthRow> = rows.flatten().collect();
         months.reverse();
         Ok(months)
+    }
+
+    /// Full dossier for one company (by EDRPOU): name variants, headline
+    /// numbers, monthly dynamics, and the top products / suppliers / origin
+    /// countries. Scoped to the company's rows, so it is fast thanks to the
+    /// EDRPOU index even on a multi-million-row database.
+    pub fn company_profile(&self, edrpou: &str, limit: u64) -> rusqlite::Result<CompanyProfile> {
+        let q = Query {
+            text: String::new(),
+            filters: Filters {
+                edrpou: edrpou.trim().to_string(),
+                ..Filters::default()
+            },
+        };
+        let overview = self.analytics_overview(&q)?;
+        let months = self.analytics_months(&q)?;
+        let top_products = self
+            .analytics_group(
+                &q,
+                AnalyticsSectionKind::ProductCodes,
+                "r.product_code",
+                AnalyticsFilterField::ProductCode,
+                limit,
+                &overview,
+            )?
+            .rows;
+        let top_senders = self
+            .analytics_group(
+                &q,
+                AnalyticsSectionKind::Senders,
+                "r.sender",
+                AnalyticsFilterField::Sender,
+                limit,
+                &overview,
+            )?
+            .rows;
+        let top_origin_countries = self
+            .analytics_group(
+                &q,
+                AnalyticsSectionKind::OriginCountries,
+                "r.origin_country",
+                AnalyticsFilterField::OriginCountry,
+                limit,
+                &overview,
+            )?
+            .rows;
+
+        let mut names = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT TRIM(recipient) AS name, COUNT(*) AS n
+             FROM records
+             WHERE TRIM(edrpou) = ?1 AND TRIM(COALESCE(recipient, '')) <> ''
+             GROUP BY name ORDER BY n DESC LIMIT 8",
+        )?;
+        let rows = stmt.query_map([edrpou.trim()], |row| row.get::<_, String>(0))?;
+        for name in rows.flatten() {
+            names.push(name);
+        }
+
+        Ok(CompanyProfile {
+            edrpou: edrpou.trim().to_string(),
+            names,
+            overview,
+            months,
+            top_products,
+            top_senders,
+            top_origin_countries,
+        })
+    }
+
+    /// Cross-tabulation of `row_dim` by `col_dim` for `metric`, over the rows
+    /// matching the query. Rows are limited to the top `max_rows` by total and
+    /// columns to the top `max_cols`; the remainder is folded into an "others"
+    /// bucket so the matrix stays readable.
+    pub fn pivot(
+        &self,
+        q: &Query,
+        row_dim: PivotDim,
+        col_dim: PivotDim,
+        metric: PivotMetric,
+        max_rows: usize,
+        max_cols: usize,
+        others_label: &str,
+    ) -> rusqlite::Result<PivotResult> {
+        let (joins, where_sql, params) = self.build_where(q);
+        let row_sql = row_dim.sql();
+        let col_sql = col_dim.sql();
+        let non_empty = format!("{row_sql} <> '' AND {col_sql} <> ''");
+        let filter_sql = if where_sql.is_empty() {
+            format!(" WHERE {non_empty}")
+        } else {
+            format!("{where_sql} AND {non_empty}")
+        };
+        let sql = format!(
+            "SELECT {row_sql} AS rk, {col_sql} AS ck, {metric} AS v
+             FROM records r{joins}{filter_sql}
+             GROUP BY rk, ck",
+            metric = metric.sql()
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(params))?;
+
+        // Accumulate into maps, then rank rows and columns by total.
+        let mut row_totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        let mut col_totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        let mut triples: Vec<(String, String, f64)> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let rk: String = row.get(0)?;
+            let ck: String = row.get(1)?;
+            let v: f64 = row.get(2)?;
+            *row_totals.entry(rk.clone()).or_default() += v;
+            *col_totals.entry(ck.clone()).or_default() += v;
+            triples.push((rk, ck, v));
+        }
+
+        let rank = |totals: &std::collections::HashMap<String, f64>, limit: usize, sort_label: bool| {
+            let mut items: Vec<(String, f64)> =
+                totals.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            if sort_label {
+                items.sort_by(|a, b| a.0.cmp(&b.0));
+            } else {
+                items.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            }
+            let truncated = items.len() > limit;
+            items.truncate(limit);
+            (
+                items.into_iter().map(|(k, _)| k).collect::<Vec<_>>(),
+                truncated,
+            )
+        };
+
+        // Months/years read naturally in chronological order; others by size.
+        let col_chrono = matches!(col_dim, PivotDim::Month | PivotDim::Year);
+        let (row_labels, rows_truncated) = rank(&row_totals, max_rows, false);
+        let (col_labels, cols_truncated) = rank(&col_totals, max_cols, col_chrono);
+
+        let row_index: std::collections::HashMap<&str, usize> = row_labels
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.as_str(), i))
+            .collect();
+        let col_index: std::collections::HashMap<&str, usize> = col_labels
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.as_str(), i))
+            .collect();
+
+        let n_rows = row_labels.len() + usize::from(rows_truncated);
+        let n_cols = col_labels.len() + usize::from(cols_truncated);
+        let others_row = row_labels.len();
+        let others_col = col_labels.len();
+        let mut cells = vec![vec![0.0_f64; n_cols]; n_rows];
+        for (rk, ck, v) in triples {
+            let ri = row_index.get(rk.as_str()).copied().unwrap_or(others_row);
+            let ci = col_index.get(ck.as_str()).copied().unwrap_or(others_col);
+            if ri < n_rows && ci < n_cols {
+                cells[ri][ci] += v;
+            }
+        }
+
+        let mut final_row_labels = row_labels;
+        if rows_truncated {
+            final_row_labels.push(others_label.to_string());
+        }
+        let mut final_col_labels = col_labels;
+        if cols_truncated {
+            final_col_labels.push(others_label.to_string());
+        }
+        let row_tot: Vec<f64> = cells.iter().map(|r| r.iter().sum()).collect();
+        let mut col_tot = vec![0.0_f64; n_cols];
+        for r in &cells {
+            for (ci, v) in r.iter().enumerate() {
+                col_tot[ci] += v;
+            }
+        }
+        let grand: f64 = row_tot.iter().sum();
+
+        Ok(PivotResult {
+            row_labels: final_row_labels,
+            col_labels: final_col_labels,
+            cells,
+            row_totals: row_tot,
+            col_totals: col_tot,
+            grand_total: grand,
+            rows_truncated,
+            cols_truncated,
+        })
     }
 
     fn analytics_group(

@@ -6,7 +6,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
 
-use crate::db::{Analytics, AnalyticsScope, Db, Query, analytics_should_run};
+use crate::db::{
+    Analytics, AnalyticsScope, CompanyProfile, Db, PivotDim, PivotMetric, PivotResult, Query,
+    analytics_should_run,
+};
 use crate::export::{self, ExportError};
 use crate::import::{self, FileSummary, ImportPhase};
 
@@ -24,6 +27,17 @@ pub enum WorkerReq {
         limit: u64,
         scope: Option<AnalyticsScope>,
         hs_level: u8,
+        generation: u64,
+    },
+    /// Company dossier for one EDRPOU.
+    Profile { edrpou: String, generation: u64 },
+    /// Cross-tab of the current query.
+    Pivot {
+        q: Box<Query>,
+        row_dim: PivotDim,
+        col_dim: PivotDim,
+        metric: PivotMetric,
+        others_label: String,
         generation: u64,
     },
     Stats,
@@ -55,6 +69,14 @@ pub enum Msg {
         generation: u64,
         scope: Option<AnalyticsScope>,
         analytics: Box<Analytics>,
+    },
+    ProfileDone {
+        generation: u64,
+        profile: Box<CompanyProfile>,
+    },
+    PivotDone {
+        generation: u64,
+        pivot: Box<PivotResult>,
     },
     Stats(u64),
     Import(ImportEvent),
@@ -132,6 +154,44 @@ pub fn spawn_search_worker(
                             generation,
                             scope,
                             analytics: Box::new(analytics),
+                        },
+                        Err(e) => Msg::SearchError {
+                            generation,
+                            message: e.to_string(),
+                        },
+                    };
+                    let _ = tx.send(msg);
+                    ctx.request_repaint();
+                }
+                WorkerReq::Profile { edrpou, generation } => {
+                    let msg = match db.company_profile(&edrpou, 10) {
+                        Ok(profile) => Msg::ProfileDone {
+                            generation,
+                            profile: Box::new(profile),
+                        },
+                        Err(e) => Msg::SearchError {
+                            generation,
+                            message: e.to_string(),
+                        },
+                    };
+                    let _ = tx.send(msg);
+                    ctx.request_repaint();
+                }
+                WorkerReq::Pivot {
+                    q,
+                    row_dim,
+                    col_dim,
+                    metric,
+                    others_label,
+                    generation,
+                } => {
+                    if !analytics_should_run(&q) {
+                        continue;
+                    }
+                    let msg = match db.pivot(&q, row_dim, col_dim, metric, 25, 18, &others_label) {
+                        Ok(pivot) => Msg::PivotDone {
+                            generation,
+                            pivot: Box::new(pivot),
                         },
                         Err(e) => Msg::SearchError {
                             generation,

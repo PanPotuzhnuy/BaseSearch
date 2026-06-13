@@ -5,8 +5,9 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use base_search::db::{
-    AnalyticsFilterField, AnalyticsScope, AnalyticsSectionKind, Db, Filters, PriceMetricKind,
-    Query, analytics_should_run, build_fts_query, extract_year, parse_number,
+    AnalyticsFilterField, AnalyticsScope, AnalyticsSectionKind, Db, Filters, PivotDim,
+    PivotMetric, PriceMetricKind, Query, analytics_should_run, build_fts_query, extract_year,
+    parse_number,
 };
 use base_search::export;
 use base_search::import::{self, collapse_ws, normalize_date, normalize_value};
@@ -409,6 +410,56 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
     assert_eq!(overview_only.overview.row_count, 3);
     assert!(overview_only.company_sections.is_empty());
     assert!(overview_only.price_sections.is_empty());
+
+    // Company dossier for EDRPOU 11111111 (the Apple importer, 2 rows total).
+    let profile = db.company_profile("11111111", 10).unwrap();
+    assert_eq!(profile.edrpou, "11111111");
+    assert_eq!(profile.names, vec!["ТОВ «АЙФОН УКРАЇНА»".to_string()]);
+    assert_eq!(profile.overview.row_count, 2);
+    assert_close(profile.overview.total_value_usd, 3600.5);
+    assert_eq!(profile.top_products[0].label, "8517130000");
+    assert_eq!(profile.top_senders[0].label, "APPLE DISTRIBUTION INTERNATIONAL LTD");
+    assert_eq!(profile.top_origin_countries[0].label, "CN");
+    // Both months in which this company imported are present.
+    let months: Vec<&str> = profile.months.iter().map(|m| m.month.as_str()).collect();
+    assert_eq!(months, vec!["2024-03", "2025-01"]);
+
+    // Pivot: recipients (rows) by origin country (columns), counting rows.
+    let pivot = db
+        .pivot(
+            &q_all,
+            PivotDim::Recipient,
+            PivotDim::OriginCountry,
+            PivotMetric::Rows,
+            25,
+            18,
+            "others",
+        )
+        .unwrap();
+    // Two recipients (АЙФОН УКРАЇНА, ТЕХНО ІМПОРТ), one origin country (CN).
+    assert_eq!(pivot.col_labels, vec!["CN".to_string()]);
+    assert_eq!(pivot.row_labels.len(), 2);
+    assert_eq!(pivot.grand_total, 3.0);
+    // The matrix and totals are internally consistent.
+    let sum_cells: f64 = pivot.cells.iter().flat_map(|r| r.iter()).sum();
+    assert_eq!(sum_cells, pivot.grand_total);
+    assert_eq!(pivot.col_totals[0], 3.0);
+
+    // Pivot by month with the value metric: two months, value matches overview.
+    let pivot_m = db
+        .pivot(
+            &q_all,
+            PivotDim::Recipient,
+            PivotDim::Month,
+            PivotMetric::Value,
+            25,
+            18,
+            "others",
+        )
+        .unwrap();
+    assert_eq!(pivot_m.col_labels, vec!["2024-03".to_string(), "2025-01".to_string()]);
+    // Apple value only: 1200.50 + 300.25 (2024-03) + 2400 (2025-01).
+    assert_close(pivot_m.grand_total, 3900.75);
 }
 
 #[test]

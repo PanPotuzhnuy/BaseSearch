@@ -12,7 +12,8 @@ use egui_extras::{Column, TableBuilder};
 use crate::db::{
     Analytics, AnalyticsFilterAction, AnalyticsFilterField, AnalyticsGroupRow,
     AnalyticsMonthRow, AnalyticsPriceMetric, AnalyticsScope, AnalyticsSection,
-    AnalyticsSectionKind, Db, Filters, PriceMetricKind, Query, RecordCard,
+    AnalyticsSectionKind, CompanyProfile, Db, Filters, PivotDim, PivotMetric, PivotResult,
+    PriceMetricKind, Query, RecordCard,
 };
 use crate::export::ExportError;
 use crate::i18n::{Lang, Tr, fmt, group_digits, tr};
@@ -33,6 +34,7 @@ enum RowMenuAction {
     FilterRecipient(String),
     FilterCode(String),
     FilterEdrpou(String),
+    OpenProfile(String),
 }
 
 type QuickAction = (&'static str, &'static str, fn(String) -> RowMenuAction);
@@ -84,7 +86,8 @@ impl MonthMetric {
     }
 }
 
-/// Sub-tab of the Analytics view: Overview plus the four data categories.
+/// Sub-tab of the Analytics view: Overview, four data categories, and the
+/// cross-tab (pivot).
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum AnalyticsView {
     #[default]
@@ -93,15 +96,17 @@ enum AnalyticsView {
     Products,
     Countries,
     Prices,
+    Pivot,
 }
 
 impl AnalyticsView {
-    const ALL: [AnalyticsView; 5] = [
+    const ALL: [AnalyticsView; 6] = [
         AnalyticsView::Overview,
         AnalyticsView::Companies,
         AnalyticsView::Products,
         AnalyticsView::Countries,
         AnalyticsView::Prices,
+        AnalyticsView::Pivot,
     ];
 
     fn index(self) -> usize {
@@ -111,16 +116,18 @@ impl AnalyticsView {
             AnalyticsView::Products => 2,
             AnalyticsView::Countries => 3,
             AnalyticsView::Prices => 4,
+            AnalyticsView::Pivot => 5,
         }
     }
 
+    /// Section scope for the standard sub-tabs; Overview and Pivot have none.
     fn scope(self) -> Option<AnalyticsScope> {
         match self {
-            AnalyticsView::Overview => None,
             AnalyticsView::Companies => Some(AnalyticsScope::Companies),
             AnalyticsView::Products => Some(AnalyticsScope::Products),
             AnalyticsView::Countries => Some(AnalyticsScope::Countries),
             AnalyticsView::Prices => Some(AnalyticsScope::Prices),
+            AnalyticsView::Overview | AnalyticsView::Pivot => None,
         }
     }
 
@@ -244,11 +251,16 @@ pub struct App {
     /// Active sub-tab on the Analytics view.
     analytics_view: AnalyticsView,
     /// Which sub-tabs are loaded for `analytics_gen` (indexed by view).
-    analytics_loaded: [bool; 5],
+    analytics_loaded: [bool; 6],
     analytics_loading: bool,
     /// Product code grouping level: 2/4/6 digits or 10 for full codes.
     hs_level: u8,
     month_metric: MonthMetric,
+    /// Pivot (cross-tab) state.
+    pivot: Option<PivotResult>,
+    pivot_row_dim: PivotDim,
+    pivot_col_dim: PivotDim,
+    pivot_metric: PivotMetric,
     selected: HashSet<usize>,
     select_anchor: Option<usize>,
     visible_cols: Vec<bool>,
@@ -266,6 +278,11 @@ pub struct App {
     card_open: bool,
     show_settings: bool,
     confirm_clear: bool,
+
+    /// Open company dossier; `None` means the normal Results/Analytics view.
+    profile: Option<CompanyProfile>,
+    profile_loading: bool,
+    profile_gen: u64,
 
     msg_rx: Receiver<Msg>,
     msg_tx: Sender<Msg>,
@@ -333,10 +350,14 @@ impl App {
             analytics_limit: 10,
             analytics_gen: 0,
             analytics_view: AnalyticsView::default(),
-            analytics_loaded: [false; 5],
+            analytics_loaded: [false; 6],
             analytics_loading: false,
             hs_level: 10,
             month_metric: MonthMetric::default(),
+            pivot: None,
+            pivot_row_dim: PivotDim::Recipient,
+            pivot_col_dim: PivotDim::Month,
+            pivot_metric: PivotMetric::Value,
             selected: HashSet::new(),
             select_anchor: None,
             visible_cols,
@@ -351,6 +372,9 @@ impl App {
             card_open: false,
             show_settings: false,
             confirm_clear: false,
+            profile: None,
+            profile_loading: false,
+            profile_gen: 0,
             msg_rx,
             msg_tx,
             search_tx,
@@ -411,8 +435,9 @@ impl App {
         self.search_in_flight = true;
         // Запрос изменился — загруженная аналитика устарела.
         self.analytics = None;
-        self.analytics_loaded = [false; 5];
+        self.analytics_loaded = [false; 6];
         self.analytics_loading = false;
+        self.pivot = None;
         let _ = self.search_tx.send(WorkerReq::Search {
             q: Box::new(self.active_query.clone()),
             page: self.page,
@@ -439,6 +464,22 @@ impl App {
         if self.active_query.is_empty() {
             return;
         }
+        if self.analytics_view == AnalyticsView::Pivot {
+            // Pivot needs the headline overview too (summary line + guard);
+            // load it once if it is missing for this query.
+            if self.analytics.is_none() || self.analytics_gen != self.search_gen {
+                self.analytics_loading = true;
+                let _ = self.search_tx.send(WorkerReq::Analytics {
+                    q: Box::new(self.active_query.clone()),
+                    limit: self.analytics_limit,
+                    scope: None,
+                    hs_level: self.hs_level,
+                    generation: self.search_gen,
+                });
+            }
+            self.request_pivot();
+            return;
+        }
         if self.analytics_gen == self.search_gen
             && self.analytics_loaded[self.analytics_view.index()]
         {
@@ -450,6 +491,29 @@ impl App {
             limit: self.analytics_limit,
             scope: self.analytics_view.scope(),
             hs_level: self.hs_level,
+            generation: self.search_gen,
+        });
+    }
+
+    /// (Re)builds the pivot for the current query and chosen dimensions.
+    fn request_pivot(&mut self) {
+        if self.active_query.is_empty() {
+            return;
+        }
+        self.pivot = None;
+        self.analytics_loaded[AnalyticsView::Pivot.index()] = false;
+        self.analytics_loading = true;
+        let others = match self.lang {
+            Lang::Ua => "інші",
+            Lang::Ru => "прочие",
+            Lang::En => "others",
+        };
+        let _ = self.search_tx.send(WorkerReq::Pivot {
+            q: Box::new(self.active_query.clone()),
+            row_dim: self.pivot_row_dim,
+            col_dim: self.pivot_col_dim,
+            metric: self.pivot_metric,
+            others_label: others.to_string(),
             generation: self.search_gen,
         });
     }
@@ -510,7 +574,7 @@ impl App {
                             }
                             _ => {
                                 self.analytics = Some(*analytics);
-                                self.analytics_loaded = [false; 5];
+                                self.analytics_loaded = [false; 6];
                             }
                         }
                         self.analytics_gen = generation;
@@ -529,6 +593,23 @@ impl App {
                             text: format!("{}: {message}", self.t().error),
                             is_error: true,
                         };
+                    }
+                }
+                Msg::ProfileDone {
+                    generation,
+                    profile,
+                } => {
+                    if generation == self.profile_gen {
+                        self.profile = Some(*profile);
+                        self.profile_loading = false;
+                    }
+                }
+                Msg::PivotDone { generation, pivot } => {
+                    if generation == self.search_gen {
+                        self.pivot = Some(*pivot);
+                        self.analytics_gen = generation;
+                        self.analytics_loaded[AnalyticsView::Pivot.index()] = true;
+                        self.analytics_loading = false;
                     }
                 }
                 Msg::Stats(total) => self.db_total_rows = Some(total),
@@ -695,6 +776,27 @@ impl App {
         }
     }
 
+    /// Opens (or refreshes) the company dossier for an EDRPOU in the background.
+    fn open_profile(&mut self, edrpou: String) {
+        let edrpou = edrpou.trim().to_string();
+        if edrpou.is_empty() {
+            return;
+        }
+        self.profile = None;
+        self.profile_loading = true;
+        self.profile_gen += 1;
+        let _ = self.search_tx.send(WorkerReq::Profile {
+            edrpou,
+            generation: self.profile_gen,
+        });
+    }
+
+    fn close_profile(&mut self) {
+        self.profile = None;
+        self.profile_loading = false;
+        self.profile_gen += 1;
+    }
+
     fn handle_row_click(&mut self, i: usize, modifiers: egui::Modifiers) {
         if modifiers.ctrl || modifiers.command {
             if !self.selected.insert(i) {
@@ -761,6 +863,7 @@ impl App {
             RowMenuAction::FilterEdrpou(v) => {
                 quick_filter(self, &|f, v| f.edrpou = v, v);
             }
+            RowMenuAction::OpenProfile(v) => self.open_profile(v),
         }
     }
 
@@ -1149,6 +1252,13 @@ impl App {
             let mut new_metric: Option<MonthMetric> = None;
             let mut new_view: Option<AnalyticsView> = None;
             let mut new_hs: Option<u8> = None;
+            let mut new_pivot_row: Option<PivotDim> = None;
+            let mut new_pivot_col: Option<PivotDim> = None;
+            let mut new_pivot_metric: Option<PivotMetric> = None;
+            let mut copy_pivot = false;
+            let p_row = self.pivot_row_dim;
+            let p_col = self.pivot_col_dim;
+            let p_metric = self.pivot_metric;
             let month_metric = self.month_metric;
             let view = self.analytics_view;
             let view_ready = self.analytics_loaded[view.index()];
@@ -1165,6 +1275,7 @@ impl App {
                         AnalyticsView::Products => t.products_section,
                         AnalyticsView::Countries => t.countries_section,
                         AnalyticsView::Prices => t.prices_section,
+                        AnalyticsView::Pivot => t.tab_pivot,
                     };
                     if ui.selectable_label(view == v, label).clicked() && v != view {
                         new_view = Some(v);
@@ -1173,7 +1284,10 @@ impl App {
                 if loading || self.search_in_flight {
                     ui.spinner();
                 }
-                if view != AnalyticsView::Overview && view != AnalyticsView::Prices {
+                if matches!(
+                    view,
+                    AnalyticsView::Companies | AnalyticsView::Products | AnalyticsView::Countries
+                ) {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if self.analytics_limit < 50 && ui.button(t.show_more).clicked() {
                             show_more = true;
@@ -1375,6 +1489,62 @@ impl App {
                             ui.label(egui::RichText::new(t.currency_note).weak().small());
                         }
                     }
+                    AnalyticsView::Pivot => {
+                        ui.label(egui::RichText::new(t.pivot_hint).weak().small());
+                        ui.add_space(6.0);
+                        // Dimension and metric selectors.
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new(t.pivot_rows).strong());
+                            pivot_dim_combo(ui, "pv_row", p_row, lang, &mut new_pivot_row);
+                            ui.separator();
+                            ui.label(egui::RichText::new(t.pivot_cols).strong());
+                            pivot_dim_combo(ui, "pv_col", p_col, lang, &mut new_pivot_col);
+                            ui.separator();
+                            ui.label(egui::RichText::new(t.pivot_metric_label).strong());
+                            for (m, label) in [
+                                (PivotMetric::Value, t.metric_value),
+                                (PivotMetric::Rows, t.metric_rows),
+                                (PivotMetric::NetKg, t.metric_weight),
+                            ] {
+                                if ui.selectable_label(p_metric == m, label).clicked()
+                                    && p_metric != m
+                                {
+                                    new_pivot_metric = Some(m);
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+                        match &self.pivot {
+                            Some(pivot) if self.analytics_loaded[AnalyticsView::Pivot.index()] => {
+                                if pivot.row_labels.is_empty() {
+                                    ui.add_space(16.0);
+                                    ui.label(egui::RichText::new(t.nothing_found).weak());
+                                } else {
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .small_button(format!("\u{29C9} {}", t.copy_all))
+                                            .on_hover_text(copy_table_hover(lang))
+                                            .clicked()
+                                        {
+                                            copy_pivot = true;
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                    if let Some(next) =
+                                        pivot_table_ui(ui, pivot, p_row, p_col, p_metric, lang)
+                                    {
+                                        action = Some(next);
+                                    }
+                                }
+                            }
+                            _ => {
+                                ui.add_space(24.0);
+                                ui.vertical_centered(|ui| {
+                                    ui.spinner();
+                                });
+                            }
+                        }
+                    }
                 }
                 ui.add_space(8.0);
             });
@@ -1391,9 +1561,29 @@ impl App {
                 self.analytics_loaded[AnalyticsView::Products.index()] = false;
                 need_request = true;
             }
+            let mut repivot = false;
+            if let Some(d) = new_pivot_row {
+                self.pivot_row_dim = d;
+                repivot = true;
+            }
+            if let Some(d) = new_pivot_col {
+                self.pivot_col_dim = d;
+                repivot = true;
+            }
+            if let Some(m) = new_pivot_metric {
+                self.pivot_metric = m;
+                repivot = true;
+            }
+            if repivot {
+                self.request_pivot();
+            }
+            if copy_pivot && let Some(pivot) = &self.pivot {
+                let tsv = pivot_tsv(pivot, self.pivot_row_dim, self.pivot_col_dim, self.lang);
+                ui.ctx().copy_text(tsv);
+            }
             if show_more {
                 self.analytics_limit = 50;
-                self.analytics_loaded = [false; 5];
+                self.analytics_loaded = [false; 6];
                 need_request = true;
             }
             if let Some(action) = action {
@@ -1537,6 +1727,22 @@ impl App {
                                         ui.close();
                                     }
                                     ui.separator();
+                                    // Профиль компании по ЕДРПОУ строки.
+                                    if let Some(col) = result_col_index("edrpou") {
+                                        let edrpou = cells[col].trim();
+                                        if !edrpou.is_empty()
+                                            && ui
+                                                .button(format!(
+                                                    "\u{1F3E2} {}: {}",
+                                                    t.open_profile, edrpou
+                                                ))
+                                                .clicked()
+                                        {
+                                            menu_action =
+                                                Some(RowMenuAction::OpenProfile(edrpou.to_string()));
+                                            ui.close();
+                                        }
+                                    }
                                     let quick: [QuickAction; 4] = [
                                         (t.flt_sender, "sender", RowMenuAction::FilterSender),
                                         (
@@ -1640,6 +1846,161 @@ impl App {
         self.card_open = open;
         if !self.card_open {
             self.card = None;
+        }
+    }
+
+    fn ui_profile_view(&mut self, root: &mut egui::Ui) {
+        let mut close = false;
+        let mut filter_all = false;
+        let mut action: Option<AnalyticsFilterAction> = None;
+        egui::CentralPanel::default().show_inside(root, |ui| {
+            let t = self.t();
+            // Header: back button + company identity.
+            ui.horizontal(|ui| {
+                if ui.button(format!("\u{2190} {}", t.profile_back)).clicked() {
+                    close = true;
+                }
+                ui.heading(t.company_profile);
+                if self.profile_loading {
+                    ui.spinner();
+                }
+            });
+            ui.add_space(4.0);
+
+            let Some(profile) = &self.profile else {
+                ui.add_space((ui.available_height() * 0.30).max(0.0));
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                });
+                return;
+            };
+            let lang = self.lang;
+
+            // Company names (variants) and EDRPOU.
+            let primary = profile.names.first().cloned().unwrap_or_default();
+            ui.label(
+                egui::RichText::new(if primary.is_empty() {
+                    profile.edrpou.clone()
+                } else {
+                    primary.clone()
+                })
+                .size(18.0)
+                .strong(),
+            );
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("{}: {}", t.edrpou, profile.edrpou)).weak());
+                if ui.small_button(t.show_results).clicked() {
+                    filter_all = true;
+                }
+            });
+            if profile.names.len() > 1 {
+                ui.label(
+                    egui::RichText::new(fmt(
+                        t.also_known_as,
+                        &[&profile.names[1..].join(" · ")],
+                    ))
+                    .weak()
+                    .small(),
+                );
+            }
+            ui.add_space(8.0);
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                // Headline numbers for this company.
+                ui.horizontal_wrapped(|ui| {
+                    kpi_tile(
+                        ui,
+                        t.rows_label,
+                        group_digits(profile.overview.row_count),
+                        t.rows_help,
+                    );
+                    kpi_tile(
+                        ui,
+                        t.declarations_label,
+                        group_digits(profile.overview.declaration_count),
+                        t.declarations_help,
+                    );
+                    kpi_tile(
+                        ui,
+                        t.total_value,
+                        format!("{} $", fmt_compact(profile.overview.total_value_usd)),
+                        t.total_value_help,
+                    );
+                    kpi_tile(
+                        ui,
+                        t.net_weight,
+                        format!("{} kg", fmt_compact(profile.overview.total_net_kg)),
+                        t.net_weight_help,
+                    );
+                    kpi_tile(
+                        ui,
+                        t.avg_value_kg,
+                        format!(
+                            "{} $/kg",
+                            fmt_decimal(profile.overview.avg_value_per_net_kg, 2)
+                        ),
+                        t.avg_value_kg_help,
+                    );
+                    kpi_tile(
+                        ui,
+                        t.product_codes_count,
+                        group_digits(profile.overview.distinct_product_codes),
+                        t.product_codes_help,
+                    );
+                    kpi_tile(
+                        ui,
+                        t.unique_senders,
+                        group_digits(profile.overview.distinct_senders),
+                        t.unique_senders,
+                    );
+                });
+                ui.add_space(12.0);
+
+                if !profile.months.is_empty() {
+                    ui.label(egui::RichText::new(t.months_section).strong());
+                    ui.add_space(2.0);
+                    months_chart(ui, &profile.months, MonthMetric::Value, lang);
+                    ui.add_space(12.0);
+                }
+
+                // Three dossier cards side by side.
+                let sections = [
+                    AnalyticsSection {
+                        kind: AnalyticsSectionKind::ProductCodes,
+                        rows: profile.top_products.clone(),
+                    },
+                    AnalyticsSection {
+                        kind: AnalyticsSectionKind::Senders,
+                        rows: profile.top_senders.clone(),
+                    },
+                    AnalyticsSection {
+                        kind: AnalyticsSectionKind::OriginCountries,
+                        rows: profile.top_origin_countries.clone(),
+                    },
+                ];
+                if let Some(next) = analytics_cards(ui, &sections, lang) {
+                    action = Some(next);
+                }
+                ui.add_space(8.0);
+            });
+        });
+        if close {
+            self.close_profile();
+        }
+        if filter_all {
+            let edrpou = self.profile.as_ref().map(|p| p.edrpou.clone());
+            if let Some(edrpou) = edrpou {
+                self.close_profile();
+                self.apply_analytics_filter(AnalyticsFilterAction {
+                    field: AnalyticsFilterField::Edrpou,
+                    value: edrpou,
+                });
+            }
+        }
+        if let Some(action) = action {
+            // Drill from a dossier card into filtered results.
+            self.close_profile();
+            self.apply_analytics_filter(action);
         }
     }
 
@@ -1845,16 +2206,24 @@ impl eframe::App for App {
         }
         self.ui_toolbar(root);
         self.ui_status_bar(root);
-        match self.active_tab {
-            AppTab::Results => self.ui_table(root),
-            AppTab::Analytics => self.ui_analytics_view(root),
+        if self.profile.is_some() || self.profile_loading {
+            self.ui_profile_view(root);
+        } else {
+            match self.active_tab {
+                AppTab::Results => self.ui_table(root),
+                AppTab::Analytics => self.ui_analytics_view(root),
+            }
         }
         self.ui_card_window(&ctx);
         self.ui_import_report(&ctx);
         self.ui_settings_window(&ctx);
         self.ui_confirm_clear(&ctx);
         // Safety repaint: refresh regularly while a background operation runs.
-        if self.op.is_some() || self.search_in_flight {
+        if self.op.is_some()
+            || self.search_in_flight
+            || self.analytics_loading
+            || self.profile_loading
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
     }
@@ -2252,6 +2621,286 @@ fn price_table(ui: &mut egui::Ui, metrics: &[AnalyticsPriceMetric], lang: Lang) 
                 ui.end_row();
             }
         });
+}
+
+fn pivot_dim_label(dim: PivotDim, lang: Lang) -> &'static str {
+    let t = tr(lang);
+    match dim {
+        PivotDim::Recipient => t.recipient,
+        PivotDim::Sender => t.sender,
+        PivotDim::Edrpou => t.edrpou,
+        PivotDim::ProductCode => t.product_code,
+        PivotDim::Trademark => match lang {
+            Lang::Ua => "Торгова марка",
+            Lang::Ru => "Торговая марка",
+            Lang::En => "Trademark",
+        },
+        PivotDim::OriginCountry => t.origin_country,
+        PivotDim::DispatchCountry => t.dispatch_country,
+        PivotDim::TradeCountry => t.trade_country,
+        PivotDim::Month => match lang {
+            Lang::Ua => "Місяць",
+            Lang::Ru => "Месяц",
+            Lang::En => "Month",
+        },
+        PivotDim::Year => t.year,
+    }
+}
+
+const PIVOT_DIMS: [PivotDim; 10] = [
+    PivotDim::Recipient,
+    PivotDim::Sender,
+    PivotDim::Edrpou,
+    PivotDim::ProductCode,
+    PivotDim::Trademark,
+    PivotDim::OriginCountry,
+    PivotDim::DispatchCountry,
+    PivotDim::TradeCountry,
+    PivotDim::Month,
+    PivotDim::Year,
+];
+
+fn pivot_dim_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    current: PivotDim,
+    lang: Lang,
+    out: &mut Option<PivotDim>,
+) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(pivot_dim_label(current, lang))
+        .show_ui(ui, |ui| {
+            for dim in PIVOT_DIMS {
+                if ui
+                    .selectable_label(dim == current, pivot_dim_label(dim, lang))
+                    .clicked()
+                    && dim != current
+                {
+                    *out = Some(dim);
+                }
+            }
+        });
+}
+
+/// Heatmap-style cross-tab. Row/column labels are clickable to drill into
+/// the Results table; cell shading shows relative size within the matrix.
+fn pivot_table_ui(
+    ui: &mut egui::Ui,
+    pivot: &PivotResult,
+    row_dim: PivotDim,
+    col_dim: PivotDim,
+    metric: PivotMetric,
+    lang: Lang,
+) -> Option<AnalyticsFilterAction> {
+    let mut action: Option<AnalyticsFilterAction> = None;
+    let max_cell = pivot
+        .cells
+        .iter()
+        .flat_map(|r| r.iter())
+        .copied()
+        .fold(0.0_f64, f64::max)
+        .max(f64::EPSILON);
+    let accent = if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(80, 140, 255)
+    } else {
+        ACCENT
+    };
+    let row_field = row_dim.filter_field();
+    let col_field = col_dim.filter_field();
+    let total_label = match lang {
+        Lang::Ua => "Разом",
+        Lang::Ru => "Итого",
+        Lang::En => "Total",
+    };
+
+    egui::ScrollArea::both().show(ui, |ui| {
+        let mut builder = TableBuilder::new(ui)
+            .striped(false)
+            .resizable(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(190.0).at_least(120.0).clip(true));
+        for _ in &pivot.col_labels {
+            builder = builder.column(Column::initial(84.0).at_least(56.0));
+        }
+        builder = builder.column(Column::initial(92.0).at_least(64.0));
+        builder
+            .header(24.0, |mut header| {
+                header.col(|ui| {
+                    ui.strong(pivot_dim_label(row_dim, lang));
+                });
+                for label in &pivot.col_labels {
+                    header.col(|ui| {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.strong(label.clone());
+                            },
+                        );
+                    });
+                }
+                header.col(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.strong(total_label);
+                    });
+                });
+            })
+            .body(|mut body| {
+                for (ri, row_label) in pivot.row_labels.iter().enumerate() {
+                    body.row(22.0, |mut row| {
+                        row.col(|ui| {
+                            let resp = ui.add(
+                                egui::Label::new(row_label)
+                                    .truncate()
+                                    .sense(egui::Sense::click()),
+                            );
+                            if let Some(field) = row_field {
+                                let resp = resp.on_hover_text(pivot_click_hint(lang));
+                                if resp.clicked() {
+                                    action = Some(AnalyticsFilterAction {
+                                        field,
+                                        value: row_label.clone(),
+                                    });
+                                }
+                            }
+                        });
+                        for ci in 0..pivot.col_labels.len() {
+                            let v = pivot.cells[ri][ci];
+                            row.col(|ui| {
+                                paint_pivot_cell(ui, v, max_cell, accent, metric);
+                            });
+                        }
+                        row.col(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(pivot_fmt(pivot.row_totals[ri], metric))
+                                            .monospace()
+                                            .strong(),
+                                    );
+                                },
+                            );
+                        });
+                    });
+                }
+                // Totals row.
+                body.row(22.0, |mut row| {
+                    row.col(|ui| {
+                        ui.strong(total_label);
+                    });
+                    for ci in 0..pivot.col_labels.len() {
+                        row.col(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(pivot_fmt(pivot.col_totals[ci], metric))
+                                            .monospace()
+                                            .strong(),
+                                    );
+                                },
+                            );
+                        });
+                    }
+                    row.col(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(pivot_fmt(pivot.grand_total, metric))
+                                    .monospace()
+                                    .strong(),
+                            );
+                        });
+                    });
+                });
+            });
+    });
+    let _ = col_field;
+    action
+}
+
+fn paint_pivot_cell(
+    ui: &mut egui::Ui,
+    value: f64,
+    max_cell: f64,
+    accent: egui::Color32,
+    metric: PivotMetric,
+) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 20.0),
+        egui::Sense::hover(),
+    );
+    if value > 0.0 {
+        let intensity = (value / max_cell).clamp(0.0, 1.0) as f32;
+        // Stronger fill for larger cells (heatmap).
+        let alpha = (18.0 + intensity * 150.0) as u8;
+        let fill = egui::Color32::from_rgba_unmultiplied(
+            accent.r(),
+            accent.g(),
+            accent.b(),
+            alpha,
+        );
+        ui.painter()
+            .rect_filled(rect.shrink(1.0), egui::CornerRadius::same(2), fill);
+        let text_color = ui.visuals().text_color();
+        ui.painter().text(
+            egui::pos2(rect.right() - 4.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            pivot_fmt(value, metric),
+            egui::FontId::new(11.0, egui::FontFamily::Monospace),
+            text_color,
+        );
+    }
+}
+
+fn pivot_fmt(value: f64, metric: PivotMetric) -> String {
+    match metric {
+        PivotMetric::Rows => group_digits(value as u64),
+        _ => fmt_compact(value),
+    }
+}
+
+fn pivot_click_hint(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Натисніть, щоб відфільтрувати результати",
+        Lang::Ru => "Нажмите, чтобы отфильтровать результаты",
+        Lang::En => "Click to filter results",
+    }
+}
+
+/// Pivot matrix as TSV, ready to paste into Excel.
+fn pivot_tsv(pivot: &PivotResult, row_dim: PivotDim, _col_dim: PivotDim, lang: Lang) -> String {
+    let total_label = match lang {
+        Lang::Ua => "Разом",
+        Lang::Ru => "Итого",
+        Lang::En => "Total",
+    };
+    let mut out = String::new();
+    out.push_str(pivot_dim_label(row_dim, lang));
+    for c in &pivot.col_labels {
+        out.push('\t');
+        out.push_str(c);
+    }
+    out.push('\t');
+    out.push_str(total_label);
+    for (ri, rl) in pivot.row_labels.iter().enumerate() {
+        out.push('\n');
+        out.push_str(rl);
+        for ci in 0..pivot.col_labels.len() {
+            out.push('\t');
+            out.push_str(&format!("{:.2}", pivot.cells[ri][ci]));
+        }
+        out.push('\t');
+        out.push_str(&format!("{:.2}", pivot.row_totals[ri]));
+    }
+    out.push('\n');
+    out.push_str(total_label);
+    for ci in 0..pivot.col_labels.len() {
+        out.push('\t');
+        out.push_str(&format!("{:.2}", pivot.col_totals[ci]));
+    }
+    out.push('\t');
+    out.push_str(&format!("{:.2}", pivot.grand_total));
+    out
 }
 
 fn price_header_median(lang: Lang) -> &'static str {
