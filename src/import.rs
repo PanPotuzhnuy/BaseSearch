@@ -184,6 +184,14 @@ fn map_format_b(idx: &HeaderIndex) -> Option<Vec<ColSrc>> {
     ]);
     let value_usd = idx.first_of(&[("Фактурнаа вартість, $", 0), ("Фактурна вартість, $", 0)]);
     let price_usd_kg = idx.first_of(&[("Ціна, $/кг", 0), ("Вартість, $/кг", 0)]);
+    let movement_feature = idx.first_of(&[
+        ("Ознака товару в контейнері", 0),
+        ("Ознака товару у контейнері", 0),
+    ]);
+    let customs_value_method = idx.first_of(&[("Метод визначення митної вартості", 0)]);
+    let duty_uah = idx.first_of(&[("Мито, грн.", 0), ("Мито, грн", 0)]);
+    let excise_uah = idx.first_of(&[("Акциз, грн.", 0), ("Акциз, грн", 0)]);
+    let vat_uah = idx.first_of(&[("ПДВ, грн.", 0), ("ПДВ, грн", 0)]);
     let decl_type_parts = idx.all_with_prefix("Тип деклараці");
     let join = |parts: &Vec<usize>| {
         if parts.is_empty() {
@@ -216,7 +224,12 @@ fn map_format_b(idx: &HeaderIndex) -> Option<Vec<ColSrc>> {
                 "gross_kg" => opt(idx.get("Вага брутто, кг", 0)),
                 "net_kg" => opt(idx.get("Вага нетто, кг", 0)),
                 "currency_control_value" => opt(value_usd),
+                "movement_feature" => opt(movement_feature),
+                "field_43" => opt(customs_value_method),
                 "rfv_usd_kg" => opt(price_usd_kg),
+                "field_3001" => opt(duty_uah),
+                "field_3002" => opt(excise_uah),
+                "field_9610" => opt(vat_uah),
                 _ => ColSrc::Missing,
             })
             .collect(),

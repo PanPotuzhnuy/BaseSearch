@@ -949,6 +949,12 @@ fn import_registry_format_im12_variant() {
         "Назва фірми отримувача",
         "Назва фірми відправиника",
         "Вартість, $/кг",
+        "Ознака товару  в контейнері",
+        "Метод визначення митної вартості",
+        "Фактурна вартість, $",
+        "Мито, грн.",
+        "Акциз, грн.",
+        "ПДВ, грн.",
     ];
     for (c, h) in headers.iter().enumerate() {
         sheet.write_string(0, c as u16, *h).unwrap();
@@ -967,6 +973,12 @@ fn import_registry_format_im12_variant() {
         "ТОВ ГЮАЛОС",
         "GUARDIAN CZESTOCHOWA SP Z O O",
         "",
+        "0",
+        "1",
+        "",
+        "120.5",
+        "0",
+        "",
     ];
     for (c, v) in row.iter().enumerate() {
         if !v.is_empty() {
@@ -976,6 +988,8 @@ fn import_registry_format_im12_variant() {
     sheet.write_number(1, 3, 2024.0).unwrap(); // middle declaration-number part
     sheet.write_number(1, 5, 45627.0).unwrap(); // date = 2024-12-01
     sheet.write_number(1, 12, 0.5756).unwrap();
+    sheet.write_number(1, 15, 8473.2).unwrap();
+    sheet.write_number(1, 18, 74216.87).unwrap();
     workbook.save(&xlsx).unwrap();
 
     let db_path = dir.path().join("test.db");
@@ -1010,6 +1024,12 @@ fn import_registry_format_im12_variant() {
     assert_eq!(get("Відправник"), "GUARDIAN CZESTOCHOWA SP Z O O");
     assert_eq!(get("Тип"), "40/АА");
     assert_eq!(get("РФВ Дол/кг."), "0.5756");
+    assert_eq!(get("ФВ вал.контр"), "8473.2");
+    assert_eq!(get("Особ.перем."), "0");
+    assert_eq!(get("43"), "1");
+    assert_eq!(get("3001"), "120.5");
+    assert_eq!(get("3002"), "0");
+    assert_eq!(get("9610"), "74216.87");
 }
 
 /// Generic detector: an external export with Russian headers and title rows
