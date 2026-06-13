@@ -3410,14 +3410,20 @@ fn system_font_candidates() -> (&'static [&'static str], &'static [&'static str]
     }
     #[cfg(target_os = "macos")]
     {
+        // Single-file .ttf fonts that cover Cyrillic. If none is found, egui's
+        // bundled font still renders Cyrillic, so text is never broken.
         (
             &[
                 "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
                 "/System/Library/Fonts/Supplemental/Arial.ttf",
+                "/System/Library/Fonts/Supplemental/Verdana.ttf",
+                "/System/Library/Fonts/Supplemental/Tahoma.ttf",
                 "/Library/Fonts/Arial Unicode.ttf",
+                "/Library/Fonts/Arial.ttf",
             ],
             &[
                 "/System/Library/Fonts/Supplemental/Courier New.ttf",
+                "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
                 "/Library/Fonts/Courier New.ttf",
             ],
         )

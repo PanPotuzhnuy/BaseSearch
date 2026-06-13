@@ -58,14 +58,49 @@ That makes repeated search and filtering much faster and more predictable.
 
 ## Quick Start
 
-**Windows.** Run the prebuilt application:
+### Windows
+
+Run the prebuilt application — no install needed:
 
 ```text
 dist\BaseSearch\BaseSearch.exe
 ```
 
-**Linux / macOS.** Build from source (see below) or download the binaries from
-the CI artifacts, then run `BaseSearch`.
+### macOS (copy-paste)
+
+Paste the whole block into Terminal. It installs the Rust toolchain if it is
+missing, then builds and launches the app:
+
+```bash
+xcode-select --install 2>/dev/null || true
+command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+git clone https://github.com/PanPotuzhnuy/BaseSearch.git
+cd BaseSearch
+cargo run --release
+```
+
+After the first build, just run `./run.sh` from the project folder to start it
+again (or `./run.sh cli stats data/base_search.db` for the command-line tool).
+
+### Linux (Debian / Ubuntu, copy-paste)
+
+```bash
+sudo apt-get update && sudo apt-get install -y build-essential pkg-config \
+  libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev \
+  libxcb-xfixes0-dev curl git
+command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+git clone https://github.com/PanPotuzhnuy/BaseSearch.git
+cd BaseSearch
+cargo run --release
+```
+
+On Fedora the dependencies are `gcc pkgconf-pkg-config libxkbcommon-devel
+wayland-devel libxcb-devel`; on Arch, `base-devel libxkbcommon wayland libxcb`.
+After the first build, `./run.sh` launches the app.
+
+### Where the data lives
 
 The local database is stored in a `data` folder next to the executable. When
 that location is not writable (for example, a system-wide install), Base Search
@@ -219,9 +254,19 @@ cargo build --release
 ```
 
 Release binaries are created in `target/release/`: `BaseSearch` and
-`base-search-cli` (with `.exe` on Windows). Continuous integration builds and
-tests every commit on Windows, Linux, and macOS and publishes downloadable
-binaries as workflow artifacts.
+`base-search-cli` (with `.exe` on Windows). On macOS and Linux you can also use
+the bundled helper script, which builds and launches in one step:
+
+```bash
+./run.sh              # build (release) and run the app
+./run.sh cli stats data/base_search.db   # run the command-line tool
+```
+
+Continuous integration builds and tests every commit on Windows, Linux, and
+macOS and publishes downloadable binaries as workflow artifacts. macOS and
+Linux CI binaries are unsigned — on macOS, clear the quarantine flag once with
+`xattr -d com.apple.quarantine ./BaseSearch` (or right-click → Open), or just
+build from source as above.
 
 ## Architecture
 
