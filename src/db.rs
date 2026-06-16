@@ -14,6 +14,8 @@ use crate::schema::{COLUMNS, RESULT_COLUMNS, SEARCH_COLUMNS};
 pub struct Filters {
     pub year: String,
     pub product_code: String,
+    pub trademark: String,
+    pub description: String,
     pub sender: String,
     pub recipient: String,
     pub edrpou: String,
@@ -27,6 +29,8 @@ impl Filters {
         [
             &self.year,
             &self.product_code,
+            &self.trademark,
+            &self.description,
             &self.sender,
             &self.recipient,
             &self.edrpou,
@@ -346,14 +350,14 @@ pub enum PivotDim {
 impl PivotDim {
     fn sql(self) -> &'static str {
         match self {
-            PivotDim::Recipient => "TRIM(r.recipient)",
-            PivotDim::Sender => "TRIM(r.sender)",
-            PivotDim::Edrpou => "TRIM(r.edrpou)",
-            PivotDim::ProductCode => "TRIM(r.product_code)",
-            PivotDim::Trademark => "TRIM(r.trademark)",
-            PivotDim::OriginCountry => "TRIM(r.origin_country)",
-            PivotDim::DispatchCountry => "TRIM(r.dispatch_country)",
-            PivotDim::TradeCountry => "TRIM(r.trade_country)",
+            PivotDim::Recipient => "label_value(r.recipient)",
+            PivotDim::Sender => "label_value(r.sender)",
+            PivotDim::Edrpou => "label_value(r.edrpou)",
+            PivotDim::ProductCode => "label_value(r.product_code)",
+            PivotDim::Trademark => "label_value(r.trademark)",
+            PivotDim::OriginCountry => "country_key(r.origin_country)",
+            PivotDim::DispatchCountry => "country_key(r.dispatch_country)",
+            PivotDim::TradeCountry => "country_key(r.trade_country)",
             PivotDim::Month => "SUBSTR(TRIM(r.declaration_date), 1, 7)",
             PivotDim::Year => "CAST(r.year AS TEXT)",
         }
@@ -512,6 +516,42 @@ impl Db {
                     .as_str_or_null()
                     .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
                 Ok(raw.and_then(parse_number))
+            },
+        )?;
+        self.conn.create_scalar_function(
+            "country_key",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let raw = ctx
+                    .get_raw(0)
+                    .as_str_or_null()
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                Ok(raw.map(normalize_country_key).unwrap_or_default())
+            },
+        )?;
+        self.conn.create_scalar_function(
+            "text_key",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let raw = ctx
+                    .get_raw(0)
+                    .as_str_or_null()
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                Ok(raw.map(normalize_text_key).unwrap_or_default())
+            },
+        )?;
+        self.conn.create_scalar_function(
+            "label_value",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let raw = ctx
+                    .get_raw(0)
+                    .as_str_or_null()
+                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                Ok(raw.map(clean_label_value).unwrap_or_default())
             },
         )?;
         // Percentiles in one pass: "p25|p50|p75", or NULL with no values.
@@ -704,12 +744,19 @@ impl Db {
         let mut match_expr = build_fts_query(&q.text);
         let f = &q.filters;
         let mut contains_clauses: Vec<(String, String)> = Vec::new();
+        let trademark = f.trademark.trim();
+        if !trademark.is_empty()
+            && let Some(terms) = fts_prefix_terms(trademark)
+        {
+            if !match_expr.is_empty() {
+                match_expr.push(' ');
+            }
+            match_expr.push_str(&terms);
+        }
         for (col, value) in [
+            ("description", &f.description),
             ("sender", &f.sender),
             ("recipient", &f.recipient),
-            ("trade_country", &f.trade_country),
-            ("dispatch_country", &f.dispatch_country),
-            ("origin_country", &f.origin_country),
         ] {
             let value = value.trim();
             if value.is_empty() {
@@ -741,6 +788,25 @@ impl Db {
         if !edrpou.is_empty() {
             clauses.push("r.edrpou = ?".into());
             params.push(edrpou.to_string().into());
+        }
+        if !trademark.is_empty() {
+            clauses.push("text_key(r.trademark) = text_key(?)".into());
+            params.push(trademark.to_string().into());
+        }
+        for (col, value) in [
+            ("trade_country", &f.trade_country),
+            ("dispatch_country", &f.dispatch_country),
+            ("origin_country", &f.origin_country),
+        ] {
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            clauses.push(format!(
+                "(country_key(r.{col}) = country_key(?) OR cyr_contains(r.{col}, ?))"
+            ));
+            params.push(value.to_string().into());
+            params.push(value.to_lowercase().into());
         }
         for (clause, param) in contains_clauses {
             clauses.push(clause);
@@ -902,6 +968,13 @@ impl Db {
                 analytics.company_sections = vec![
                     self.analytics_section_with_overview(
                         q,
+                        AnalyticsSectionKind::Edrpou,
+                        hs_level,
+                        limit,
+                        overview,
+                    )?,
+                    self.analytics_section_with_overview(
+                        q,
                         AnalyticsSectionKind::Recipients,
                         hs_level,
                         limit,
@@ -910,13 +983,6 @@ impl Db {
                     self.analytics_section_with_overview(
                         q,
                         AnalyticsSectionKind::Senders,
-                        hs_level,
-                        limit,
-                        overview,
-                    )?,
-                    self.analytics_section_with_overview(
-                        q,
-                        AnalyticsSectionKind::Edrpou,
                         hs_level,
                         limit,
                         overview,
@@ -1059,14 +1125,14 @@ impl Db {
             "SELECT
                 COUNT(*),
                 COUNT(DISTINCT NULLIF(TRIM(r.declaration_number), '')),
-                COUNT(DISTINCT NULLIF(TRIM(r.sender), '')),
-                COUNT(DISTINCT NULLIF(TRIM(r.recipient), '')),
-                COUNT(DISTINCT NULLIF(TRIM(r.edrpou), '')),
-                COUNT(DISTINCT NULLIF(TRIM(r.trademark), '')),
-                COUNT(DISTINCT NULLIF(TRIM(r.product_code), '')),
-                COUNT(DISTINCT NULLIF(TRIM(r.origin_country), '')),
-                COUNT(DISTINCT NULLIF(TRIM(r.dispatch_country), '')),
-                COUNT(DISTINCT NULLIF(TRIM(r.trade_country), '')),
+                COUNT(DISTINCT NULLIF(label_value(r.sender), '')),
+                COUNT(DISTINCT NULLIF(label_value(r.recipient), '')),
+                COUNT(DISTINCT NULLIF(label_value(r.edrpou), '')),
+                COUNT(DISTINCT NULLIF(label_value(r.trademark), '')),
+                COUNT(DISTINCT NULLIF(label_value(r.product_code), '')),
+                COUNT(DISTINCT NULLIF(country_key(r.origin_country), '')),
+                COUNT(DISTINCT NULLIF(country_key(r.dispatch_country), '')),
+                COUNT(DISTINCT NULLIF(country_key(r.trade_country), '')),
                 SUM(num_value(r.currency_control_value)),
                 SUM(num_value(r.gross_kg)),
                 SUM(num_value(r.net_kg)),
@@ -1409,7 +1475,8 @@ impl Db {
         overview: &AnalyticsOverview,
     ) -> rusqlite::Result<AnalyticsSection> {
         let (joins, where_sql, mut params) = self.build_where(q);
-        let non_empty = format!("TRIM(COALESCE({label_expr}, '')) <> ''");
+        let label_sql = format!("label_value({label_expr})");
+        let non_empty = format!("{label_sql} <> ''");
         let filter_sql = if where_sql.is_empty() {
             format!(" WHERE {non_empty}")
         } else {
@@ -1417,7 +1484,7 @@ impl Db {
         };
         let sql = format!(
             "SELECT
-                TRIM({label_expr}) AS label,
+                {label_sql} AS label,
                 COUNT(*) AS rows_count,
                 COUNT(DISTINCT NULLIF(TRIM(r.declaration_number), '')) AS declarations_count,
                 COUNT(DISTINCT NULLIF(TRIM(r.edrpou), '')) AS companies_count,
@@ -1426,7 +1493,7 @@ impl Db {
                 COALESCE(SUM(num_value(r.gross_kg)), 0.0) AS total_gross_kg,
                 COALESCE(SUM(num_value(r.quantity)), 0.0) AS total_quantity
              FROM records r{joins}{filter_sql}
-             GROUP BY TRIM({label_expr})
+             GROUP BY {label_sql}
              ORDER BY total_value_usd DESC, total_net_kg DESC, rows_count DESC, label COLLATE NOCASE
              LIMIT ?"
         );
@@ -1736,15 +1803,15 @@ fn analytics_section_grouping(
             AnalyticsFilterField::Description,
         ),
         AnalyticsSectionKind::OriginCountries => (
-            "r.origin_country".to_string(),
+            "country_key(r.origin_country)".to_string(),
             AnalyticsFilterField::OriginCountry,
         ),
         AnalyticsSectionKind::DispatchCountries => (
-            "r.dispatch_country".to_string(),
+            "country_key(r.dispatch_country)".to_string(),
             AnalyticsFilterField::DispatchCountry,
         ),
         AnalyticsSectionKind::TradeCountries => (
-            "r.trade_country".to_string(),
+            "country_key(r.trade_country)".to_string(),
             AnalyticsFilterField::TradeCountry,
         ),
     }
@@ -1803,15 +1870,117 @@ pub fn parse_number(value: &str) -> Option<f64> {
 
 fn decimal_separator_for_single(value: &str, sep: char) -> Option<char> {
     let pos = value.rfind(sep)?;
-    let before = value[..pos].chars().filter(|c| c.is_ascii_digit()).count();
     let after = value[pos + sep.len_utf8()..]
         .chars()
         .filter(|c| c.is_ascii_digit())
         .count();
-    if after == 0 || (after == 3 && before > 0) {
-        None
+    if after == 0 { None } else { Some(sep) }
+}
+
+fn normalize_country_key(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let key: String = trimmed
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_uppercase)
+        .collect();
+    if matches!(
+        key.as_str(),
+        "0" | "00" | "000" | "NA" | "NODATA" | "ND" | "НД" | "НЕМАДАНИХ" | "НЕТДАННЫХ"
+    ) {
+        return String::new();
+    }
+    match key.as_str() {
+        "CN" | "CHN" | "КИТАЙ" => "CN",
+        "IE" | "IRL" | "ІРЛАНДІЯ" | "ИРЛАНДИЯ" => "IE",
+        "PL" | "POL" | "ПОЛЬЩА" | "ПОЛЬША" => "PL",
+        "CZ" | "CZE" | "ЧЕСЬКАРЕСПУБЛІКА" | "ЧЕХІЯ" | "ЧЕШСКАЯРЕСПУБЛИКА" | "ЧЕХИЯ" => {
+            "CZ"
+        }
+        "DE" | "DEU" | "НІМЕЧЧИНА" | "ГЕРМАНІЯ" | "ГЕРМАНИЯ" => "DE",
+        "US" | "USA" | "СПОЛУЧЕНІШТАТИАМЕРИКИ" | "США" | "СОЕДИНЕННЫЕШТАТЫАМЕРИКИ" => {
+            "US"
+        }
+        "VN" | "VNM" | "ВЄТНАМ" | "ВЕТНАМ" => "VN",
+        "EU" | "КРАЇНИЄС" | "СТРАНЫЕС" => "EU",
+        "KR" | "KOR" | "ПІВДЕННАКОРЕЯ" | "КОРЕЯРЕСПУБЛІКА" | "ЮЖНАЯКОРЕЯ" => {
+            "KR"
+        }
+        "TR" | "TUR" | "ТУРЕЧЧИНА" | "ТУРЦІЯ" | "ТУРЦИЯ" => "TR",
+        "IN" | "IND" | "ІНДІЯ" | "ИНДИЯ" => "IN",
+        "IT" | "ITA" | "ІТАЛІЯ" | "ИТАЛИЯ" => "IT",
+        "BE" | "BEL" | "БЕЛЬГІЯ" | "БЕЛЬГИЯ" => "BE",
+        "NL" | "NLD" | "НІДЕРЛАНДИ" | "НИДЕРЛАНДЫ" => "NL",
+        "FR" | "FRA" | "ФРАНЦІЯ" | "ФРАНЦИЯ" => "FR",
+        "GB" | "UK" | "GBR" | "ВЕЛИКАБРИТАНІЯ" | "ВЕЛИКОБРИТАНІЯ" | "ВЕЛИКОБРИТАНИЯ" => {
+            "GB"
+        }
+        "ES" | "ESP" | "ІСПАНІЯ" | "ИСПАНИЯ" => "ES",
+        "CH" | "CHE" | "ШВЕЙЦАРІЯ" | "ШВЕЙЦАРИЯ" => "CH",
+        "AT" | "AUT" | "АВСТРІЯ" | "АВСТРИЯ" => "AT",
+        "FI" | "FIN" | "ФІНЛЯНДІЯ" | "ФИНЛЯНДИЯ" => "FI",
+        "LV" | "LVA" | "ЛАТВІЯ" | "ЛАТВИЯ" => "LV",
+        "LT" | "LTU" | "ЛИТВА" => "LT",
+        "EE" | "EST" | "ЕСТОНІЯ" | "ЭСТОНИЯ" => "EE",
+        "HU" | "HUN" | "УГОРЩИНА" | "ВЕНГРИЯ" => "HU",
+        "RO" | "ROU" | "РУМУНІЯ" | "РУМЫНИЯ" => "RO",
+        "BG" | "BGR" | "БОЛГАРІЯ" | "БОЛГАРИЯ" => "BG",
+        _ => return key,
+    }
+    .to_string()
+}
+
+fn normalize_text_key(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+    for ch in value.trim().chars() {
+        if ch.is_whitespace() {
+            if !out.is_empty() && !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.extend(ch.to_lowercase());
+            last_space = false;
+        }
+    }
+    out
+}
+
+fn clean_label_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let key: String = trimmed
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_uppercase)
+        .collect();
+    if matches!(
+        key.as_str(),
+        "0" | "00"
+            | "000"
+            | "0000"
+            | "NA"
+            | "NА"
+            | "ND"
+            | "NULL"
+            | "NONE"
+            | "NODATA"
+            | "UNKNOWN"
+            | "НД"
+            | "НЕМАДАНИХ"
+            | "НЕТДАННЫХ"
+            | "НЕВІДОМО"
+            | "НЕИЗВЕСТНО"
+    ) {
+        String::new()
     } else {
-        Some(sep)
+        trimmed.to_string()
     }
 }
 

@@ -132,6 +132,13 @@ Analytics always follows the same query and filters as the Results table. For
 example, if the user searches for `Apple` and filters year `2024`, the Analytics
 tab is calculated only for those matching rows.
 
+The free-text search is intentionally broad: a word can match the product
+description, company names, trademark, declaration number, product code, or
+country fields. For business questions such as "show only the Apple trademark",
+use the dedicated **Trademark** filter or click a trademark row in Analytics.
+Those drill-down actions now apply field-specific filters instead of replacing
+the whole query with another broad search.
+
 The Analytics tab is split into focused sub-tabs, so each screen answers one
 kind of question instead of cramming everything into one long page. A one-line
 summary (rows · value · net weight · period) stays visible on every sub-tab.
@@ -139,9 +146,9 @@ summary (rows · value · net weight · period) stays visible on every sub-tab.
 | Sub-tab | What it answers |
 |---|---|
 | **Overview** | Headline numbers (rows, declarations, companies, source value, weight, value per kg, distinct codes and countries) plus a **monthly dynamics** bar chart. Switch the chart metric between source value, rows, net weight, and **value per kg**. Hover a bar for the full month. |
-| **Companies** | Who received/imported, who sent, and which organization codes dominate. |
-| **Goods** | Which product codes, brands, and product groups dominate. Codes can be grouped by HS level — **2 / 4 / 6 digits or full** — to see structure from chapter down to exact code. |
-| **Countries** | Origin, dispatch, and trade countries for the matching shipments. |
+| **Companies** | Which organization codes dominate, who received/imported, and who sent. EDRPOU is shown first because it is more stable than company names with address variants. |
+| **Goods** | Which product codes, brands, and product groups dominate. Codes can be grouped by HS level — **2 / 4 / 6 digits or full** — to see structure from chapter down to exact code. Brand totals depend on source files that actually contain trademark data. |
+| **Countries** | Origin, dispatch, and trade countries for the matching shipments. Common country name/code variants are normalized, for example `CN` and `КИТАЙ` are grouped together. |
 | **Prices** | Per price field: average, weighted average, **median, and the P25–P75 range** with the value count. Below the table, a **price-undervaluation scan** lists declarations priced per kg far below the median for their own product code — the classic signal of customs undervaluation (or a data-entry error). |
 | **Pivot** | A **cross-tab**: pick any dimension for rows and any for columns (company, EDRPOU, product code, trademark, origin/dispatch/trade country, month, year) and a value (source value, rows, net weight). The result is a heatmap with row, column, and grand totals; row/column labels drill into the Results table, and the whole matrix copies into Excel. |
 
@@ -164,6 +171,10 @@ explicitly if that safety limit is reached.
 Values and prices are shown exactly as they appear in the source files: in the
 41-column layout the "value" can be in the contract currency rather than only
 USD, which the tab notes explicitly so totals are not misread.
+
+Numeric analytics accepts both comma and dot decimals. Customs weights with
+three decimal places, such as `13804.656`, are treated as decimal values rather
+than thousands-formatted integers.
 
 To avoid heavy full-database grouping by accident, the Analytics tab asks for a
 search term or filter before running large calculations.
@@ -194,6 +205,8 @@ interface language.
 - Numeric terms with 4+ digits, for example `8504`, are treated as prefixes,
   which is useful for product codes.
 - Text filters are case-insensitive and support Cyrillic text.
+- Use field filters when the meaning matters: **Trademark = Apple** is narrower
+  than searching for `Apple` everywhere.
 
 ## Supported Data
 

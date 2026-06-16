@@ -997,10 +997,10 @@ impl App {
             AnalyticsFilterField::OriginCountry => self.filters.origin_country = action.value,
             AnalyticsFilterField::DispatchCountry => self.filters.dispatch_country = action.value,
             AnalyticsFilterField::TradeCountry => self.filters.trade_country = action.value,
-            AnalyticsFilterField::Trademark | AnalyticsFilterField::Description => {
-                self.query_text = action.value;
-            }
+            AnalyticsFilterField::Trademark => self.filters.trademark = action.value,
+            AnalyticsFilterField::Description => self.filters.description = action.value,
         }
+        self.show_filters = true;
         self.active_tab = AppTab::Results;
         self.start_search(true);
     }
@@ -1143,11 +1143,25 @@ impl App {
                 &mut search,
             );
             filter_field(ui, t.edrpou, &mut self.filters.edrpou, 100.0, &mut search);
+            filter_field(
+                ui,
+                t.trademark,
+                &mut self.filters.trademark,
+                120.0,
+                &mut search,
+            );
             filter_field(ui, t.sender, &mut self.filters.sender, 180.0, &mut search);
             filter_field(
                 ui,
                 t.recipient,
                 &mut self.filters.recipient,
+                180.0,
+                &mut search,
+            );
+            filter_field(
+                ui,
+                t.description,
+                &mut self.filters.description,
                 180.0,
                 &mut search,
             );

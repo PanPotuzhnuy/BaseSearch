@@ -620,6 +620,217 @@ fn analytics_section_can_load_all_group_rows_beyond_visible_top() {
 }
 
 #[test]
+fn analytics_trademark_filter_is_field_specific() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("trademark_filter.xlsx");
+    let db_path = dir.path().join("data").join("trademark_filter.db");
+    write_test_xlsx(
+        &xlsx,
+        &[
+            vec![
+                ("declaration_number", "24UA100110000301U1"),
+                ("declaration_date", "15.03.2024"),
+                ("sender", "APPLE DISTRIBUTION INTERNATIONAL LTD"),
+                ("edrpou", "11111111"),
+                ("recipient", "IPHONE UKRAINE LLC"),
+                ("product_code", "8517130000"),
+                ("description", "Apple iPhone smartphone"),
+                ("origin_country", "CN"),
+                ("net_kg", "10"),
+                ("currency_control_value", "1200"),
+                ("trademark", "Apple"),
+            ],
+            vec![
+                ("declaration_number", "24UA100110000302U2"),
+                ("declaration_date", "16.03.2024"),
+                ("sender", "ORIFLAME"),
+                ("edrpou", "22222222"),
+                ("recipient", "COSMETICS IMPORT LLC"),
+                ("product_code", "3401110000"),
+                ("description", "Soap Apple & Cinnamon"),
+                ("origin_country", "PL"),
+                ("net_kg", "30"),
+                ("currency_control_value", "500"),
+                ("trademark", "ORIFLAME"),
+            ],
+            vec![
+                ("declaration_number", "24UA100110000303U3"),
+                ("declaration_date", "17.03.2024"),
+                ("sender", "GLOBAL SUPPLY LTD"),
+                ("edrpou", "33333333"),
+                ("recipient", "DECOR IMPORT LLC"),
+                ("product_code", "9503000000"),
+                ("description", "Decorative desk globe"),
+                ("origin_country", "CN"),
+                ("net_kg", "20"),
+                ("currency_control_value", "700"),
+                ("trademark", "APPLE GLOBE"),
+            ],
+        ],
+    );
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 3);
+
+    let broad = Query {
+        text: "Apple".into(),
+        filters: Filters {
+            year: "2024".into(),
+            ..Default::default()
+        },
+    };
+    assert_eq!(db.count(&broad).unwrap(), 3);
+
+    let exact_brand = Query {
+        text: String::new(),
+        filters: Filters {
+            year: "2024".into(),
+            trademark: "Apple".into(),
+            ..Default::default()
+        },
+    };
+    let analytics = db.analytics(&exact_brand, 10).unwrap();
+    assert_eq!(analytics.overview.row_count, 1);
+    assert_close(analytics.overview.total_value_usd, 1200.0);
+    assert_eq!(analytics.top_trademarks[0].label, "Apple");
+}
+
+#[test]
+fn analytics_country_sections_use_normalized_country_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("country_keys.xlsx");
+    let db_path = dir.path().join("data").join("country_keys.db");
+    write_test_xlsx(
+        &xlsx,
+        &[
+            vec![
+                ("declaration_number", "24UA100110000401U1"),
+                ("declaration_date", "15.03.2024"),
+                ("sender", "APPLE DISTRIBUTION INTERNATIONAL LTD"),
+                ("edrpou", "11111111"),
+                ("recipient", "IPHONE UKRAINE LLC"),
+                ("product_code", "8517130000"),
+                ("description", "Apple iPhone smartphone"),
+                ("origin_country", "CN"),
+                ("net_kg", "10"),
+                ("currency_control_value", "1000"),
+                ("trademark", "Apple"),
+            ],
+            vec![
+                ("declaration_number", "24UA100110000402U2"),
+                ("declaration_date", "16.03.2024"),
+                ("sender", "APPLE OPERATIONS EUROPE"),
+                ("edrpou", "22222222"),
+                ("recipient", "TECH IMPORT LLC"),
+                ("product_code", "8517130000"),
+                ("description", "Apple iPhone parts"),
+                ("origin_country", "КИТАЙ"),
+                ("net_kg", "5"),
+                ("currency_control_value", "500"),
+                ("trademark", "Apple"),
+            ],
+        ],
+    );
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 2);
+
+    let q = Query {
+        text: "Apple".into(),
+        filters: Filters {
+            year: "2024".into(),
+            ..Default::default()
+        },
+    };
+    let analytics = db.analytics(&q, 10).unwrap();
+    assert_eq!(analytics.overview.distinct_origin_countries, 1);
+    let origin = analytics_section(
+        &analytics.country_sections,
+        AnalyticsSectionKind::OriginCountries,
+    );
+    assert_eq!(origin.rows.len(), 1);
+    assert_eq!(origin.rows[0].label, "CN");
+    assert_eq!(origin.rows[0].rows, 2);
+}
+
+#[test]
+fn analytics_ignores_placeholder_labels_in_business_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("placeholder_labels.xlsx");
+    let db_path = dir.path().join("data").join("placeholder_labels.db");
+    write_test_xlsx(
+        &xlsx,
+        &[
+            vec![
+                ("declaration_number", "24UA100110000501U1"),
+                ("declaration_date", "15.03.2024"),
+                ("sender", "0"),
+                ("edrpou", "0"),
+                ("recipient", "0"),
+                ("product_code", "0"),
+                ("description", "Apple device"),
+                ("origin_country", "0"),
+                ("net_kg", "10"),
+                ("currency_control_value", "10000"),
+                ("trademark", "0"),
+            ],
+            vec![
+                ("declaration_number", "24UA100110000502U2"),
+                ("declaration_date", "16.03.2024"),
+                ("sender", "REAL SUPPLIER LTD"),
+                ("edrpou", "12345678"),
+                ("recipient", "REAL IMPORT LLC"),
+                ("product_code", "8517130000"),
+                ("description", "Apple iPhone"),
+                ("origin_country", "CN"),
+                ("net_kg", "5"),
+                ("currency_control_value", "100"),
+                ("trademark", "Apple"),
+            ],
+        ],
+    );
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 2);
+
+    let q = Query {
+        text: "Apple".into(),
+        filters: Filters {
+            year: "2024".into(),
+            ..Default::default()
+        },
+    };
+    let analytics = db.analytics(&q, 10).unwrap();
+
+    assert_eq!(analytics.overview.row_count, 2);
+    assert_eq!(analytics.overview.distinct_senders, 1);
+    assert_eq!(analytics.overview.distinct_recipients, 1);
+    assert_eq!(analytics.overview.distinct_edrpou, 1);
+    assert_eq!(analytics.overview.distinct_trademarks, 1);
+    assert_eq!(analytics.overview.distinct_product_codes, 1);
+    assert_eq!(analytics.overview.distinct_origin_countries, 1);
+
+    let senders = analytics_section(&analytics.company_sections, AnalyticsSectionKind::Senders);
+    assert_eq!(senders.rows[0].label, "REAL SUPPLIER LTD");
+    let edrpou = analytics_section(&analytics.company_sections, AnalyticsSectionKind::Edrpou);
+    assert_eq!(edrpou.rows[0].label, "12345678");
+    let trademarks = analytics_section(
+        &analytics.product_sections,
+        AnalyticsSectionKind::Trademarks,
+    );
+    assert_eq!(trademarks.rows[0].label, "Apple");
+}
+
+#[test]
 fn analytics_builds_decision_sections_for_trade_questions() {
     let dir = tempfile::tempdir().unwrap();
     let xlsx = dir.path().join("analytics_sections.xlsx");
@@ -1259,5 +1470,8 @@ fn value_normalization() {
     assert_eq!(parse_number("1 234,56"), Some(1234.56));
     assert_eq!(parse_number("1,234.56"), Some(1234.56));
     assert_eq!(parse_number("$ 300,25"), Some(300.25));
+    assert_eq!(parse_number("13804.656"), Some(13804.656));
+    assert_eq!(parse_number("20560.176"), Some(20560.176));
+    assert_eq!(parse_number("0.368"), Some(0.368));
     assert_eq!(parse_number(""), None);
 }

@@ -22,8 +22,10 @@ const USAGE: &str = "base-search-cli — техническая проверка
   base-search-cli import <db> <file.xlsx|file.xlsb> [...]
   base-search-cli search <db> [запрос...] [--limit N] [--year Y] [--code C]
                      [--sender S] [--recipient R] [--edrpou E]
+                     [--trademark T] [--description D]
   base-search-cli analytics <db> [запрос...] [--year Y] [--code C]
                        [--sender S] [--recipient R] [--edrpou E]
+                       [--trademark T] [--description D]
   base-search-cli export <db> <out.csv|out.xlsx> [запрос...]";
 
 fn main() -> ExitCode {
@@ -198,6 +200,8 @@ fn parse_query(args: &[String]) -> (Query, u64) {
             "--sender" => filters.sender = take(&mut i),
             "--recipient" => filters.recipient = take(&mut i),
             "--edrpou" => filters.edrpou = take(&mut i),
+            "--trademark" => filters.trademark = take(&mut i),
+            "--description" => filters.description = take(&mut i),
             word => words.push(word),
         }
         i += 1;
