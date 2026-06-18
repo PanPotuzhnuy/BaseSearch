@@ -298,6 +298,7 @@ pub struct Tr {
     pub price_header_metric: &'static str,
     pub price_header_avg: &'static str,
     pub price_header_count: &'static str,
+    pub dup_first_seen: &'static str,
 }
 
 pub static UA: Tr = Tr {
@@ -491,6 +492,7 @@ pub static UA: Tr = Tr {
     price_header_metric: "показник",
     price_header_avg: "середнє",
     price_header_count: "значень",
+    dup_first_seen: "Вперше у: {}",
 };
 
 pub static RU: Tr = Tr {
@@ -684,6 +686,7 @@ pub static RU: Tr = Tr {
     price_header_metric: "показатель",
     price_header_avg: "среднее",
     price_header_count: "значений",
+    dup_first_seen: "Впервые в: {}",
 };
 
 pub static EN: Tr = Tr {
@@ -877,6 +880,7 @@ pub static EN: Tr = Tr {
     price_header_metric: "metric",
     price_header_avg: "average",
     price_header_count: "values",
+    dup_first_seen: "First seen in: {}",
 };
 
 pub static DE: Tr = Tr {
@@ -1070,6 +1074,7 @@ pub static DE: Tr = Tr {
     price_header_metric: "Kennzahl",
     price_header_avg: "Mittel",
     price_header_count: "Werte",
+    dup_first_seen: "Zuerst gesehen in: {}",
 };
 
 pub static ES: Tr = Tr {
@@ -1263,6 +1268,7 @@ pub static ES: Tr = Tr {
     price_header_metric: "indicador",
     price_header_avg: "media",
     price_header_count: "valores",
+    dup_first_seen: "Visto por primera vez en: {}",
 };
 
 pub static FR: Tr = Tr {
@@ -1456,6 +1462,7 @@ pub static FR: Tr = Tr {
     price_header_metric: "indicateur",
     price_header_avg: "moyenne",
     price_header_count: "valeurs",
+    dup_first_seen: "Vu pour la première fois dans : {}",
 };
 
 pub static PL: Tr = Tr {
@@ -1649,6 +1656,7 @@ pub static PL: Tr = Tr {
     price_header_metric: "wskaźnik",
     price_header_avg: "średnia",
     price_header_count: "wartości",
+    dup_first_seen: "Pierwszy raz w: {}",
 };
 
 pub static PT: Tr = Tr {
@@ -1842,6 +1850,7 @@ pub static PT: Tr = Tr {
     price_header_metric: "indicador",
     price_header_avg: "média",
     price_header_count: "valores",
+    dup_first_seen: "Visto pela primeira vez em: {}",
 };
 
 pub static RO: Tr = Tr {
@@ -2035,6 +2044,7 @@ pub static RO: Tr = Tr {
     price_header_metric: "indicator",
     price_header_avg: "medie",
     price_header_count: "valori",
+    dup_first_seen: "Prima dată în: {}",
 };
 
 pub static HU: Tr = Tr {
@@ -2228,6 +2238,7 @@ pub static HU: Tr = Tr {
     price_header_metric: "mutató",
     price_header_avg: "átlag",
     price_header_count: "értékek",
+    dup_first_seen: "Először itt látható: {}",
 };
 
 pub static BG: Tr = Tr {
@@ -2421,6 +2432,7 @@ pub static BG: Tr = Tr {
     price_header_metric: "показател",
     price_header_avg: "средно",
     price_header_count: "стойности",
+    dup_first_seen: "За първи път в: {}",
 };
 
 pub static BE: Tr = Tr {
@@ -2614,6 +2626,7 @@ pub static BE: Tr = Tr {
     price_header_metric: "паказчык",
     price_header_avg: "сярэдняе",
     price_header_count: "значэнняў",
+    dup_first_seen: "Упершыню ў: {}",
 };
 
 pub static ZH: Tr = Tr {
@@ -2807,6 +2820,7 @@ pub static ZH: Tr = Tr {
     price_header_metric: "指标",
     price_header_avg: "平均",
     price_header_count: "样本数",
+    dup_first_seen: "首次出现于：{}",
 };
 
 pub fn tr(lang: Lang) -> &'static Tr {

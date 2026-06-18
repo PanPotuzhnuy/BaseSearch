@@ -2,7 +2,7 @@
 //! Cyrillic-aware filters, and CSV/XLSX export.
 
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base_search::db::{
     AnalyticsFilterField, AnalyticsScope, AnalyticsSectionKind, Db, Filters, PivotDim, PivotLimits,
@@ -10,8 +10,8 @@ use base_search::db::{
     fts_prefix_terms, parse_number, pivot_filter_action,
 };
 use base_search::export;
-use base_search::import::{self, collapse_ws, normalize_date, normalize_value};
-use base_search::schema::{COLUMNS, RESULT_COLUMNS, col_index};
+use base_search::import::{self, ImportPhase, collapse_ws, normalize_date, normalize_value};
+use base_search::schema::{COLUMNS, RESULT_COLUMNS, col_index, column_glossary};
 use calamine::Reader;
 
 #[test]
@@ -36,6 +36,47 @@ fn result_table_exposes_all_source_columns() {
         .chain(std::iter::once("source_file"))
         .collect();
     assert_eq!(RESULT_COLUMNS.as_slice(), expected.as_slice());
+}
+
+#[test]
+fn column_glossary_covers_abbreviated_table_headers() {
+    for name in [
+        "clearance_time",
+        "customs_office",
+        "declaration_number",
+        "trade_country",
+        "dispatch_country",
+        "origin_country",
+        "delivery_terms",
+        "delivery_place",
+        "quantity",
+        "unit",
+        "declaration_weight",
+        "currency_control_value",
+        "movement_feature",
+        "field_43",
+        "field_43_01",
+        "rfv_usd_kg",
+        "unit_weight",
+        "weight_difference",
+        "contract",
+        "field_3001",
+        "field_3002",
+        "field_9610",
+        "rmv_net_usd_kg",
+        "rmv_usd_extra_unit",
+        "rmv_gross_usd_kg",
+        "zed_purpose",
+        "min_base_usd_kg",
+        "min_base_difference",
+        "preferential",
+        "full_rate",
+    ] {
+        assert!(
+            column_glossary(name).is_some(),
+            "missing glossary for {name}"
+        );
+    }
 }
 
 #[test]
@@ -137,8 +178,8 @@ fn import_search_filter_export() {
     assert_eq!(db.total_rows(), 3);
     assert_eq!(db.unindexed_rows(), 0);
 
-    // A file with the same rows plus one new row: overlapping rows are removed
-    // by row-level deduplication, and the new row is inserted.
+    // A file with the same rows plus one new row: overlapping rows stay visible
+    // in Results, but are flagged as duplicates for Analytics.
     let xlsx2 = dir.path().join("test2.xlsx");
     let mut rows2 = sample_rows();
     rows2.push(vec![
@@ -154,30 +195,31 @@ fn import_search_filter_export() {
     write_test_xlsx(&xlsx2, &rows2);
     let summary2 = import::import_file(&mut db, &xlsx2, &cancel, &mut |_, _, _| {});
     assert_eq!(summary2.error, None);
-    assert_eq!(summary2.imported, 1);
+    assert_eq!(summary2.imported, 4);
     assert_eq!(summary2.duplicates, 3);
-    assert_eq!(db.total_rows(), 4);
+    assert_eq!(db.total_rows(), 7);
 
     // FTS: exact word matching, case-insensitive for Cyrillic text.
     let q = |text: &str| Query {
         text: text.into(),
         ..Default::default()
     };
-    assert_eq!(db.count(&q("виноградне")).unwrap(), 1);
-    assert_eq!(db.count(&q("ВИНОГРАДНЕ")).unwrap(), 1);
+    assert_eq!(db.count(&q("виноградне")).unwrap(), 2);
+    assert_eq!(db.count(&q("ВИНОГРАДНЕ")).unwrap(), 2);
     // Explicit prefix search with an asterisk.
-    assert_eq!(db.count(&q("виноград*")).unwrap(), 1);
+    assert_eq!(db.count(&q("виноград*")).unwrap(), 2);
     // Numeric product codes are automatically treated as prefixes.
-    assert_eq!(db.count(&q("8504")).unwrap(), 1);
+    assert_eq!(db.count(&q("8504")).unwrap(), 2);
     // Search by declaration number.
-    assert_eq!(db.count(&q("24UA100110000002U2")).unwrap(), 1);
+    assert_eq!(db.count(&q("24UA100110000002U2")).unwrap(), 2);
     // Multiple words are combined as AND.
-    assert_eq!(db.count(&q("вино біле")).unwrap(), 1);
+    assert_eq!(db.count(&q("вино біле")).unwrap(), 2);
     assert_eq!(db.count(&q("вино червоне")).unwrap(), 0);
 
     // The date is normalized to ISO and the year is extracted.
-    let (_, rows) = db.search_page(&q("8504"), 10, 0).unwrap();
+    let (_, rows, dups) = db.search_page(&q("8504"), 10, 0).unwrap();
     assert_eq!(rows[0][result_col("declaration_date")], "2024-03-17");
+    assert_eq!(dups[0], Some("test.xlsx".to_string()));
 
     // Filters.
     let filters = Filters {
@@ -188,7 +230,9 @@ fn import_search_filter_export() {
         text: String::new(),
         filters: filters.clone(),
     };
-    assert_eq!(db.count(&fq).unwrap(), 4);
+    assert_eq!(db.count(&fq).unwrap(), 7);
+    let analytics = db.analytics(&fq, 10).unwrap();
+    assert_eq!(analytics.overview.row_count, 4);
 
     // Recipient filter: Cyrillic text in a different case.
     let filters = Filters {
@@ -201,7 +245,7 @@ fn import_search_filter_export() {
             filters
         })
         .unwrap(),
-        1
+        2
     );
 
     // Product code filter: prefix matching.
@@ -215,7 +259,7 @@ fn import_search_filter_export() {
             filters
         })
         .unwrap(),
-        1
+        2
     );
 
     // EDRPOU filter: exact match.
@@ -229,7 +273,7 @@ fn import_search_filter_export() {
             filters
         })
         .unwrap(),
-        1
+        2
     );
 
     // Combination: text query plus country filter, with case-insensitive text.
@@ -243,7 +287,7 @@ fn import_search_filter_export() {
             filters
         })
         .unwrap(),
-        1
+        2
     );
     // The same query with a different country must return no rows.
     let filters = Filters {
@@ -260,9 +304,10 @@ fn import_search_filter_export() {
     );
 
     // Record details card.
-    let (ids, _) = db.search_page(&q("8504"), 10, 0).unwrap();
+    let (ids, _, dups) = db.search_page(&q("8504"), 10, 0).unwrap();
+    assert_eq!(dups[0], Some("test.xlsx".to_string()));
     let card = db.record_card(ids[0]).unwrap();
-    assert_eq!(card.source_file, "test.xlsx");
+    assert_eq!(card.source_file, "test2.xlsx");
     assert!(
         card.fields
             .iter()
@@ -272,7 +317,7 @@ fn import_search_filter_export() {
     // CSV export: BOM plus all rows.
     let csv_path = dir.path().join("out.csv");
     let n = export::export(&db, &Query::default(), &csv_path, &cancel, |_, _| {}).unwrap();
-    assert_eq!(n, 4);
+    assert_eq!(n, 7);
     let bytes = std::fs::read(&csv_path).unwrap();
     assert_eq!(&bytes[..3], b"\xEF\xBB\xBF");
     let text = String::from_utf8(bytes[3..].to_vec()).unwrap();
@@ -282,10 +327,10 @@ fn import_search_filter_export() {
     // XLSX export: opens successfully and contains all data rows.
     let xlsx_out = dir.path().join("out.xlsx");
     let n = export::export(&db, &Query::default(), &xlsx_out, &cancel, |_, _| {}).unwrap();
-    assert_eq!(n, 4);
+    assert_eq!(n, 7);
     let mut wb: calamine::Xlsx<_> = calamine::open_workbook(&xlsx_out).unwrap();
     let range = wb.worksheet_range_at(0).unwrap().unwrap();
-    assert_eq!(range.height(), 5); // header + 4 rows
+    assert_eq!(range.height(), 8); // header + 7 rows
 }
 
 #[test]
@@ -454,6 +499,24 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
         "APPLE DISTRIBUTION INTERNATIONAL LTD"
     );
     assert_eq!(profile.top_origin_countries[0].label, "CN");
+    assert_eq!(
+        analytics_section(&profile.product_sections, AnalyticsSectionKind::Trademarks).rows[0]
+            .label,
+        "Apple"
+    );
+    assert_eq!(
+        analytics_section(
+            &profile.country_sections,
+            AnalyticsSectionKind::OriginCountries
+        )
+        .rows[0]
+            .label,
+        "CN"
+    );
+    assert_eq!(
+        price_metric(&profile.price_sections, PriceMetricKind::ValuePerNetKg).count,
+        2
+    );
     // Both months in which this company imported are present.
     let months: Vec<&str> = profile.months.iter().map(|m| m.month.as_str()).collect();
     assert_eq!(months, vec!["2024-03", "2025-01"]);
@@ -1101,7 +1164,7 @@ fn import_registry_format() {
         text: "освітлювальні".into(),
         ..Default::default()
     };
-    let (ids, rows) = db.search_page(&q, 10, 0).unwrap();
+    let (ids, rows, _dups) = db.search_page(&q, 10, 0).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][result_col("declaration_date")], "2024-11-01"); // date converted from serial number
     assert_eq!(
@@ -1214,7 +1277,7 @@ fn import_registry_format_im12_variant() {
         text: "climaguard".into(),
         ..Default::default()
     };
-    let (ids, rows) = db.search_page(&q, 10, 0).unwrap();
+    let (ids, rows, _dups) = db.search_page(&q, 10, 0).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][result_col("declaration_date")], "2024-12-01");
     assert_eq!(
@@ -1295,7 +1358,7 @@ fn import_generic_format_with_title_rows() {
         text: "преобразователь".into(),
         ..Default::default()
     };
-    let (ids, rows) = db.search_page(&q, 10, 0).unwrap();
+    let (ids, rows, _dups) = db.search_page(&q, 10, 0).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][result_col("declaration_date")], "2024-03-15");
     assert_eq!(
@@ -1337,6 +1400,86 @@ fn duplicate_file_skipped_by_content_hash() {
     let third = import::import_file(&mut db, &copy, &cancel, &mut |_, _, _| {});
     assert_eq!(third.skipped_duplicate_of, Some("data.xlsx".to_string()));
     assert_eq!(db.total_rows(), 3);
+}
+
+#[test]
+fn records_schema_migration_preserves_rows_and_invalidates_old_file_hashes() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("legacy.xlsx");
+    write_test_xlsx(&xlsx, &sample_rows());
+    let db_path = dir.path().join("legacy.db");
+    let mut db = Db::open(&db_path).unwrap();
+    let cancel = AtomicBool::new(false);
+
+    let first = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(first.error, None);
+    assert_eq!(db.total_rows(), 3);
+    db.meta_set("records_schema", "1");
+    db.conn
+        .execute("UPDATE import_log SET file_hash = 'legacy-hash'", [])
+        .unwrap();
+    drop(db);
+
+    let mut db = Db::open(&db_path).unwrap();
+    assert_eq!(db.total_rows(), 3);
+    assert_eq!(db.find_import_by_hash("legacy-hash"), None);
+    assert_eq!(db.unindexed_rows(), 3);
+    db.index_fts(&cancel, |_, _| {}).unwrap();
+    assert_eq!(
+        db.count(&Query {
+            text: "виноградне".into(),
+            ..Default::default()
+        })
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn cancelled_import_rolls_back_inserted_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("large.xlsx");
+    let db_path = dir.path().join("large.db");
+    let mut rows = Vec::new();
+    for i in 0..8_300 {
+        rows.push(vec![
+            (
+                "declaration_number".to_string(),
+                format!("24UA100110{:06}U1", i),
+            ),
+            ("declaration_date".to_string(), "15.03.2024".to_string()),
+            ("sender".to_string(), format!("SUPPLIER {i}")),
+            ("edrpou".to_string(), format!("{:08}", i % 100_000_000)),
+            ("recipient".to_string(), "ROLLBACK TEST LLC".to_string()),
+            ("product_code".to_string(), "8517130000".to_string()),
+            (
+                "description".to_string(),
+                format!("Rollback import row {i}"),
+            ),
+            ("trade_country".to_string(), "CN".to_string()),
+        ]);
+    }
+    write_owned_test_xlsx(&xlsx, &rows);
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |phase, done, _| {
+        if phase == ImportPhase::Inserting && done >= 8_192 {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    });
+
+    assert_eq!(summary.error, None);
+    assert!(summary.cancelled);
+    assert_eq!(db.total_rows(), 0);
+
+    let retry_cancel = AtomicBool::new(false);
+    let retry = import::import_file(&mut db, &xlsx, &retry_cancel, &mut |_, _, _| {});
+    assert_eq!(retry.error, None);
+    assert!(!retry.cancelled);
+    assert_eq!(retry.imported, 8_300);
+    assert_eq!(retry.duplicates, 0);
+    assert_eq!(db.total_rows(), 8_300);
 }
 
 #[test]
@@ -1433,9 +1576,56 @@ fn sender_filter_with_short_tokens_is_correct() {
         filters,
     };
     assert_eq!(db.count(&q).unwrap(), 1);
-    let (_, rows) = db.search_page(&q, 10, 0).unwrap();
+    let (_, rows, _dups) = db.search_page(&q, 10, 0).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][result_col("edrpou")], "10000001");
+}
+
+#[test]
+fn bare_numeric_search_is_scoped_to_product_code_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("numeric.xlsx");
+    let db_path = dir.path().join("numeric.db");
+    write_test_xlsx(
+        &xlsx,
+        &[
+            vec![
+                ("declaration_number", "24UA0000001U1"),
+                ("declaration_date", "15.03.2024"),
+                ("sender", "POWER SUPPLY CO"),
+                ("edrpou", "10000001"),
+                ("recipient", "TECH IMPORT LLC"),
+                ("product_code", "8504405500"),
+                ("description", "Static converter"),
+            ],
+            vec![
+                ("declaration_number", "24UA0000002U2"),
+                ("declaration_date", "16.03.2024"),
+                ("sender", "MANUALS CO"),
+                ("edrpou", "10000002"),
+                ("recipient", "DOCS IMPORT LLC"),
+                ("product_code", "4901990000"),
+                ("description", "Manual references 8504 compliance"),
+            ],
+        ],
+    );
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+
+    let code_query = Query {
+        text: "8504".into(),
+        ..Default::default()
+    };
+    assert_eq!(db.count(&code_query).unwrap(), 1);
+    let (_, rows, _) = db.search_page(&code_query, 10, 0).unwrap();
+    assert_eq!(rows[0][result_col("product_code")], "8504405500");
+
+    let text_query = Query {
+        text: "compliance".into(),
+        ..Default::default()
+    };
+    assert_eq!(db.count(&text_query).unwrap(), 1);
 }
 
 #[test]

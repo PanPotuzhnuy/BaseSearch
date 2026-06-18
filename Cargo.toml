@@ -1,6 +1,6 @@
 [package]
 name = "base-search"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2024"
 description = "Base Search — локальный поиск по большим Excel-базам"
 license = "MIT"
@@ -27,6 +27,7 @@ egui_extras = "0.34.3"
 rfd = "0.17.2"
 rusqlite = { version = "0.40.1", features = ["bundled", "functions"] }
 rust_xlsxwriter = { version = "0.95.0", features = ["constant_memory"] }
+serde_json = "1.0"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 [dev-dependencies]

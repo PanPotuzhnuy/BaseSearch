@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Base Search</title>
+    <link rel="stylesheet" href="/assets/app.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark">BS</div>
+          <div>
+            <div class="brand-title">Base Search</div>
+            <div class="brand-subtitle" id="db-status">Локальная база</div>
+          </div>
+        </div>
+
+        <form class="search-form" id="search-form" role="search">
+          <input
+            id="text"
+            name="text"
+            autocomplete="off"
+            data-i18n-ph="search_hint"
+            placeholder="Товар, компания, код товара, № декларации, бренд…"
+          />
+          <button class="primary" type="submit" data-i18n="find">Найти</button>
+        </form>
+
+        <div class="top-actions">
+          <select id="lang-select" title="Language"></select>
+          <button id="export-page" type="button" data-i18n="export" title="CSV">CSV</button>
+          <button id="refresh" type="button" title="↻">↻</button>
+        </div>
+      </header>
+
+      <main class="workbench">
+        <aside class="filters">
+          <div class="side-title" data-i18n="filters">Фильтры</div>
+          <label><span data-i18n="year">Год</span><input id="year" inputmode="numeric" placeholder="2024" /></label>
+          <label><span data-i18n="product_code">Код товара</span><input id="product_code" placeholder="8517" /></label>
+          <label><span data-i18n="edrpou">ЕДРПОУ</span><input id="edrpou" placeholder="12345678" /></label>
+          <label><span data-i18n="trademark">Торговая марка</span><input id="trademark" placeholder="Apple" /></label>
+          <label><span data-i18n="recipient">Получатель</span><input id="recipient" placeholder="—" /></label>
+          <label><span data-i18n="sender">Отправитель</span><input id="sender" placeholder="—" /></label>
+          <label><span data-i18n="description">Описание</span><input id="description" placeholder="iPhone…" /></label>
+          <label><span data-i18n="origin_country">Страна происхождения</span><input id="origin_country" placeholder="CN" /></label>
+          <label><span data-i18n="dispatch_country">Страна отправления</span><input id="dispatch_country" placeholder="PL" /></label>
+          <label><span data-i18n="trade_country">Страна торговли</span><input id="trade_country" placeholder="IE" /></label>
+          <button class="clear" id="clear-filters" type="button" data-i18n="clear_filters">Сбросить фильтры</button>
+        </aside>
+
+        <section class="main-panel">
+          <nav class="tabs">
+            <button class="tab active" data-tab="results" type="button" data-i18n="results_tab">Результаты</button>
+            <button class="tab" data-tab="analytics" type="button" data-i18n="analytics">Аналитика</button>
+          </nav>
+
+          <section class="tab-panel active" id="results-panel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title" data-i18n="results_tab">Результаты</div>
+                <div class="panel-subtitle" id="results-meta">—</div>
+              </div>
+              <div class="pager">
+                <button id="prev-page" type="button">‹</button>
+                <span id="page-label">1</span>
+                <button id="next-page" type="button">›</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table id="results-table">
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="tab-panel" id="analytics-panel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title" data-i18n="analytics">Аналитика</div>
+                <div class="panel-subtitle" id="analytics-meta">—</div>
+              </div>
+              <select id="analytics-limit" title="Top N">
+                <option value="10">Топ 10</option>
+                <option value="25">Топ 25</option>
+                <option value="50">Топ 50</option>
+              </select>
+            </div>
+            <nav class="subtabs" id="analytics-subtabs">
+              <button class="chip active" data-group="overview" type="button" data-i18n="tab_overview">Обзор</button>
+              <button class="chip" data-group="companies" type="button" data-i18n="companies_section">Компании</button>
+              <button class="chip" data-group="goods" type="button" data-i18n="products_section">Товары</button>
+              <button class="chip" data-group="countries" type="button" data-i18n="countries_section">Страны</button>
+              <button class="chip" data-group="prices" type="button" data-i18n="prices_section">Цены</button>
+            </nav>
+            <div class="analytics-scroll" id="analytics-scroll">
+              <div class="empty" data-i18n="analytics_hint">Введите запрос или фильтр.</div>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <div class="backdrop" id="backdrop"></div>
+    <aside class="drawer" id="drawer" aria-hidden="true">
+      <div class="drawer-head">
+        <div>
+          <div class="drawer-title" id="drawer-title">—</div>
+          <div class="drawer-subtitle" id="drawer-subtitle"></div>
+        </div>
+        <button id="drawer-close" type="button" data-i18n="close">Закрыть</button>
+      </div>
+      <div id="drawer-body" class="drawer-body"></div>
+    </aside>
+
+    <div class="modal-overlay" id="modal" aria-hidden="true">
+      <div class="modal">
+        <div class="modal-head">
+          <div class="modal-title" id="modal-title">—</div>
+          <input id="modal-search" class="modal-search" autocomplete="off" />
+          <button id="modal-copy" type="button" data-i18n="copy_visible">Копировать</button>
+          <button id="modal-close" type="button">✕</button>
+        </div>
+        <div class="modal-meta" id="modal-meta"></div>
+        <div class="modal-body">
+          <table id="modal-table">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

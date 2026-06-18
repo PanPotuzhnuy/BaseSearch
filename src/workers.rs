@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
 
 use crate::db::{
@@ -71,12 +71,18 @@ pub struct ImportEvent {
 }
 
 pub enum Msg {
-    SearchDone {
+    SearchPage {
         generation: u64,
         ids: Vec<i64>,
         rows: Vec<Vec<String>>,
-        total: u64,
+        /// Per row: Some(first file) if it is a kept duplicate, else None.
+        dups: Vec<Option<String>>,
+        has_next: bool,
         ms: u64,
+    },
+    SearchCount {
+        generation: u64,
+        total: u64,
     },
     SearchError {
         generation: u64,
@@ -114,6 +120,11 @@ pub enum Msg {
 
 pub const PAGE_SIZE: u64 = 100;
 
+enum SearchCountReq {
+    Count { q: Box<Query>, generation: u64 },
+    ClearCache,
+}
+
 /// Persistent search thread with its own connection and COUNT cache.
 pub fn spawn_search_worker(
     db_path: PathBuf,
@@ -130,7 +141,9 @@ pub fn spawn_search_worker(
                 return;
             }
         };
-        let mut count_cache: Option<(Query, u64)> = None;
+        let (count_tx, count_rx) = channel::<SearchCountReq>();
+        spawn_search_count_worker(db_path.clone(), count_rx, tx.clone(), ctx.clone());
+
         while let Ok(req) = rx.recv() {
             match req {
                 WorkerReq::Search {
@@ -139,30 +152,48 @@ pub fn spawn_search_worker(
                     generation,
                 } => {
                     let started = Instant::now();
-                    let total = match count_cache.as_ref().filter(|(cq, _)| cq == q.as_ref()) {
-                        Some((_, n)) => Ok(*n),
-                        None => db.count(&q),
-                    };
-                    let result = total.and_then(|total| {
-                        count_cache = Some(((*q).clone(), total));
-                        let (ids, rows) = db.search_page(&q, PAGE_SIZE, page * PAGE_SIZE)?;
-                        Ok((ids, rows, total))
-                    });
-                    let msg = match result {
-                        Ok((ids, rows, total)) => Msg::SearchDone {
-                            generation,
-                            ids,
-                            rows,
-                            total,
-                            ms: started.elapsed().as_millis() as u64,
-                        },
-                        Err(e) => Msg::SearchError {
-                            generation,
-                            message: e.to_string(),
-                        },
-                    };
-                    let _ = tx.send(msg);
-                    ctx.request_repaint();
+                    let result = db.search_page(&q, PAGE_SIZE + 1, page * PAGE_SIZE);
+                    match result {
+                        Ok((mut ids, mut rows, mut dups)) => {
+                            let empty_first_page = page == 0 && ids.is_empty();
+                            let has_next = rows.len() as u64 > PAGE_SIZE;
+                            if has_next {
+                                ids.truncate(PAGE_SIZE as usize);
+                                rows.truncate(PAGE_SIZE as usize);
+                                dups.truncate(PAGE_SIZE as usize);
+                            }
+                            let msg = Msg::SearchPage {
+                                generation,
+                                ids,
+                                rows,
+                                dups,
+                                has_next,
+                                ms: started.elapsed().as_millis() as u64,
+                            };
+                            let _ = tx.send(msg);
+                            ctx.request_repaint();
+
+                            if empty_first_page {
+                                let _ = tx.send(Msg::SearchCount {
+                                    generation,
+                                    total: 0,
+                                });
+                                ctx.request_repaint();
+                            } else {
+                                let _ = count_tx.send(SearchCountReq::Count {
+                                    q: Box::new((*q).clone()),
+                                    generation,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Msg::SearchError {
+                                generation,
+                                message: e.to_string(),
+                            });
+                            ctx.request_repaint();
+                        }
+                    }
                 }
                 WorkerReq::Analytics {
                     q,
@@ -278,11 +309,72 @@ pub fn spawn_search_worker(
                     ctx.request_repaint();
                 }
                 WorkerReq::Stats => {
-                    count_cache = None;
+                    let _ = count_tx.send(SearchCountReq::ClearCache);
                     let _ = tx.send(Msg::Stats(db.total_rows()));
                     ctx.request_repaint();
                 }
             }
+        }
+    });
+}
+
+fn spawn_search_count_worker(
+    db_path: PathBuf,
+    rx: Receiver<SearchCountReq>,
+    tx: Sender<Msg>,
+    ctx: egui::Context,
+) {
+    std::thread::spawn(move || {
+        let db = match Db::open(&db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                let _ = tx.send(Msg::Fatal(e));
+                ctx.request_repaint();
+                return;
+            }
+        };
+        let mut count_cache: Option<(Query, u64)> = None;
+        while let Ok(req) = rx.recv() {
+            let mut count_req = match req {
+                SearchCountReq::Count { q, generation } => Some((*q, generation)),
+                SearchCountReq::ClearCache => {
+                    count_cache = None;
+                    None
+                }
+            };
+            while let Ok(req) = rx.try_recv() {
+                match req {
+                    SearchCountReq::Count { q, generation } => {
+                        count_req = Some((*q, generation));
+                    }
+                    SearchCountReq::ClearCache => {
+                        count_cache = None;
+                        count_req = None;
+                    }
+                }
+            }
+
+            let Some((q, generation)) = count_req else {
+                continue;
+            };
+            let msg = match count_cache.as_ref().filter(|(cq, _)| cq == &q) {
+                Some((_, total)) => Msg::SearchCount {
+                    generation,
+                    total: *total,
+                },
+                None => match db.count(&q) {
+                    Ok(total) => {
+                        count_cache = Some((q, total));
+                        Msg::SearchCount { generation, total }
+                    }
+                    Err(e) => Msg::SearchError {
+                        generation,
+                        message: e.to_string(),
+                    },
+                },
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
         }
     });
 }

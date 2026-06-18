@@ -518,26 +518,54 @@ pub fn import_file(
         }
     };
 
-    match import_file_inner(db, path, &file_name, cancel, progress, &mut summary) {
-        Ok(()) => {}
-        Err(e) => summary.error = Some(e),
+    let mut committed = false;
+    match db.begin_import_file() {
+        Ok(()) => match import_file_inner(db, path, &file_name, cancel, progress, &mut summary) {
+            Ok(()) if !summary.cancelled => match db.commit_import_file() {
+                Ok(()) => {
+                    committed = true;
+                }
+                Err(e) => {
+                    summary.error = Some(e.to_string());
+                    db.rollback_import_file();
+                }
+            },
+            Ok(()) => {
+                db.rollback_import_file();
+                summary.imported = 0;
+                summary.duplicates = 0;
+            }
+            Err(e) => {
+                summary.error = Some(e);
+                db.rollback_import_file();
+                summary.imported = 0;
+                summary.duplicates = 0;
+            }
+        },
+        Err(e) => summary.error = Some(e.to_string()),
+    }
+    if committed {
+        progress(ImportPhase::Indexing, 0, 0);
+        match db.index_fts(cancel, |done, total| {
+            progress(ImportPhase::Indexing, done, total)
+        }) {
+            Ok((_, fts_cancelled)) => {
+                summary.cancelled |= fts_cancelled;
+            }
+            Err(e) => summary.error = Some(e.to_string()),
+        }
     }
     summary.seconds = started.elapsed().as_secs_f64();
-    if summary.error.is_none() {
+    if committed {
         // Store the hash only for fully imported files, so interrupted imports
         // can be retried.
-        let hash = if summary.cancelled {
-            None
-        } else {
-            Some(file_hash.as_str())
-        };
         db.add_import_log(
             &file_name,
             summary.total_rows,
             summary.imported,
             summary.duplicates,
             summary.seconds,
-            hash,
+            Some(file_hash.as_str()),
         );
     }
     summary
@@ -764,14 +792,6 @@ impl RowSink<'_> {
             return Err(self.missing_error());
         }
         self.flush_batch()?;
-        (self.progress)(ImportPhase::Indexing, 0, 0);
-        let (_, fts_cancelled) = self
-            .db
-            .index_fts(self.cancel, |done, total| {
-                (self.progress)(ImportPhase::Indexing, done, total)
-            })
-            .map_err(|e| e.to_string())?;
-        self.summary.cancelled |= fts_cancelled;
         Ok(())
     }
 

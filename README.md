@@ -1,4 +1,4 @@
-# Base Search 1.1.1
+# Base Search 1.2.0
 
 [![CI](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml)
 
@@ -24,7 +24,14 @@ on the user's computer.
 - Filter by year, product code, company, organization code, and country fields.
 - View all imported source columns in the result table, including value, price,
   weight, rate, and technical customs fields when they exist in the source data.
+- Hover abbreviated customs headers to see what fields such as `43`,
+  `43_01`, `ФВ вал.контр`, `РФВ`, `РМВ`, `Вага по МД`, `Умови пост.`,
+  `3001`, `3002`, and `9610` mean.
 - Open a full details view for any result row.
+- Use the **Questions** menu to jump from a current product, company, code,
+  year, or country filter to the right analytical view: who imported it, what
+  was moved, which countries dominate, how prices look, or how values changed
+  by month.
 - Open a separate Analytics tab for the current search/filter set: product
   rows, unique declarations, companies, value, net/gross weight, average value
   per kg, product codes, brands, countries, and price indicators.
@@ -36,6 +43,9 @@ on the user's computer.
   represents.
 - Copy single values, whole rows, or selected rows back into Excel.
 - Export search results to CSV or XLSX.
+- Open an optional local browser interface on `127.0.0.1` for searching,
+  viewing tables, opening row cards, and reading analytics in a regular
+  browser. This is still local: it is not an internet service.
 - Keep the interface responsive while importing, searching, exporting, or
   cleaning the database.
 - Use light/dark theme, adjustable UI scale, and a 13-language interface
@@ -71,6 +81,16 @@ Run the prebuilt application — no install needed:
 ```text
 dist\BaseSearch\BaseSearch.exe
 ```
+
+For the browser interface, run:
+
+```text
+dist\BaseSearch\BaseSearch.exe --web
+```
+
+The app opens a local page such as `http://127.0.0.1:7832`. The page talks only
+to the program running on the same computer; Excel files and the database are
+not uploaded to the internet.
 
 ### macOS (copy-paste)
 
@@ -119,12 +139,52 @@ file does not exist, it is created automatically.
 3. Type a query: product description, company name, product code, declaration
    number, trademark, or country.
 4. Narrow results with filters when needed.
-5. Open **Analytics** to understand the current query: who moved the goods,
+5. Use **Questions** for guided shortcuts when you know the business question
+   but do not want to choose the tab manually.
+6. Open **Analytics** to understand the current query: who moved the goods,
    what goods dominate, where they came from, and what the value/weight picture
    looks like.
-6. Double-click a row to open its full details.
-7. Right-click a row for quick copy and quick filter actions.
-8. Export the current result set to CSV or XLSX.
+7. Double-click a row to open its full details.
+8. Right-click a row for quick copy and quick filter actions.
+9. Export the current result set to CSV or XLSX.
+
+## Guided Questions
+
+The **Questions** menu turns common trade-data questions into one-click
+navigation. It reads the current search text and filters and offers relevant
+shortcuts:
+
+- for a product, brand, product code, or free-text search: who imported it,
+  every company/EDRPOU, product-code and brand breakdowns, countries, prices,
+  monthly dynamics, and company-by-month comparison;
+- for a company or EDRPOU: the full company dossier, what it moved, who
+  supplied it, which countries it worked with, monthly dynamics, and
+  product-code-by-month comparison;
+- for a year/country/current slice: largest companies, dominant goods,
+  dominant routes, and price checks.
+
+The menu is translated into all supported interface languages. It does not
+guess legal responsibility for an import; it simply routes the user to the
+matching recipient, sender, EDRPOU, goods, country, price, or pivot view.
+
+## Browser Mode
+
+Base Search can also run a local browser interface:
+
+```text
+dist\BaseSearch\BaseSearch.exe --web
+```
+
+or, in the Windows distribution folder, double-click:
+
+```text
+Open Browser Mode.cmd
+```
+
+The browser opens a local address such as `http://127.0.0.1:7832`. This is a
+localhost interface, not an internet service: the database remains on the same
+computer. The local API uses a temporary token in the URL so another page in
+the browser cannot casually read the local database.
 
 ## Analytics Tab
 
@@ -257,6 +317,7 @@ base-search-cli import <db> <file.xlsx|file.xlsb> [...]
 base-search-cli search <db> [query...] [--limit N] [--year Y] [--code C]
 base-search-cli analytics <db> [query...] [--year Y] [--code C]
 base-search-cli export <db> <out.csv|out.xlsx> [query...]
+base-search-cli web [db] [--host 127.0.0.1] [--port 7832] [--no-open]
 ```
 
 The GUI is the primary user interface. The CLI is intended for troubleshooting,
@@ -303,6 +364,8 @@ build from source as above.
 - **SQLite** for local storage in a single database file.
 - **SQLite FTS5** for fast full-text search.
 - **SQLite aggregate queries** for local analytics over the current result set.
+- **Built-in localhost web interface** for optional browser-based search and
+  analytics without uploading data.
 - **xxhash** for duplicate detection.
 - **CSV and XLSX writers** for exporting results.
 
@@ -316,6 +379,24 @@ selected local spreadsheets and writes a local SQLite database beside the
 application executable.
 
 ## Changelog
+
+### 1.2.0
+
+- **Smart Questions menu.** Context-aware business questions now route the user
+  directly from the current product, company, EDRPOU, year, or country filter
+  into the right analytical view: companies, goods, countries, prices, monthly
+  dynamics, pivots, full group lists, or company dossiers. The menu is
+  translated for all 13 interface languages.
+- **Expanded column glossary.** Abbreviated customs table headers now show
+  hover explanations for technical fields such as `43`, `43_01`, `Вага по МД`,
+  `Умови пост.`, `Місце пост`, `Вага.один.`, `Вага різн.`, `3001`, `3002`,
+  `9610`, `пільгова`, `повна`, and the value/price columns.
+- **Local browser mode.** The app can start a local web interface on
+  `127.0.0.1` with token-protected API routes. The Windows distribution
+  includes `Open Browser Mode.cmd` for a double-click launch.
+- **Search and analytics workflow polish.** Recent and saved searches preserve
+  full filters, broad structural searches page faster, and analytics explains
+  how rows, declarations, totals, shares, and price metrics are calculated.
 
 ### 1.1.1
 

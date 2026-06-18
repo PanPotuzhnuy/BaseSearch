@@ -18,13 +18,16 @@ use crate::db::{
 use crate::export::ExportError;
 use crate::i18n::{Lang, Tr, fmt, group_digits, help_sections, tr};
 use crate::import::{FileSummary, ImportPhase};
-use crate::schema::{RESULT_COLUMNS, header_for};
+use crate::schema::{RESULT_COLUMNS, column_glossary, header_for};
 use crate::workers::{self, ImportEvent, Msg, PAGE_SIZE, WorkerReq};
 
 /// Interface accent color.
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(37, 99, 235);
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const FULL_SECTION_LIMIT: u64 = 20_000;
+const RECENT_QUERIES_META: &str = "recent_queries_v1";
+const SAVED_QUERIES_META: &str = "saved_queries_v1";
+const RECENT_QUERY_LIMIT: usize = 12;
 
 /// Action from the table row context menu.
 enum RowMenuAction {
@@ -62,6 +65,41 @@ enum AppTab {
 enum AnalyticsCardAction {
     Filter(AnalyticsFilterAction),
     Explore(AnalyticsSectionKind),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuidedQuestionSection {
+    Product,
+    Company,
+    Market,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuidedQuestionKind {
+    ProductCompanies,
+    ProductAllCompanies,
+    ProductGoods,
+    ProductCountries,
+    ProductPrices,
+    ProductTimeline,
+    ProductCompaniesByMonth,
+    CompanyProfile,
+    CompanyGoods,
+    CompanySuppliers,
+    CompanyCountries,
+    CompanyTimeline,
+    CompanyGoodsByMonth,
+    MarketCompanies,
+    MarketGoods,
+    MarketCountries,
+    MarketPrices,
+}
+
+enum GuidedQuestionAction {
+    Analytics(AnalyticsView),
+    Explore(AnalyticsSectionKind),
+    Pivot(PivotDim, PivotDim, PivotMetric),
+    Profile(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -220,6 +258,798 @@ fn trunc_label(s: &str, max: usize) -> String {
     out
 }
 
+fn query_summary(query: &Query, t: &Tr) -> String {
+    if query.is_empty() {
+        return t.enter_query_hint.to_string();
+    }
+    let f = &query.filters;
+    let mut parts = Vec::new();
+    if !query.text.trim().is_empty() {
+        parts.push(query.text.trim().to_string());
+    }
+    for (label, value) in [
+        (t.year, &f.year),
+        (t.product_code, &f.product_code),
+        (t.trademark, &f.trademark),
+        (t.description, &f.description),
+        (t.sender, &f.sender),
+        (t.recipient, &f.recipient),
+        (t.edrpou, &f.edrpou),
+        (t.trade_country, &f.trade_country),
+        (t.dispatch_country, &f.dispatch_country),
+        (t.origin_country, &f.origin_country),
+    ] {
+        let value = value.trim();
+        if !value.is_empty() {
+            parts.push(format!("{label}: {value}"));
+        }
+    }
+    parts.join(" · ")
+}
+
+fn encode_stored_queries(items: &[StoredQuery]) -> String {
+    items
+        .iter()
+        .map(|item| {
+            let f = &item.query.filters;
+            [
+                item.name.as_str(),
+                item.query.text.as_str(),
+                f.year.as_str(),
+                f.product_code.as_str(),
+                f.trademark.as_str(),
+                f.description.as_str(),
+                f.sender.as_str(),
+                f.recipient.as_str(),
+                f.edrpou.as_str(),
+                f.trade_country.as_str(),
+                f.dispatch_country.as_str(),
+                f.origin_country.as_str(),
+            ]
+            .iter()
+            .map(|value| encode_component(value))
+            .collect::<Vec<_>>()
+            .join("\t")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn decode_stored_queries(raw: &str) -> Vec<StoredQuery> {
+    raw.lines()
+        .filter_map(|line| {
+            let fields = line
+                .split('\t')
+                .map(decode_component)
+                .collect::<Option<Vec<_>>>()?;
+            if fields.len() != 12 {
+                return None;
+            }
+            let query = Query {
+                text: fields[1].clone(),
+                filters: Filters {
+                    year: fields[2].clone(),
+                    product_code: fields[3].clone(),
+                    trademark: fields[4].clone(),
+                    description: fields[5].clone(),
+                    sender: fields[6].clone(),
+                    recipient: fields[7].clone(),
+                    edrpou: fields[8].clone(),
+                    trade_country: fields[9].clone(),
+                    dispatch_country: fields[10].clone(),
+                    origin_country: fields[11].clone(),
+                },
+            };
+            if query.is_empty() {
+                return None;
+            }
+            let name = if fields[0].trim().is_empty() {
+                query_summary(&query, tr(Lang::En))
+            } else {
+                fields[0].clone()
+            };
+            Some(StoredQuery { name, query })
+        })
+        .collect()
+}
+
+fn encode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '\t' => out.push_str("%09"),
+            '\n' => out.push_str("%0A"),
+            '\r' => out.push_str("%0D"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn decode_component(value: &str) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hex = &value[i + 1..i + 3];
+            match hex {
+                "25" => out.push('%'),
+                "09" => out.push('\t'),
+                "0A" => out.push('\n'),
+                "0D" => out.push('\r'),
+                _ => return None,
+            }
+            i += 3;
+        } else {
+            let ch = value[i..].chars().next()?;
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    Some(out)
+}
+
+fn recent_queries_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Недавні запити",
+        Lang::Ru => "Недавние запросы",
+        _ => "Recent searches",
+    }
+}
+
+fn saved_queries_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Збережені запити",
+        Lang::Ru => "Сохранённые запросы",
+        _ => "Saved searches",
+    }
+}
+
+fn save_current_query_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Зберегти поточний запит",
+        Lang::Ru => "Сохранить текущий запрос",
+        _ => "Save current search",
+    }
+}
+
+fn empty_recent_queries_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Недавніх запитів ще немає",
+        Lang::Ru => "Недавних запросов пока нет",
+        _ => "No recent searches yet",
+    }
+}
+
+fn empty_saved_queries_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Збережених запитів ще немає",
+        Lang::Ru => "Сохранённых запросов пока нет",
+        _ => "No saved searches yet",
+    }
+}
+
+fn clear_recent_queries_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Очистити історію",
+        Lang::Ru => "Очистить историю",
+        _ => "Clear history",
+    }
+}
+
+fn guided_questions_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "Questions",
+        Lang::Ua => "Питання",
+        Lang::Ru => "Вопросы",
+        Lang::De => "Fragen",
+        Lang::Es => "Preguntas",
+        Lang::Fr => "Questions",
+        Lang::Pl => "Pytania",
+        Lang::Pt => "Perguntas",
+        Lang::Ro => "Întrebări",
+        Lang::Hu => "Kérdések",
+        Lang::Bg => "Въпроси",
+        Lang::Be => "Пытанні",
+        Lang::Zh => "问题",
+    }
+}
+
+fn guided_questions_hover(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "Smart shortcuts for the current product, company, or filtered slice.",
+        Lang::Ua => "Розумні сценарії для поточного товару, компанії або фільтра.",
+        Lang::Ru => "Умные сценарии для текущего товара, компании или фильтра.",
+        Lang::De => "Intelligente Wege für Ware, Firma oder aktuellen Filter.",
+        Lang::Es => "Atajos inteligentes para el producto, empresa o filtro actual.",
+        Lang::Fr => "Raccourcis intelligents pour le produit, l'entreprise ou le filtre actuel.",
+        Lang::Pl => "Inteligentne skróty dla towaru, firmy albo bieżącego filtra.",
+        Lang::Pt => "Atalhos inteligentes para produto, empresa ou filtro atual.",
+        Lang::Ro => "Scurtături inteligente pentru produs, companie sau filtrul curent.",
+        Lang::Hu => "Okos útvonalak az aktuális termékhez, céghez vagy szűrőhöz.",
+        Lang::Bg => "Умни преки пътища за текущия продукт, фирма или филтър.",
+        Lang::Be => "Разумныя сцэнарыі для тавару, кампаніі або бягучага фільтра.",
+        Lang::Zh => "当前商品、公司或筛选范围的智能分析入口。",
+    }
+}
+
+fn guided_questions_empty(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "Enter a product, company, code, year, or country first.",
+        Lang::Ua => "Спочатку введіть товар, компанію, код, рік або країну.",
+        Lang::Ru => "Сначала введите товар, компанию, код, год или страну.",
+        Lang::De => "Geben Sie zuerst Ware, Firma, Code, Jahr oder Land ein.",
+        Lang::Es => "Primero introduzca producto, empresa, código, año o país.",
+        Lang::Fr => "Saisissez d'abord un produit, une entreprise, un code, une année ou un pays.",
+        Lang::Pl => "Najpierw wpisz towar, firmę, kod, rok albo kraj.",
+        Lang::Pt => "Digite primeiro produto, empresa, código, ano ou país.",
+        Lang::Ro => "Introduceți mai întâi produs, companie, cod, an sau țară.",
+        Lang::Hu => "Először adjon meg terméket, céget, kódot, évet vagy országot.",
+        Lang::Bg => "Първо въведете продукт, фирма, код, година или държава.",
+        Lang::Be => "Спачатку ўвядзіце тавар, кампанію, код, год або краіну.",
+        Lang::Zh => "请先输入商品、公司、编码、年份或国家。",
+    }
+}
+
+fn guided_section_title(section: GuidedQuestionSection, lang: Lang) -> &'static str {
+    match section {
+        GuidedQuestionSection::Product => match lang {
+            Lang::En => "For this product or search",
+            Lang::Ua => "Для цього товару або запиту",
+            Lang::Ru => "По этому товару или запросу",
+            Lang::De => "Zu dieser Ware oder Suche",
+            Lang::Es => "Para este producto o búsqueda",
+            Lang::Fr => "Pour ce produit ou cette recherche",
+            Lang::Pl => "Dla tego towaru lub wyszukiwania",
+            Lang::Pt => "Para este produto ou busca",
+            Lang::Ro => "Pentru acest produs sau căutare",
+            Lang::Hu => "Ehhez a termékhez vagy kereséshez",
+            Lang::Bg => "За този продукт или търсене",
+            Lang::Be => "Для гэтага тавару або запыту",
+            Lang::Zh => "针对当前商品或搜索",
+        },
+        GuidedQuestionSection::Company => match lang {
+            Lang::En => "For this company",
+            Lang::Ua => "Для цієї компанії",
+            Lang::Ru => "По этой компании",
+            Lang::De => "Zu dieser Firma",
+            Lang::Es => "Para esta empresa",
+            Lang::Fr => "Pour cette entreprise",
+            Lang::Pl => "Dla tej firmy",
+            Lang::Pt => "Para esta empresa",
+            Lang::Ro => "Pentru această companie",
+            Lang::Hu => "Ehhez a céghez",
+            Lang::Bg => "За тази фирма",
+            Lang::Be => "Для гэтай кампаніі",
+            Lang::Zh => "针对当前公司",
+        },
+        GuidedQuestionSection::Market => match lang {
+            Lang::En => "For the current slice",
+            Lang::Ua => "Для поточної вибірки",
+            Lang::Ru => "По текущей выборке",
+            Lang::De => "Zum aktuellen Ausschnitt",
+            Lang::Es => "Para la selección actual",
+            Lang::Fr => "Pour le périmètre actuel",
+            Lang::Pl => "Dla bieżącego zakresu",
+            Lang::Pt => "Para o recorte atual",
+            Lang::Ro => "Pentru selecția curentă",
+            Lang::Hu => "Az aktuális szűréshez",
+            Lang::Bg => "За текущата извадка",
+            Lang::Be => "Для бягучай выбаркі",
+            Lang::Zh => "针对当前筛选范围",
+        },
+    }
+}
+
+fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
+    match kind {
+        GuidedQuestionKind::ProductCompanies => match lang {
+            Lang::En => "Who received or imported it?",
+            Lang::Ua => "Хто отримував або ввозив це?",
+            Lang::Ru => "Кто получал или ввозил это?",
+            Lang::De => "Wer hat es erhalten oder importiert?",
+            Lang::Es => "¿Quién lo recibió o importó?",
+            Lang::Fr => "Qui l'a reçu ou importé ?",
+            Lang::Pl => "Kto to odbierał lub importował?",
+            Lang::Pt => "Quem recebeu ou importou isso?",
+            Lang::Ro => "Cine a primit sau importat?",
+            Lang::Hu => "Ki kapta vagy importálta?",
+            Lang::Bg => "Кой го е получавал или внасял?",
+            Lang::Be => "Хто атрымліваў або ўвозіў гэта?",
+            Lang::Zh => "谁接收或进口了它？",
+        },
+        GuidedQuestionKind::ProductAllCompanies => match lang {
+            Lang::En => "Show every company and EDRPOU",
+            Lang::Ua => "Показати всі компанії та ЄДРПОУ",
+            Lang::Ru => "Показать все компании и ЕДРПОУ",
+            Lang::De => "Alle Firmen und EDRPOU anzeigen",
+            Lang::Es => "Mostrar todas las empresas y EDRPOU",
+            Lang::Fr => "Afficher toutes les entreprises et EDRPOU",
+            Lang::Pl => "Pokaż wszystkie firmy i EDRPOU",
+            Lang::Pt => "Mostrar todas as empresas e EDRPOU",
+            Lang::Ro => "Arată toate companiile și EDRPOU",
+            Lang::Hu => "Összes cég és EDRPOU megjelenítése",
+            Lang::Bg => "Покажи всички фирми и ЕДРПОУ",
+            Lang::Be => "Паказаць усе кампаніі і ЕДРПОУ",
+            Lang::Zh => "显示所有公司和EDRPOU",
+        },
+        GuidedQuestionKind::ProductGoods => match lang {
+            Lang::En => "Which product codes and brands are inside?",
+            Lang::Ua => "Які коди товару та бренди всередині?",
+            Lang::Ru => "Какие коды товара и бренды внутри?",
+            Lang::De => "Welche Warencodes und Marken stecken darin?",
+            Lang::Es => "¿Qué códigos y marcas contiene?",
+            Lang::Fr => "Quels codes produit et marques contient-il ?",
+            Lang::Pl => "Jakie kody towaru i marki są w środku?",
+            Lang::Pt => "Quais códigos de produto e marcas aparecem?",
+            Lang::Ro => "Ce coduri de produs și mărci conține?",
+            Lang::Hu => "Milyen termékkódok és márkák vannak benne?",
+            Lang::Bg => "Какви кодове и марки има вътре?",
+            Lang::Be => "Якія коды тавару і брэнды ўнутры?",
+            Lang::Zh => "包含哪些商品编码和品牌？",
+        },
+        GuidedQuestionKind::ProductCountries => match lang {
+            Lang::En => "From which countries and routes?",
+            Lang::Ua => "З яких країн і маршрутів?",
+            Lang::Ru => "Из каких стран и маршрутов?",
+            Lang::De => "Aus welchen Ländern und Routen?",
+            Lang::Es => "¿Desde qué países y rutas?",
+            Lang::Fr => "Depuis quels pays et routes ?",
+            Lang::Pl => "Z jakich krajów i tras?",
+            Lang::Pt => "De quais países e rotas?",
+            Lang::Ro => "Din ce țări și rute?",
+            Lang::Hu => "Mely országokból és útvonalakon?",
+            Lang::Bg => "От кои държави и маршрути?",
+            Lang::Be => "З якіх краін і маршрутаў?",
+            Lang::Zh => "来自哪些国家和路线？",
+        },
+        GuidedQuestionKind::ProductPrices => match lang {
+            Lang::En => "What is the price and $/kg picture?",
+            Lang::Ua => "Яка ціна та картина $/кг?",
+            Lang::Ru => "Какая картина по цене и $/кг?",
+            Lang::De => "Wie sieht Preis und $/kg aus?",
+            Lang::Es => "¿Cómo se ven precio y $/kg?",
+            Lang::Fr => "Quelle est la situation prix et $/kg ?",
+            Lang::Pl => "Jak wygląda cena i $/kg?",
+            Lang::Pt => "Como estão preço e $/kg?",
+            Lang::Ro => "Cum arată prețul și $/kg?",
+            Lang::Hu => "Milyen az ár és $/kg képe?",
+            Lang::Bg => "Как изглеждат цена и $/кг?",
+            Lang::Be => "Якая карціна па цане і $/кг?",
+            Lang::Zh => "价格和$/公斤情况如何？",
+        },
+        GuidedQuestionKind::ProductTimeline => match lang {
+            Lang::En => "How did value and weight change by month?",
+            Lang::Ua => "Як змінювались вартість і вага по місяцях?",
+            Lang::Ru => "Как менялись сумма и вес по месяцам?",
+            Lang::De => "Wie änderten sich Wert und Gewicht je Monat?",
+            Lang::Es => "¿Cómo cambiaron valor y peso por mes?",
+            Lang::Fr => "Comment valeur et poids ont-ils changé par mois ?",
+            Lang::Pl => "Jak zmieniały się wartość i waga miesięcznie?",
+            Lang::Pt => "Como valor e peso mudaram por mês?",
+            Lang::Ro => "Cum s-au schimbat valoarea și greutatea lunar?",
+            Lang::Hu => "Hogyan változott az érték és a súly havonta?",
+            Lang::Bg => "Как се променяха стойност и тегло по месеци?",
+            Lang::Be => "Як змяняліся сума і вага па месяцах?",
+            Lang::Zh => "金额和重量按月如何变化？",
+        },
+        GuidedQuestionKind::ProductCompaniesByMonth => match lang {
+            Lang::En => "Compare companies by month",
+            Lang::Ua => "Порівняти компанії по місяцях",
+            Lang::Ru => "Сравнить компании по месяцам",
+            Lang::De => "Firmen nach Monaten vergleichen",
+            Lang::Es => "Comparar empresas por mes",
+            Lang::Fr => "Comparer les entreprises par mois",
+            Lang::Pl => "Porównaj firmy według miesięcy",
+            Lang::Pt => "Comparar empresas por mês",
+            Lang::Ro => "Compară companiile pe luni",
+            Lang::Hu => "Cégek összehasonlítása hónaponként",
+            Lang::Bg => "Сравни фирмите по месеци",
+            Lang::Be => "Параўнаць кампаніі па месяцах",
+            Lang::Zh => "按月比较公司",
+        },
+        GuidedQuestionKind::CompanyProfile => match lang {
+            Lang::En => "Open the full company dossier",
+            Lang::Ua => "Відкрити повне досьє компанії",
+            Lang::Ru => "Открыть полное досье компании",
+            Lang::De => "Vollständiges Firmendossier öffnen",
+            Lang::Es => "Abrir el expediente completo de la empresa",
+            Lang::Fr => "Ouvrir le dossier complet de l'entreprise",
+            Lang::Pl => "Otwórz pełny profil firmy",
+            Lang::Pt => "Abrir o dossiê completo da empresa",
+            Lang::Ro => "Deschide dosarul complet al companiei",
+            Lang::Hu => "Teljes cégdosszié megnyitása",
+            Lang::Bg => "Отвори пълното досие на фирмата",
+            Lang::Be => "Адкрыць поўнае дасье кампаніі",
+            Lang::Zh => "打开完整公司档案",
+        },
+        GuidedQuestionKind::CompanyGoods => match lang {
+            Lang::En => "What did this company move?",
+            Lang::Ua => "Що переміщувала ця компанія?",
+            Lang::Ru => "Что возила эта компания?",
+            Lang::De => "Welche Waren bewegte diese Firma?",
+            Lang::Es => "¿Qué movió esta empresa?",
+            Lang::Fr => "Quelles marchandises cette entreprise a-t-elle traitées ?",
+            Lang::Pl => "Co przewoziła ta firma?",
+            Lang::Pt => "O que esta empresa movimentou?",
+            Lang::Ro => "Ce a transportat această companie?",
+            Lang::Hu => "Mit mozgatott ez a cég?",
+            Lang::Bg => "Какво е превозвала тази фирма?",
+            Lang::Be => "Што вазіла гэта кампанія?",
+            Lang::Zh => "这家公司运输了什么？",
+        },
+        GuidedQuestionKind::CompanySuppliers => match lang {
+            Lang::En => "Who supplied this company?",
+            Lang::Ua => "Хто постачав цій компанії?",
+            Lang::Ru => "Кто поставлял этой компании?",
+            Lang::De => "Wer belieferte diese Firma?",
+            Lang::Es => "¿Quién abasteció a esta empresa?",
+            Lang::Fr => "Qui a fourni cette entreprise ?",
+            Lang::Pl => "Kto dostarczał tej firmie?",
+            Lang::Pt => "Quem forneceu para esta empresa?",
+            Lang::Ro => "Cine a furnizat această companie?",
+            Lang::Hu => "Ki szállított ennek a cégnek?",
+            Lang::Bg => "Кой е доставял на тази фирма?",
+            Lang::Be => "Хто пастаўляў гэтай кампаніі?",
+            Lang::Zh => "谁给这家公司供货？",
+        },
+        GuidedQuestionKind::CompanyCountries => match lang {
+            Lang::En => "Which countries did it work with?",
+            Lang::Ua => "З якими країнами вона працювала?",
+            Lang::Ru => "С какими странами она работала?",
+            Lang::De => "Mit welchen Ländern arbeitete sie?",
+            Lang::Es => "¿Con qué países trabajó?",
+            Lang::Fr => "Avec quels pays a-t-elle travaillé ?",
+            Lang::Pl => "Z jakimi krajami współpracowała?",
+            Lang::Pt => "Com quais países trabalhou?",
+            Lang::Ro => "Cu ce țări a lucrat?",
+            Lang::Hu => "Mely országokkal dolgozott?",
+            Lang::Bg => "С кои държави е работила?",
+            Lang::Be => "З якімі краінамі яна працавала?",
+            Lang::Zh => "它与哪些国家往来？",
+        },
+        GuidedQuestionKind::CompanyTimeline => match lang {
+            Lang::En => "How did this company change by month?",
+            Lang::Ua => "Як ця компанія змінювалась по місяцях?",
+            Lang::Ru => "Как эта компания менялась по месяцам?",
+            Lang::De => "Wie veränderte sich diese Firma je Monat?",
+            Lang::Es => "¿Cómo cambió esta empresa por mes?",
+            Lang::Fr => "Comment cette entreprise a-t-elle évolué par mois ?",
+            Lang::Pl => "Jak firma zmieniała się miesięcznie?",
+            Lang::Pt => "Como esta empresa mudou por mês?",
+            Lang::Ro => "Cum s-a schimbat compania pe luni?",
+            Lang::Hu => "Hogyan változott a cég havonta?",
+            Lang::Bg => "Как се променяше фирмата по месеци?",
+            Lang::Be => "Як гэта кампанія змянялася па месяцах?",
+            Lang::Zh => "这家公司按月如何变化？",
+        },
+        GuidedQuestionKind::CompanyGoodsByMonth => match lang {
+            Lang::En => "Compare product codes by month",
+            Lang::Ua => "Порівняти коди товару по місяцях",
+            Lang::Ru => "Сравнить коды товара по месяцам",
+            Lang::De => "Warencodes nach Monaten vergleichen",
+            Lang::Es => "Comparar códigos de producto por mes",
+            Lang::Fr => "Comparer les codes produit par mois",
+            Lang::Pl => "Porównaj kody towarów według miesięcy",
+            Lang::Pt => "Comparar códigos de produto por mês",
+            Lang::Ro => "Compară codurile de produs pe luni",
+            Lang::Hu => "Termékkódok összehasonlítása hónaponként",
+            Lang::Bg => "Сравни кодовете по месеци",
+            Lang::Be => "Параўнаць коды тавараў па месяцах",
+            Lang::Zh => "按月比较商品编码",
+        },
+        GuidedQuestionKind::MarketCompanies => match lang {
+            Lang::En => "Who are the biggest companies here?",
+            Lang::Ua => "Хто найбільші компанії у вибірці?",
+            Lang::Ru => "Кто крупнейшие компании в выборке?",
+            Lang::De => "Wer sind hier die größten Firmen?",
+            Lang::Es => "¿Cuáles son las empresas más grandes aquí?",
+            Lang::Fr => "Quelles sont les plus grandes entreprises ici ?",
+            Lang::Pl => "Które firmy są tu największe?",
+            Lang::Pt => "Quais são as maiores empresas aqui?",
+            Lang::Ro => "Care sunt cele mai mari companii aici?",
+            Lang::Hu => "Melyek itt a legnagyobb cégek?",
+            Lang::Bg => "Кои са най-големите фирми тук?",
+            Lang::Be => "Хто найбуйнейшыя кампаніі ў выбарцы?",
+            Lang::Zh => "这里最大的公司是谁？",
+        },
+        GuidedQuestionKind::MarketGoods => match lang {
+            Lang::En => "Which goods dominate this slice?",
+            Lang::Ua => "Які товари домінують у вибірці?",
+            Lang::Ru => "Какие товары доминируют в выборке?",
+            Lang::De => "Welche Waren dominieren diesen Ausschnitt?",
+            Lang::Es => "¿Qué mercancías dominan esta selección?",
+            Lang::Fr => "Quelles marchandises dominent ce périmètre ?",
+            Lang::Pl => "Jakie towary dominują w tym zakresie?",
+            Lang::Pt => "Quais mercadorias dominam este recorte?",
+            Lang::Ro => "Ce mărfuri domină această selecție?",
+            Lang::Hu => "Mely áruk dominálnak ebben a szűrésben?",
+            Lang::Bg => "Кои стоки доминират в тази извадка?",
+            Lang::Be => "Якія тавары дамінуюць у выбарцы?",
+            Lang::Zh => "这个范围内哪些商品占主导？",
+        },
+        GuidedQuestionKind::MarketCountries => match lang {
+            Lang::En => "Which countries and routes dominate?",
+            Lang::Ua => "Які країни та маршрути домінують?",
+            Lang::Ru => "Какие страны и маршруты доминируют?",
+            Lang::De => "Welche Länder und Routen dominieren?",
+            Lang::Es => "¿Qué países y rutas dominan?",
+            Lang::Fr => "Quels pays et routes dominent ?",
+            Lang::Pl => "Jakie kraje i trasy dominują?",
+            Lang::Pt => "Quais países e rotas dominam?",
+            Lang::Ro => "Ce țări și rute domină?",
+            Lang::Hu => "Mely országok és útvonalak dominálnak?",
+            Lang::Bg => "Кои държави и маршрути доминират?",
+            Lang::Be => "Якія краіны і маршруты дамінуюць?",
+            Lang::Zh => "哪些国家和路线占主导？",
+        },
+        GuidedQuestionKind::MarketPrices => match lang {
+            Lang::En => "Are prices normal in this slice?",
+            Lang::Ua => "Чи нормальні ціни в цій вибірці?",
+            Lang::Ru => "Нормальные ли цены в этой выборке?",
+            Lang::De => "Sind die Preise in diesem Ausschnitt normal?",
+            Lang::Es => "¿Son normales los precios en esta selección?",
+            Lang::Fr => "Les prix sont-ils normaux dans ce périmètre ?",
+            Lang::Pl => "Czy ceny w tym zakresie są normalne?",
+            Lang::Pt => "Os preços são normais neste recorte?",
+            Lang::Ro => "Sunt prețurile normale în această selecție?",
+            Lang::Hu => "Normálisak az árak ebben a szűrésben?",
+            Lang::Bg => "Нормални ли са цените в тази извадка?",
+            Lang::Be => "Ці нармальныя цэны ў гэтай выбарцы?",
+            Lang::Zh => "这个范围内价格是否正常？",
+        },
+    }
+}
+
+fn exact_edrpou_candidate(text: &str, filters: &Filters) -> Option<String> {
+    let from_filter = filters.edrpou.trim();
+    if !from_filter.is_empty() {
+        return Some(from_filter.to_string());
+    }
+    let text = text.trim();
+    if text.len() == 8 && text.chars().all(|c| c.is_ascii_digit()) {
+        Some(text.to_string())
+    } else {
+        None
+    }
+}
+
+fn guided_questions_for(
+    text: &str,
+    filters: &Filters,
+) -> Vec<(GuidedQuestionSection, GuidedQuestionKind)> {
+    let mut out = Vec::new();
+    let has_text = !text.trim().is_empty();
+    let has_product = has_text
+        || !filters.product_code.trim().is_empty()
+        || !filters.trademark.trim().is_empty()
+        || !filters.description.trim().is_empty();
+    let has_company = exact_edrpou_candidate(text, filters).is_some()
+        || !filters.recipient.trim().is_empty()
+        || !filters.sender.trim().is_empty();
+    let has_market = !filters.year.trim().is_empty()
+        || !filters.origin_country.trim().is_empty()
+        || !filters.dispatch_country.trim().is_empty()
+        || !filters.trade_country.trim().is_empty();
+
+    if has_product {
+        out.extend([
+            (
+                GuidedQuestionSection::Product,
+                GuidedQuestionKind::ProductCompanies,
+            ),
+            (
+                GuidedQuestionSection::Product,
+                GuidedQuestionKind::ProductAllCompanies,
+            ),
+            (
+                GuidedQuestionSection::Product,
+                GuidedQuestionKind::ProductGoods,
+            ),
+            (
+                GuidedQuestionSection::Product,
+                GuidedQuestionKind::ProductCountries,
+            ),
+            (
+                GuidedQuestionSection::Product,
+                GuidedQuestionKind::ProductPrices,
+            ),
+            (
+                GuidedQuestionSection::Product,
+                GuidedQuestionKind::ProductTimeline,
+            ),
+            (
+                GuidedQuestionSection::Product,
+                GuidedQuestionKind::ProductCompaniesByMonth,
+            ),
+        ]);
+    }
+    if has_company {
+        if exact_edrpou_candidate(text, filters).is_some() {
+            out.push((
+                GuidedQuestionSection::Company,
+                GuidedQuestionKind::CompanyProfile,
+            ));
+        }
+        out.extend([
+            (
+                GuidedQuestionSection::Company,
+                GuidedQuestionKind::CompanyGoods,
+            ),
+            (
+                GuidedQuestionSection::Company,
+                GuidedQuestionKind::CompanySuppliers,
+            ),
+            (
+                GuidedQuestionSection::Company,
+                GuidedQuestionKind::CompanyCountries,
+            ),
+            (
+                GuidedQuestionSection::Company,
+                GuidedQuestionKind::CompanyTimeline,
+            ),
+            (
+                GuidedQuestionSection::Company,
+                GuidedQuestionKind::CompanyGoodsByMonth,
+            ),
+        ]);
+    }
+    if has_market || (!has_product && !has_company) {
+        out.extend([
+            (
+                GuidedQuestionSection::Market,
+                GuidedQuestionKind::MarketCompanies,
+            ),
+            (
+                GuidedQuestionSection::Market,
+                GuidedQuestionKind::MarketGoods,
+            ),
+            (
+                GuidedQuestionSection::Market,
+                GuidedQuestionKind::MarketCountries,
+            ),
+            (
+                GuidedQuestionSection::Market,
+                GuidedQuestionKind::MarketPrices,
+            ),
+        ]);
+    }
+    out
+}
+
+fn guided_question_action(
+    kind: GuidedQuestionKind,
+    text: &str,
+    filters: &Filters,
+) -> Option<GuidedQuestionAction> {
+    Some(match kind {
+        GuidedQuestionKind::ProductCompanies | GuidedQuestionKind::MarketCompanies => {
+            GuidedQuestionAction::Analytics(AnalyticsView::Companies)
+        }
+        GuidedQuestionKind::ProductAllCompanies => {
+            GuidedQuestionAction::Explore(AnalyticsSectionKind::Edrpou)
+        }
+        GuidedQuestionKind::ProductGoods
+        | GuidedQuestionKind::CompanyGoods
+        | GuidedQuestionKind::MarketGoods => {
+            GuidedQuestionAction::Analytics(AnalyticsView::Products)
+        }
+        GuidedQuestionKind::ProductCountries
+        | GuidedQuestionKind::CompanyCountries
+        | GuidedQuestionKind::MarketCountries => {
+            GuidedQuestionAction::Analytics(AnalyticsView::Countries)
+        }
+        GuidedQuestionKind::ProductPrices | GuidedQuestionKind::MarketPrices => {
+            GuidedQuestionAction::Analytics(AnalyticsView::Prices)
+        }
+        GuidedQuestionKind::ProductTimeline | GuidedQuestionKind::CompanyTimeline => {
+            GuidedQuestionAction::Analytics(AnalyticsView::Overview)
+        }
+        GuidedQuestionKind::ProductCompaniesByMonth => {
+            GuidedQuestionAction::Pivot(PivotDim::Recipient, PivotDim::Month, PivotMetric::Value)
+        }
+        GuidedQuestionKind::CompanyProfile => {
+            GuidedQuestionAction::Profile(exact_edrpou_candidate(text, filters)?)
+        }
+        GuidedQuestionKind::CompanySuppliers => {
+            GuidedQuestionAction::Explore(AnalyticsSectionKind::Senders)
+        }
+        GuidedQuestionKind::CompanyGoodsByMonth => {
+            GuidedQuestionAction::Pivot(PivotDim::ProductCode, PivotDim::Month, PivotMetric::Value)
+        }
+    })
+}
+
+fn analytics_calc_title(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Як рахуються цифри",
+        Lang::Ru => "Как считаются цифры",
+        _ => "How the numbers are calculated",
+    }
+}
+
+fn analytics_calc_short_note(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Усі цифри рахуються за поточним запитом і фільтрами.",
+        Lang::Ru => "Все цифры считаются по текущему запросу и фильтрам.",
+        _ => "All numbers are calculated from the current search and filters.",
+    }
+}
+
+fn analytics_calc_lines(lang: Lang) -> &'static [&'static str] {
+    match lang {
+        Lang::Ua => &[
+            "Рядки = знайдені товарні рядки, не унікальні декларації.",
+            "Декларації = унікальні номери МД у поточній вибірці.",
+            "Сума = сума поля «ФВ вал.контр», якщо воно заповнене у джерелі.",
+            "$/кг = сума / нетто; якщо нетто порожнє або нульове, показник не рахується.",
+            "У групах частка рахується від суми; якщо суми немає, використовується нетто, потім кількість рядків.",
+            "Аналітика рахує унікальні рядки: дублікати, позначені як повтори, не подвоюють підсумки.",
+        ],
+        Lang::Ru => &[
+            "Строки = найденные товарные строки, не уникальные декларации.",
+            "Декларации = уникальные номера МД в текущей выборке.",
+            "Сумма = сумма поля «ФВ вал.контр», если оно заполнено в источнике.",
+            "$/кг = сумма / нетто; если нетто пустое или нулевое, показатель не считается.",
+            "В группах доля считается от суммы; если суммы нет, используется нетто, затем количество строк.",
+            "Аналитика считает уникальные строки: дубликаты, помеченные как повторы, не удваивают итоги.",
+        ],
+        _ => &[
+            "Rows = matching product rows, not unique declarations.",
+            "Declarations = distinct declaration numbers in the current result set.",
+            "Value = SUM of the source field “ФВ вал.контр” when it is filled.",
+            "$/kg = value / net kg; empty or zero net weight is skipped.",
+            "Group share uses value first; if value is empty, it falls back to net weight, then row count.",
+            "Analytics counts unique rows: duplicate rows flagged as repeats do not double totals.",
+        ],
+    }
+}
+
+fn price_average_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Звичайне середнє за рядками з числовим значенням.",
+        Lang::Ru => "Обычное среднее по строкам с числовым значением.",
+        _ => "Simple average across rows with a numeric value.",
+    }
+}
+
+fn price_weighted_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Середнє, зважене за нетто кг: SUM(ціна * нетто) / SUM(нетто).",
+        Lang::Ru => "Среднее, взвешенное по нетто кг: SUM(цена * нетто) / SUM(нетто).",
+        _ => "Net-kg weighted average: SUM(price * net kg) / SUM(net kg).",
+    }
+}
+
+fn price_median_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Медіана: половина значень нижче, половина вище.",
+        Lang::Ru => "Медиана: половина значений ниже, половина выше.",
+        _ => "Median: half the values are lower and half are higher.",
+    }
+}
+
+fn price_range_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "P25-P75: середній діапазон без крайніх 25% знизу і зверху.",
+        Lang::Ru => "P25-P75: средний диапазон без крайних 25% снизу и сверху.",
+        _ => "P25-P75: middle range after excluding the lowest and highest quarters.",
+    }
+}
+
+fn price_count_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Кількість рядків, де цей показник можна прочитати як число.",
+        Lang::Ru => "Количество строк, где этот показатель можно прочитать как число.",
+        _ => "Rows where this metric can be parsed as a number.",
+    }
+}
+
 /// Database location: a `data` folder beside the executable (a portable
 /// install) or, when that location is not writable (e.g. /usr/bin on Linux
 /// or /Applications on macOS), a folder in the user's home directory.
@@ -259,6 +1089,12 @@ struct StatusLine {
     is_error: bool,
 }
 
+#[derive(Clone)]
+struct StoredQuery {
+    name: String,
+    query: Query,
+}
+
 fn invalidate_underpricing_generation(generation: &mut u64) {
     *generation = generation.wrapping_add(1);
 }
@@ -271,12 +1107,17 @@ pub struct App {
 
     query_text: String,
     filters: Filters,
+    recent_queries: Vec<StoredQuery>,
+    saved_queries: Vec<StoredQuery>,
     show_filters: bool,
     active_query: Query,
     page: u64,
     total: Option<u64>,
     rows: Vec<Vec<String>>,
     row_ids: Vec<i64>,
+    page_has_next: bool,
+    /// Per result row: Some(first file) when the row is a kept duplicate.
+    result_dups: Vec<Option<String>>,
     analytics: Option<Analytics>,
     active_tab: AppTab,
     analytics_limit: u64,
@@ -305,6 +1146,7 @@ pub struct App {
     visible_cols: Vec<bool>,
     search_gen: u64,
     search_in_flight: bool,
+    count_in_flight: bool,
     last_search_ms: Option<u64>,
 
     db_total_rows: Option<u64>,
@@ -368,6 +1210,16 @@ impl App {
             .iter()
             .map(|name| !hidden.contains(*name))
             .collect();
+        let recent_queries = lite_db
+            .as_ref()
+            .and_then(|db| db.meta_get(RECENT_QUERIES_META))
+            .map(|raw| decode_stored_queries(&raw))
+            .unwrap_or_default();
+        let saved_queries = lite_db
+            .as_ref()
+            .and_then(|db| db.meta_get(SAVED_QUERIES_META))
+            .map(|raw| decode_stored_queries(&raw))
+            .unwrap_or_default();
 
         let (msg_tx, msg_rx) = channel::<Msg>();
         let (search_tx, search_rx) = channel::<WorkerReq>();
@@ -384,12 +1236,16 @@ impl App {
             lite_db,
             query_text: String::new(),
             filters: Filters::default(),
+            recent_queries,
+            saved_queries,
             show_filters: false,
             active_query: Query::default(),
             page: 0,
             total: None,
             rows: Vec::new(),
             row_ids: Vec::new(),
+            page_has_next: false,
+            result_dups: Vec::new(),
             analytics: None,
             active_tab: AppTab::Results,
             analytics_limit: 10,
@@ -412,6 +1268,7 @@ impl App {
             visible_cols,
             search_gen: 0,
             search_in_flight: false,
+            count_in_flight: false,
             last_search_ms: None,
             db_total_rows: None,
             status: StatusLine::default(),
@@ -473,6 +1330,75 @@ impl App {
         self.persist("hidden_cols", &hidden.join(","));
     }
 
+    fn persist_recent_queries(&self) {
+        self.persist(
+            RECENT_QUERIES_META,
+            &encode_stored_queries(&self.recent_queries),
+        );
+    }
+
+    fn persist_saved_queries(&self) {
+        self.persist(
+            SAVED_QUERIES_META,
+            &encode_stored_queries(&self.saved_queries),
+        );
+    }
+
+    fn remember_recent_query(&mut self, query: &Query) {
+        if query.is_empty() {
+            return;
+        }
+        self.recent_queries.retain(|item| item.query != *query);
+        self.recent_queries.insert(
+            0,
+            StoredQuery {
+                name: query_summary(query, self.t()),
+                query: query.clone(),
+            },
+        );
+        self.recent_queries.truncate(RECENT_QUERY_LIMIT);
+        self.persist_recent_queries();
+    }
+
+    fn save_current_query(&mut self) {
+        let query = Query {
+            text: self.query_text.clone(),
+            filters: self.filters.clone(),
+        };
+        if query.is_empty() {
+            return;
+        }
+        self.saved_queries.retain(|item| item.query != query);
+        self.saved_queries.insert(
+            0,
+            StoredQuery {
+                name: query_summary(&query, self.t()),
+                query,
+            },
+        );
+        self.persist_saved_queries();
+    }
+
+    fn clear_recent_queries(&mut self) {
+        self.recent_queries.clear();
+        self.persist_recent_queries();
+    }
+
+    fn remove_saved_query(&mut self, index: usize) {
+        if index < self.saved_queries.len() {
+            self.saved_queries.remove(index);
+            self.persist_saved_queries();
+        }
+    }
+
+    fn apply_stored_query(&mut self, query: Query) {
+        self.query_text = query.text;
+        self.filters = query.filters;
+        self.show_filters = !self.filters.is_empty();
+        self.active_tab = AppTab::Results;
+        self.start_search(true);
+    }
+
     fn start_search(&mut self, reset_page: bool) {
         if reset_page {
             self.page = 0;
@@ -481,8 +1407,16 @@ impl App {
             text: self.query_text.clone(),
             filters: self.filters.clone(),
         };
+        let query_to_remember = self.active_query.clone();
+        if reset_page {
+            self.remember_recent_query(&query_to_remember);
+        }
         self.search_gen += 1;
         self.search_in_flight = true;
+        self.count_in_flight = true;
+        self.page_has_next = false;
+        self.total = None;
+        self.last_search_ms = None;
         // The query changed; loaded analytics no longer matches the results.
         self.analytics = None;
         self.analytics_loaded = [false; 6];
@@ -506,6 +1440,10 @@ impl App {
         self.page = page;
         self.search_gen += 1;
         self.search_in_flight = true;
+        self.count_in_flight = true;
+        self.page_has_next = false;
+        self.total = None;
+        self.last_search_ms = None;
         let _ = self.search_tx.send(WorkerReq::Search {
             q: Box::new(self.active_query.clone()),
             page,
@@ -607,29 +1545,43 @@ impl App {
     }
 
     fn page_count(&self) -> u64 {
-        self.total
-            .map(|t| t.div_ceil(PAGE_SIZE).max(1))
-            .unwrap_or(1)
+        match self.total {
+            Some(total) => total.div_ceil(PAGE_SIZE).max(1),
+            None if !self.search_in_flight && self.page_has_next => self.page + 2,
+            None => self.page + 1,
+        }
     }
 
     fn drain_messages(&mut self) {
         while let Ok(msg) = self.msg_rx.try_recv() {
             match msg {
-                Msg::SearchDone {
+                Msg::SearchPage {
                     generation,
                     ids,
                     rows,
-                    total,
+                    dups,
+                    has_next,
                     ms,
                 } => {
                     if generation == self.search_gen {
                         self.row_ids = ids;
                         self.rows = rows;
-                        self.total = Some(total);
+                        self.result_dups = dups;
+                        self.page_has_next = has_next;
+                        if self.page == 0 && self.rows.is_empty() {
+                            self.total = Some(0);
+                            self.count_in_flight = false;
+                        }
                         self.last_search_ms = Some(ms);
                         self.search_in_flight = false;
                         self.selected.clear();
                         self.select_anchor = None;
+                    }
+                }
+                Msg::SearchCount { generation, total } => {
+                    if generation == self.search_gen {
+                        self.total = Some(total);
+                        self.count_in_flight = false;
                     }
                 }
                 Msg::AnalyticsDone {
@@ -689,6 +1641,7 @@ impl App {
                 } => {
                     if generation == self.search_gen {
                         self.search_in_flight = false;
+                        self.count_in_flight = false;
                         self.analytics_loading = false;
                         self.status = StatusLine {
                             text: format!("{}: {message}", self.t().error),
@@ -918,6 +1871,54 @@ impl App {
         self.profile_gen += 1;
     }
 
+    fn run_guided_question(&mut self, action: GuidedQuestionAction) {
+        let current = Query {
+            text: self.query_text.clone(),
+            filters: self.filters.clone(),
+        };
+        if current.is_empty() && !matches!(action, GuidedQuestionAction::Profile(_)) {
+            self.status = StatusLine {
+                text: guided_questions_empty(self.lang).to_string(),
+                is_error: false,
+            };
+            return;
+        }
+        let query_changed = current != self.active_query;
+        match action {
+            GuidedQuestionAction::Analytics(view) => {
+                self.active_tab = AppTab::Analytics;
+                self.analytics_view = view;
+                if query_changed {
+                    self.start_search(true);
+                } else {
+                    self.request_analytics();
+                }
+            }
+            GuidedQuestionAction::Explore(kind) => {
+                self.active_tab = AppTab::Analytics;
+                if query_changed {
+                    self.start_search(true);
+                }
+                self.open_group_explorer(kind);
+            }
+            GuidedQuestionAction::Pivot(row_dim, col_dim, metric) => {
+                self.active_tab = AppTab::Analytics;
+                self.analytics_view = AnalyticsView::Pivot;
+                self.pivot_row_dim = row_dim;
+                self.pivot_col_dim = col_dim;
+                self.pivot_metric = metric;
+                self.pivot = None;
+                self.analytics_loaded[AnalyticsView::Pivot.index()] = false;
+                if query_changed {
+                    self.start_search(true);
+                } else {
+                    self.request_analytics();
+                }
+            }
+            GuidedQuestionAction::Profile(edrpou) => self.open_profile(edrpou),
+        }
+    }
+
     fn handle_row_click(&mut self, i: usize, modifiers: egui::Modifiers) {
         if modifiers.ctrl || modifiers.command {
             if !self.selected.insert(i) {
@@ -1014,6 +2015,20 @@ impl App {
         let mut do_import = false;
         let mut do_export = false;
         let mut switched_to_analytics = false;
+        let mut apply_stored_query: Option<Query> = None;
+        let mut clear_recent_queries = false;
+        let mut save_current_query = false;
+        let mut remove_saved_query: Option<usize> = None;
+        let mut guided_action: Option<GuidedQuestionAction> = None;
+        let recent_queries = self.recent_queries.clone();
+        let saved_queries = self.saved_queries.clone();
+        let guided_filters = self.filters.clone();
+        let guided_text = self.query_text.clone();
+        let guided_query = Query {
+            text: guided_text.clone(),
+            filters: guided_filters.clone(),
+        };
+        let guided_items = guided_questions_for(&guided_text, &guided_filters);
         let frame = egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin {
             left: 12,
             right: 12,
@@ -1051,7 +2066,8 @@ impl App {
                     if ui.add_enabled(!busy, egui::Button::new(t.import)).clicked() {
                         do_import = true;
                     }
-                    let can_export = !busy && self.total.unwrap_or(0) > 0;
+                    let can_export =
+                        !busy && (self.total.unwrap_or(0) > 0 || !self.rows.is_empty());
                     if ui
                         .add_enabled(can_export, egui::Button::new(t.export))
                         .clicked()
@@ -1091,6 +2107,110 @@ impl App {
                         if filters_btn.clicked() {
                             self.show_filters = !self.show_filters;
                         }
+                        let questions_resp = ui
+                            .menu_button(guided_questions_label(self.lang), |ui| {
+                                if guided_items.is_empty() || guided_query.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(guided_questions_empty(self.lang))
+                                            .weak(),
+                                    );
+                                    return;
+                                }
+                                ui.label(
+                                    egui::RichText::new(query_summary(&guided_query, t))
+                                        .weak()
+                                        .small(),
+                                );
+                                let mut current_section: Option<GuidedQuestionSection> = None;
+                                for (section, kind) in &guided_items {
+                                    if current_section != Some(*section) {
+                                        if current_section.is_some() {
+                                            ui.separator();
+                                        }
+                                        current_section = Some(*section);
+                                        ui.label(
+                                            egui::RichText::new(guided_section_title(
+                                                *section, self.lang,
+                                            ))
+                                            .strong(),
+                                        );
+                                    }
+                                    let Some(action) = guided_question_action(
+                                        *kind,
+                                        &guided_text,
+                                        &guided_filters,
+                                    ) else {
+                                        continue;
+                                    };
+                                    if ui.button(guided_question_title(*kind, self.lang)).clicked()
+                                    {
+                                        guided_action = Some(action);
+                                        ui.close();
+                                    }
+                                }
+                            })
+                            .response;
+                        questions_resp.on_hover_text(guided_questions_hover(self.lang));
+                        let saved_resp = ui
+                            .menu_button("\u{2605}", |ui| {
+                                if ui.button(save_current_query_label(self.lang)).clicked() {
+                                    save_current_query = true;
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if saved_queries.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(empty_saved_queries_label(self.lang))
+                                            .weak(),
+                                    );
+                                } else {
+                                    for (idx, item) in saved_queries.iter().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .button(trunc_label(&item.name, 56))
+                                                .on_hover_text(query_summary(&item.query, t))
+                                                .clicked()
+                                            {
+                                                apply_stored_query = Some(item.query.clone());
+                                                ui.close();
+                                            }
+                                            if ui.small_button("\u{00D7}").clicked() {
+                                                remove_saved_query = Some(idx);
+                                                ui.close();
+                                            }
+                                        });
+                                    }
+                                }
+                            })
+                            .response;
+                        saved_resp.on_hover_text(saved_queries_label(self.lang));
+                        let recent_resp = ui
+                            .menu_button("\u{21BA}", |ui| {
+                                if recent_queries.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(empty_recent_queries_label(self.lang))
+                                            .weak(),
+                                    );
+                                } else {
+                                    for item in &recent_queries {
+                                        if ui
+                                            .button(trunc_label(&item.name, 64))
+                                            .on_hover_text(query_summary(&item.query, t))
+                                            .clicked()
+                                        {
+                                            apply_stored_query = Some(item.query.clone());
+                                            ui.close();
+                                        }
+                                    }
+                                    ui.separator();
+                                    if ui.button(clear_recent_queries_label(self.lang)).clicked() {
+                                        clear_recent_queries = true;
+                                        ui.close();
+                                    }
+                                }
+                            })
+                            .response;
+                        recent_resp.on_hover_text(recent_queries_label(self.lang));
                         let find_btn = egui::Button::new(
                             egui::RichText::new(t.find).color(egui::Color32::WHITE),
                         )
@@ -1105,6 +2225,12 @@ impl App {
                         if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             do_search = true;
                         }
+                        if response.changed()
+                            && self.query_text.trim().is_empty()
+                            && !self.active_query.text.trim().is_empty()
+                        {
+                            do_search = true;
+                        }
                     });
                 });
 
@@ -1116,7 +2242,20 @@ impl App {
                 }
                 ui.add_space(2.0);
             });
-        if do_search {
+        if save_current_query {
+            self.save_current_query();
+        }
+        if let Some(index) = remove_saved_query {
+            self.remove_saved_query(index);
+        }
+        if clear_recent_queries {
+            self.clear_recent_queries();
+        }
+        if let Some(query) = apply_stored_query {
+            self.apply_stored_query(query);
+        } else if let Some(action) = guided_action {
+            self.run_guided_question(action);
+        } else if do_search {
             self.start_search(true);
         } else if switched_to_analytics {
             self.request_analytics();
@@ -1215,20 +2354,41 @@ impl App {
                         ui.visuals().text_color()
                     };
                     ui.colored_label(color, &self.status.text);
-                } else if let (Some(total), Some(ms)) = (self.total, self.last_search_ms) {
+                } else if let Some(ms) = self.last_search_ms {
                     let start = self.page * PAGE_SIZE + 1;
-                    let end = (self.page * PAGE_SIZE + self.rows.len() as u64).min(total);
-                    if total > 0 {
+                    let end = self.page * PAGE_SIZE + self.rows.len() as u64;
+                    if let Some(total) = self.total {
+                        if total > 0 {
+                            let mut text = fmt(
+                                self.t().rows_of,
+                                &[
+                                    &group_digits(start),
+                                    &group_digits(end.min(total)),
+                                    &group_digits(total),
+                                ],
+                            );
+                            text.push_str("  \u{00B7}  ");
+                            text.push_str(&fmt(self.t().search_ms, &[&ms.to_string()]));
+                            if self.selected.len() > 1 {
+                                text.push_str("  \u{00B7}  ");
+                                text.push_str(&fmt(
+                                    self.t().selected_n,
+                                    &[&self.selected.len().to_string()],
+                                ));
+                            }
+                            ui.label(text);
+                        }
+                    } else if !self.rows.is_empty() {
                         let mut text = fmt(
                             self.t().rows_of,
-                            &[
-                                &group_digits(start),
-                                &group_digits(end),
-                                &group_digits(total),
-                            ],
+                            &[&group_digits(start), &group_digits(end), "?"],
                         );
                         text.push_str("  \u{00B7}  ");
                         text.push_str(&fmt(self.t().search_ms, &[&ms.to_string()]));
+                        if self.count_in_flight {
+                            text.push_str("  \u{00B7}  ");
+                            text.push_str(self.t().searching);
+                        }
                         if self.selected.len() > 1 {
                             text.push_str("  \u{00B7}  ");
                             text.push_str(&fmt(
@@ -1334,25 +2494,32 @@ impl App {
     fn ui_pagination(&mut self, ui: &mut egui::Ui) {
         let pages = self.page_count();
         let page = self.page;
+        let can_go_next = self
+            .total
+            .map(|_| page + 1 < pages)
+            .unwrap_or(!self.search_in_flight && self.page_has_next);
         let mut goto: Option<u64> = None;
         // right_to_left draws from the end.
         if ui
-            .add_enabled(page + 1 < pages, egui::Button::new("⏭"))
+            .add_enabled(
+                self.total.is_some() && page + 1 < pages,
+                egui::Button::new("⏭"),
+            )
             .clicked()
         {
             goto = Some(pages - 1);
         }
         if ui
-            .add_enabled(page + 1 < pages, egui::Button::new("▶"))
+            .add_enabled(can_go_next, egui::Button::new("▶"))
             .clicked()
         {
             goto = Some(page + 1);
         }
-        ui.label(format!(
-            "{} / {}",
-            group_digits(page + 1),
-            group_digits(pages)
-        ));
+        let page_total = self
+            .total
+            .map(|_| group_digits(pages))
+            .unwrap_or_else(|| "?".to_string());
+        ui.label(format!("{} / {}", group_digits(page + 1), page_total));
         if ui.add_enabled(page > 0, egui::Button::new("◀")).clicked() {
             goto = Some(page - 1);
         }
@@ -1446,7 +2613,7 @@ impl App {
             });
             // One-line summary keeps context visible on every sub-tab.
             ui.horizontal(|ui| {
-                ui.label(
+                let summary = ui.label(
                     egui::RichText::new(fmt(
                         t.mini_summary,
                         &[
@@ -1458,6 +2625,7 @@ impl App {
                     .weak()
                     .small(),
                 );
+                summary.on_hover_text(analytics_calc_short_note(lang));
                 if let (Some(first), Some(last)) =
                     (analytics.months.first(), analytics.months.last())
                 {
@@ -1475,6 +2643,13 @@ impl App {
                     );
                 }
             });
+            egui::CollapsingHeader::new(analytics_calc_title(lang))
+                .id_salt("analytics_calculation_notes")
+                .show(ui, |ui| {
+                    for line in analytics_calc_lines(lang) {
+                        ui.label(egui::RichText::new(*line).weak().small());
+                    }
+                });
             ui.add_space(8.0);
 
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1778,6 +2953,7 @@ impl App {
                 let text = match self.total {
                     Some(0) if self.active_query.is_empty() => self.t().db_empty,
                     Some(0) => self.t().nothing_found,
+                    None if self.search_in_flight || self.count_in_flight => self.t().searching,
                     _ => self.t().enter_query_hint,
                 };
                 ui.add_space((ui.available_height() * 0.35).max(0.0));
@@ -1814,6 +2990,12 @@ impl App {
             } else {
                 ACCENT
             };
+            // Duplicate rows (already seen in an earlier file) are tinted amber.
+            let dup_color = if dark {
+                egui::Color32::from_rgb(235, 170, 90)
+            } else {
+                egui::Color32::from_rgb(160, 90, 0)
+            };
             let mut open_card: Option<usize> = None;
             let mut clicked_row: Option<usize> = None;
             let mut menu_action: Option<RowMenuAction> = None;
@@ -1837,15 +3019,19 @@ impl App {
                             let name = RESULT_COLUMNS[*idx];
                             let (_, kind) = col_spec(name);
                             header.col(|ui| {
-                                if kind == CellKind::Number {
+                                let resp = if kind == CellKind::Number {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.strong(header_for(name));
-                                        },
-                                    );
+                                        |ui| ui.strong(header_for(name)),
+                                    )
+                                    .inner
                                 } else {
-                                    ui.strong(header_for(name));
+                                    ui.strong(header_for(name))
+                                };
+                                // Hover hint with the expanded meaning for
+                                // abbreviated customs value/price columns.
+                                if let Some(glossary) = column_glossary(name) {
+                                    resp.on_hover_text(glossary);
                                 }
                             });
                         }
@@ -1854,6 +3040,10 @@ impl App {
                         body.rows(text_height, self.rows.len(), |mut row| {
                             let i = row.index();
                             row.set_selected(self.selected.contains(&i));
+                            // A kept duplicate: the file where the row first
+                            // appeared, used to tint and to fill the tooltip.
+                            let dup_first = self.result_dups.get(i).and_then(|d| d.clone());
+                            let is_dup = dup_first.is_some();
                             let mut clicked = false;
                             let mut double = false;
                             for idx in &visible {
@@ -1868,6 +3058,7 @@ impl App {
                                         }
                                         CellKind::Number => egui::RichText::new(value).monospace(),
                                     };
+                                    let rich = if is_dup { rich.color(dup_color) } else { rich };
                                     let label = egui::Label::new(rich).selectable(false).truncate();
                                     if kind == CellKind::Number {
                                         ui.with_layout(
@@ -1880,6 +3071,11 @@ impl App {
                                         ui.add(label);
                                     }
                                 });
+                                let response = if let Some(first_file) = &dup_first {
+                                    response.on_hover_text(fmt(t.dup_first_seen, &[first_file]))
+                                } else {
+                                    response
+                                };
                                 clicked |= response.clicked();
                                 double |= response.double_clicked();
                                 response.context_menu(|ui| {
@@ -2135,26 +3331,41 @@ impl App {
                     ui.add_space(12.0);
                 }
 
-                // Three dossier cards side by side.
-                let sections = [
-                    AnalyticsSection {
-                        kind: AnalyticsSectionKind::ProductCodes,
-                        rows: profile.top_products.clone(),
-                    },
-                    AnalyticsSection {
-                        kind: AnalyticsSectionKind::Senders,
-                        rows: profile.top_senders.clone(),
-                    },
-                    AnalyticsSection {
-                        kind: AnalyticsSectionKind::OriginCountries,
-                        rows: profile.top_origin_countries.clone(),
-                    },
-                ];
-                if let Some(next) = analytics_cards_with_options(ui, &sections, lang, false)
+                ui.label(egui::RichText::new(t.products_section).strong());
+                ui.label(egui::RichText::new(t.products_section_hint).weak().small());
+                if let Some(next) =
+                    analytics_cards_with_options(ui, &profile.product_sections, lang, false)
                     && let AnalyticsCardAction::Filter(filter) = next
                 {
                     action = Some(filter);
                 }
+                ui.add_space(8.0);
+
+                ui.label(egui::RichText::new(t.companies_section).strong());
+                let sender_section = [AnalyticsSection {
+                    kind: AnalyticsSectionKind::Senders,
+                    rows: profile.top_senders.clone(),
+                }];
+                if let Some(next) = analytics_cards_with_options(ui, &sender_section, lang, false)
+                    && let AnalyticsCardAction::Filter(filter) = next
+                {
+                    action = Some(filter);
+                }
+                ui.add_space(8.0);
+
+                ui.label(egui::RichText::new(t.countries_section).strong());
+                ui.label(egui::RichText::new(t.countries_section_hint).weak().small());
+                if let Some(next) =
+                    analytics_cards_with_options(ui, &profile.country_sections, lang, false)
+                    && let AnalyticsCardAction::Filter(filter) = next
+                {
+                    action = Some(filter);
+                }
+                ui.add_space(8.0);
+
+                ui.label(egui::RichText::new(t.prices_section).strong());
+                ui.label(egui::RichText::new(t.prices_section_hint).weak().small());
+                price_table(ui, &profile.price_sections, lang);
                 ui.add_space(8.0);
             });
         });
@@ -2549,6 +3760,7 @@ impl eframe::App for App {
         // Safety repaint: refresh regularly while a background operation runs.
         if self.op.is_some()
             || self.search_in_flight
+            || self.count_in_flight
             || self.analytics_loading
             || self.profile_loading
             || self.underpricing_loading
@@ -3184,11 +4396,16 @@ fn price_table(ui: &mut egui::Ui, metrics: &[AnalyticsPriceMetric], lang: Lang) 
         .spacing([14.0, 6.0])
         .show(ui, |ui| {
             ui.label(egui::RichText::new(price_header_metric(lang)).weak());
-            ui.label(egui::RichText::new(price_header_avg(lang)).weak());
-            ui.label(egui::RichText::new(price_header_weighted(lang)).weak());
-            ui.label(egui::RichText::new(price_header_median(lang)).weak());
-            ui.label(egui::RichText::new("P25\u{2013}P75").weak());
-            ui.label(egui::RichText::new(price_header_count(lang)).weak());
+            ui.label(egui::RichText::new(price_header_avg(lang)).weak())
+                .on_hover_text(price_average_help(lang));
+            ui.label(egui::RichText::new(price_header_weighted(lang)).weak())
+                .on_hover_text(price_weighted_help(lang));
+            ui.label(egui::RichText::new(price_header_median(lang)).weak())
+                .on_hover_text(price_median_help(lang));
+            ui.label(egui::RichText::new("P25\u{2013}P75").weak())
+                .on_hover_text(price_range_help(lang));
+            ui.label(egui::RichText::new(price_header_count(lang)).weak())
+                .on_hover_text(price_count_help(lang));
             ui.end_row();
             for metric in metrics {
                 if metric.count == 0 {
@@ -3981,7 +5198,13 @@ fn setup_style(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::invalidate_underpricing_generation;
+    use super::{
+        GuidedQuestionKind, StoredQuery, decode_stored_queries, encode_stored_queries,
+        exact_edrpou_candidate, guided_question_title, guided_questions_for,
+        invalidate_underpricing_generation,
+    };
+    use crate::db::{Filters, Query};
+    use crate::i18n::Lang;
 
     #[test]
     fn invalidating_underpricing_generation_rejects_stale_results() {
@@ -3991,5 +5214,105 @@ mod tests {
         invalidate_underpricing_generation(&mut generation);
 
         assert_ne!(generation, stale_generation);
+    }
+
+    #[test]
+    fn stored_queries_round_trip_full_query() {
+        let query = Query {
+            text: "Apple\tphones%2024".into(),
+            filters: Filters {
+                year: "2024".into(),
+                product_code: "8517".into(),
+                sender: "A\nB".into(),
+                origin_country: "CN".into(),
+                ..Filters::default()
+            },
+        };
+        let stored = vec![StoredQuery {
+            name: "Apple saved".into(),
+            query: query.clone(),
+        }];
+
+        let encoded = encode_stored_queries(&stored);
+        let decoded = decode_stored_queries(&encoded);
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].name, "Apple saved");
+        assert_eq!(decoded[0].query, query);
+    }
+
+    #[test]
+    fn guided_questions_cover_all_languages() {
+        let kinds = [
+            GuidedQuestionKind::ProductCompanies,
+            GuidedQuestionKind::ProductAllCompanies,
+            GuidedQuestionKind::ProductGoods,
+            GuidedQuestionKind::ProductCountries,
+            GuidedQuestionKind::ProductPrices,
+            GuidedQuestionKind::ProductTimeline,
+            GuidedQuestionKind::ProductCompaniesByMonth,
+            GuidedQuestionKind::CompanyProfile,
+            GuidedQuestionKind::CompanyGoods,
+            GuidedQuestionKind::CompanySuppliers,
+            GuidedQuestionKind::CompanyCountries,
+            GuidedQuestionKind::CompanyTimeline,
+            GuidedQuestionKind::CompanyGoodsByMonth,
+            GuidedQuestionKind::MarketCompanies,
+            GuidedQuestionKind::MarketGoods,
+            GuidedQuestionKind::MarketCountries,
+            GuidedQuestionKind::MarketPrices,
+        ];
+        for lang in Lang::ALL {
+            for kind in kinds {
+                assert!(!guided_question_title(kind, lang).trim().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn guided_questions_match_input_context() {
+        let product = guided_questions_for("Apple", &Filters::default());
+        assert!(
+            product
+                .iter()
+                .any(|(_, kind)| *kind == GuidedQuestionKind::ProductCompanies)
+        );
+        assert!(
+            product
+                .iter()
+                .any(|(_, kind)| *kind == GuidedQuestionKind::ProductPrices)
+        );
+
+        let filters = Filters {
+            edrpou: "12345678".into(),
+            ..Filters::default()
+        };
+        let company = guided_questions_for("", &filters);
+        assert!(
+            company
+                .iter()
+                .any(|(_, kind)| *kind == GuidedQuestionKind::CompanyProfile)
+        );
+        assert_eq!(
+            exact_edrpou_candidate("", &filters),
+            Some("12345678".to_string())
+        );
+
+        let filters = Filters {
+            year: "2024".into(),
+            origin_country: "CN".into(),
+            ..Filters::default()
+        };
+        let market = guided_questions_for("", &filters);
+        assert!(
+            market
+                .iter()
+                .any(|(_, kind)| *kind == GuidedQuestionKind::MarketCompanies)
+        );
+        assert!(
+            market
+                .iter()
+                .any(|(_, kind)| *kind == GuidedQuestionKind::MarketPrices)
+        );
     }
 }

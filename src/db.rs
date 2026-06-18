@@ -439,25 +439,35 @@ pub struct CompanyProfile {
     pub top_products: Vec<AnalyticsGroupRow>,
     pub top_senders: Vec<AnalyticsGroupRow>,
     pub top_origin_countries: Vec<AnalyticsGroupRow>,
+    pub product_sections: Vec<AnalyticsSection>,
+    pub country_sections: Vec<AnalyticsSection>,
+    pub price_sections: Vec<AnalyticsPriceMetric>,
 }
 
 pub struct Db {
     pub conn: Connection,
 }
 
-fn records_ddl() -> String {
+pub type SearchPage = (Vec<i64>, Vec<Vec<String>>, Vec<Option<String>>);
+
+fn records_ddl_for(table_name: &str) -> String {
     let fields: Vec<String> = COLUMNS.iter().map(|c| format!("{} TEXT", c.name)).collect();
     format!(
-        "CREATE TABLE IF NOT EXISTS records (
+        "CREATE TABLE IF NOT EXISTS {table_name} (
             id INTEGER PRIMARY KEY,
-            row_hash BLOB NOT NULL UNIQUE,
+            row_hash BLOB NOT NULL,
             source_file TEXT NOT NULL,
             year INTEGER,
+            dup_first_file TEXT,
             imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             {}
         )",
         fields.join(",\n            ")
     )
+}
+
+fn records_ddl() -> String {
+    records_ddl_for("records")
 }
 
 fn search_text_expr() -> String {
@@ -584,6 +594,7 @@ impl Db {
             self.meta_set("fts_watermark", "0");
             self.meta_set("fts_schema", FTS_SCHEMA_VERSION);
         }
+        self.migrate_records_schema()?;
         self.conn.execute_batch(&format!(
             "{records};
             CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
@@ -604,7 +615,8 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_records_year ON records(year);
             CREATE INDEX IF NOT EXISTS idx_records_product_code ON records(product_code);
-            CREATE INDEX IF NOT EXISTS idx_records_edrpou ON records(edrpou);",
+            CREATE INDEX IF NOT EXISTS idx_records_edrpou ON records(edrpou);
+            CREATE INDEX IF NOT EXISTS idx_records_hash ON records(row_hash);",
             records = records_ddl()
         ))?;
         // This column was added after early versions; add it without a migration.
@@ -612,6 +624,74 @@ impl Db {
             .conn
             .execute("ALTER TABLE import_log ADD COLUMN file_hash TEXT", []);
         Ok(())
+    }
+
+    fn migrate_records_schema(&self) -> rusqlite::Result<()> {
+        const RECORDS_SCHEMA_VERSION: &str = "2";
+        if self.meta_get("records_schema").as_deref() == Some(RECORDS_SCHEMA_VERSION) {
+            return Ok(());
+        }
+
+        if self.table_exists("records")? {
+            let has_dup_first = self.table_has_column("records", "dup_first_file")?;
+            let column_names = COLUMNS.iter().map(|c| c.name).collect::<Vec<_>>();
+            let columns_sql = column_names.join(", ");
+            let dup_expr = if has_dup_first {
+                "dup_first_file"
+            } else {
+                "NULL AS dup_first_file"
+            };
+
+            self.conn.execute_batch(
+                "DROP TABLE IF EXISTS records_fts; DROP TABLE IF EXISTS records_v2;",
+            )?;
+            self.conn.execute_batch(&records_ddl_for("records_v2"))?;
+            self.conn.execute_batch(&format!(
+                "INSERT INTO records_v2 (
+                    id, row_hash, source_file, year, dup_first_file, imported_at, {columns_sql}
+                 )
+                 SELECT
+                    id, row_hash, source_file, year, {dup_expr}, imported_at, {columns_sql}
+                 FROM records;
+                 DROP TABLE records;
+                 ALTER TABLE records_v2 RENAME TO records;"
+            ))?;
+            if self.table_exists("import_log")? {
+                let _ = self
+                    .conn
+                    .execute("ALTER TABLE import_log ADD COLUMN file_hash TEXT", []);
+                self.conn
+                    .execute("UPDATE import_log SET file_hash = NULL", [])?;
+            }
+            self.meta_set("fts_watermark", "0");
+        }
+
+        self.meta_set("records_schema", RECORDS_SCHEMA_VERSION);
+        Ok(())
+    }
+
+    fn table_exists(&self, name: &str) -> rusqlite::Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type IN ('table', 'virtual table') AND name = ?1
+                )",
+                [name],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v != 0)
+    }
+
+    fn table_has_column(&self, table: &str, column: &str) -> rusqlite::Result<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for name in rows {
+            if name? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     // ---------- meta ----------
@@ -638,8 +718,20 @@ impl Db {
 
     // ---------- insert ----------
 
-    /// Inserts a row batch in one transaction.
-    /// Returns (inserted rows, skipped duplicates).
+    pub fn begin_import_file(&mut self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")
+    }
+
+    pub fn commit_import_file(&mut self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("COMMIT")
+    }
+
+    pub fn rollback_import_file(&mut self) {
+        let _ = self.conn.execute_batch("ROLLBACK");
+    }
+
+    /// Inserts a row batch. Duplicates are inserted and flagged.
+    /// Returns (inserted physical rows, duplicate rows).
     pub fn insert_batch(
         &mut self,
         source_file: &str,
@@ -649,29 +741,63 @@ impl Db {
             return Ok((0, 0));
         }
         let col_names: Vec<&str> = COLUMNS.iter().map(|c| c.name).collect();
+        // Duplicates are kept, not dropped. A row whose full-row hash was already
+        // stored is inserted with dup_first_file set to the file where it first
+        // appeared, so the UI can flag it and analytics can skip it.
         let sql = format!(
-            "INSERT OR IGNORE INTO records (row_hash, source_file, year, {}) VALUES ({})",
+            "INSERT INTO records (row_hash, source_file, year, dup_first_file, {}) VALUES ({})",
             col_names.join(", "),
-            std::iter::repeat_n("?", 3 + col_names.len())
+            std::iter::repeat_n("?", 4 + col_names.len())
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let tx = self.conn.transaction()?;
-        let mut inserted: u64 = 0;
-        {
-            let mut stmt = tx.prepare_cached(&sql)?;
+        self.conn.execute_batch("SAVEPOINT insert_batch")?;
+        let result = (|| -> rusqlite::Result<(u64, u64)> {
+            let mut first_seen: u64 = 0;
+            let mut duplicates: u64 = 0;
+            let mut lookup = self.conn.prepare_cached(
+                "SELECT source_file
+                     FROM records
+                     WHERE row_hash = ?1 AND dup_first_file IS NULL
+                     ORDER BY id ASC
+                     LIMIT 1",
+            )?;
+            let mut stmt = self.conn.prepare_cached(&sql)?;
             for rec in records {
+                // Seen earlier (in this batch's transaction or a previous file)?
+                let prior: Option<String> =
+                    lookup.query_row([&rec.hash[..]], |r| r.get(0)).optional()?;
                 stmt.raw_bind_parameter(1, &rec.hash[..])?;
                 stmt.raw_bind_parameter(2, source_file)?;
                 stmt.raw_bind_parameter(3, rec.year)?;
-                for (i, v) in rec.values.iter().enumerate() {
-                    stmt.raw_bind_parameter(4 + i, v.as_str())?;
+                match prior {
+                    Some(ref first_file) => {
+                        stmt.raw_bind_parameter(4, first_file.as_str())?;
+                        duplicates += 1;
+                    }
+                    None => {
+                        stmt.raw_bind_parameter(4, rusqlite::types::Null)?;
+                        first_seen += 1;
+                    }
                 }
-                inserted += stmt.raw_execute()? as u64;
+                for (i, v) in rec.values.iter().enumerate() {
+                    stmt.raw_bind_parameter(5 + i, v.as_str())?;
+                }
+                stmt.raw_execute()?;
+            }
+            Ok((first_seen + duplicates, duplicates))
+        })();
+        match result {
+            Ok(counts) => {
+                self.conn.execute_batch("RELEASE insert_batch")?;
+                Ok(counts)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO insert_batch");
+                let _ = self.conn.execute_batch("RELEASE insert_batch");
+                Err(e)
             }
         }
-        tx.commit()?;
-        Ok((inserted, records.len() as u64 - inserted))
     }
 
     // ---------- FTS ----------
@@ -733,7 +859,7 @@ impl Db {
 
     // ---------- search ----------
 
-    fn build_where(&self, q: &Query) -> (String, String, Vec<Value>) {
+    fn build_where(&self, q: &Query, unique_only: bool) -> (String, String, Vec<Value>) {
         let mut joins = String::new();
         let mut clauses: Vec<String> = Vec::new();
         let mut params: Vec<Value> = Vec::new();
@@ -741,7 +867,15 @@ impl Db {
         // Shared MATCH expression: query text plus company and country filter
         // tokens. These columns are indexed, so FTS narrows the candidate set
         // first and cyr_contains performs the exact substring check.
-        let mut match_expr = build_fts_query(&q.text);
+        let text_code_prefix = product_code_search_prefix(&q.text);
+        // Bare HS/product-code prefixes such as "8504" are far cheaper and more
+        // useful as product_code range scans than as FTS prefix scans over every
+        // text column. Mixed free-text queries still use FTS.
+        let mut match_expr = if text_code_prefix.is_some() {
+            String::new()
+        } else {
+            build_fts_query(&q.text)
+        };
         let f = &q.filters;
         let mut contains_clauses: Vec<(String, String)> = Vec::new();
         let trademark = f.trademark.trim();
@@ -779,6 +913,10 @@ impl Db {
             clauses.push("r.year = ?".into());
             params.push(year.into());
         }
+        if let Some(code) = text_code_prefix {
+            clauses.push("r.product_code GLOB ?".into());
+            params.push(format!("{}*", glob_escape(code)).into());
+        }
         let code = f.product_code.trim();
         if !code.is_empty() {
             clauses.push("r.product_code GLOB ?".into());
@@ -812,6 +950,11 @@ impl Db {
             clauses.push(clause);
             params.push(param.into());
         }
+        // Analytics count each unique row once: skip rows flagged as repeats.
+        // Search and the result table leave this off so duplicates stay visible.
+        if unique_only {
+            clauses.push("r.dup_first_file IS NULL".into());
+        }
         let where_sql = if clauses.is_empty() {
             String::new()
         } else {
@@ -821,7 +964,7 @@ impl Db {
     }
 
     pub fn count(&self, q: &Query) -> rusqlite::Result<u64> {
-        let (joins, where_sql, params) = self.build_where(q);
+        let (joins, where_sql, params) = self.build_where(q, false);
         let sql = format!("SELECT COUNT(*) FROM records r{joins}{where_sql}");
         let n: i64 = self
             .conn
@@ -829,24 +972,22 @@ impl Db {
         Ok(n as u64)
     }
 
-    /// Result page: (row ids, RESULT_COLUMNS values).
-    pub fn search_page(
-        &self,
-        q: &Query,
-        limit: u64,
-        offset: u64,
-    ) -> rusqlite::Result<(Vec<i64>, Vec<Vec<String>>)> {
-        let (joins, where_sql, mut params) = self.build_where(q);
+    /// Result page: (row ids, RESULT_COLUMNS values, duplicate first-file hints).
+    pub fn search_page(&self, q: &Query, limit: u64, offset: u64) -> rusqlite::Result<SearchPage> {
+        // false: the result table shows every matching row, duplicates included
+        // (they are highlighted, not hidden).
+        let (joins, where_sql, mut params) = self.build_where(q, false);
         let select: Vec<String> = RESULT_COLUMNS.iter().map(|c| format!("r.{c}")).collect();
-        // Without conditions, page by insertion order, which is instant at any
-        // size. With conditions, sort by date after the result set is narrowed.
-        let order = if q.is_empty() {
+        // Broad indexed filters (year, product code, EDRPOU) can match millions
+        // of rows. Date sorting those sets forces SQLite to build a temporary
+        // sort tree, so page by insertion order for the fast structural paths.
+        let order = if uses_fast_result_order(q) {
             "r.id DESC"
         } else {
             "r.declaration_date DESC, r.id DESC"
         };
         let sql = format!(
-            "SELECT r.id, {} FROM records r{joins}{where_sql} ORDER BY {order} LIMIT ? OFFSET ?",
+            "SELECT r.id, {}, r.dup_first_file FROM records r{joins}{where_sql} ORDER BY {order} LIMIT ? OFFSET ?",
             select.join(", ")
         );
         params.push((limit as i64).into());
@@ -855,6 +996,7 @@ impl Db {
         let mut rows = stmt.query(params_from_iter(params))?;
         let mut ids = Vec::new();
         let mut data = Vec::new();
+        let mut dups = Vec::new();
         while let Some(row) = rows.next()? {
             ids.push(row.get::<_, i64>(0)?);
             let mut values = Vec::with_capacity(RESULT_COLUMNS.len());
@@ -862,8 +1004,10 @@ impl Db {
                 values.push(row.get::<_, Option<String>>(i + 1)?.unwrap_or_default());
             }
             data.push(values);
+            // dup_first_file follows the RESULT_COLUMNS block; Some => repeat.
+            dups.push(row.get::<_, Option<String>>(RESULT_COLUMNS.len() + 1)?);
         }
-        Ok((ids, data))
+        Ok((ids, data, dups))
     }
 
     /// Export row batch using keyset pagination by id: all 41 columns plus file.
@@ -873,7 +1017,7 @@ impl Db {
         last_id: i64,
         limit: u64,
     ) -> rusqlite::Result<(i64, Vec<Vec<String>>)> {
-        let (joins, where_sql, mut params) = self.build_where(q);
+        let (joins, where_sql, mut params) = self.build_where(q, false);
         let select: Vec<String> = COLUMNS.iter().map(|c| format!("r.{}", c.name)).collect();
         let cond = if where_sql.is_empty() {
             " WHERE"
@@ -1058,39 +1202,7 @@ impl Db {
                 );
             }
             Some(AnalyticsScope::Prices) => {
-                analytics.price_sections = vec![
-                    self.price_metric(
-                        q,
-                        PriceMetricKind::ValuePerNetKg,
-                        "CASE
-                            WHEN num_value(r.currency_control_value) IS NOT NULL
-                                AND num_value(r.net_kg) IS NOT NULL
-                                AND num_value(r.net_kg) > 0
-                            THEN num_value(r.currency_control_value) / num_value(r.net_kg)
-                         END",
-                    )?,
-                    self.price_metric(q, PriceMetricKind::RfvUsdKg, "num_value(r.rfv_usd_kg)")?,
-                    self.price_metric(
-                        q,
-                        PriceMetricKind::RmvNetUsdKg,
-                        "num_value(r.rmv_net_usd_kg)",
-                    )?,
-                    self.price_metric(
-                        q,
-                        PriceMetricKind::RmvUsdExtraUnit,
-                        "num_value(r.rmv_usd_extra_unit)",
-                    )?,
-                    self.price_metric(
-                        q,
-                        PriceMetricKind::RmvGrossUsdKg,
-                        "num_value(r.rmv_gross_usd_kg)",
-                    )?,
-                    self.price_metric(
-                        q,
-                        PriceMetricKind::MinBaseUsdKg,
-                        "num_value(r.min_base_usd_kg)",
-                    )?,
-                ];
+                analytics.price_sections = self.analytics_price_metrics(q)?;
             }
         }
         Ok(analytics)
@@ -1120,7 +1232,7 @@ impl Db {
     }
 
     fn analytics_overview(&self, q: &Query) -> rusqlite::Result<AnalyticsOverview> {
-        let (joins, where_sql, params) = self.build_where(q);
+        let (joins, where_sql, params) = self.build_where(q, true);
         let sql = format!(
             "SELECT
                 COUNT(*),
@@ -1169,7 +1281,7 @@ impl Db {
     /// Import dynamics grouped by month ("YYYY-MM" from the ISO date).
     /// Returns the most recent 48 months in chronological order.
     fn analytics_months(&self, q: &Query) -> rusqlite::Result<Vec<AnalyticsMonthRow>> {
-        let (joins, where_sql, params) = self.build_where(q);
+        let (joins, where_sql, params) = self.build_where(q, true);
         let month_filter = "TRIM(r.declaration_date) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]*'";
         let filter_sql = if where_sql.is_empty() {
             format!(" WHERE {month_filter}")
@@ -1217,16 +1329,56 @@ impl Db {
         };
         let overview = self.analytics_overview(&q)?;
         let months = self.analytics_months(&q)?;
-        let top_products = self
-            .analytics_group(
+        let product_sections = vec![
+            self.analytics_section_with_overview(
                 &q,
                 AnalyticsSectionKind::ProductCodes,
-                "r.product_code",
-                AnalyticsFilterField::ProductCode,
+                10,
                 limit,
                 &overview,
-            )?
-            .rows;
+            )?,
+            self.analytics_section_with_overview(
+                &q,
+                AnalyticsSectionKind::Trademarks,
+                10,
+                limit,
+                &overview,
+            )?,
+            self.analytics_section_with_overview(
+                &q,
+                AnalyticsSectionKind::ProductGroups,
+                10,
+                limit,
+                &overview,
+            )?,
+        ];
+        let country_sections = vec![
+            self.analytics_section_with_overview(
+                &q,
+                AnalyticsSectionKind::OriginCountries,
+                10,
+                limit,
+                &overview,
+            )?,
+            self.analytics_section_with_overview(
+                &q,
+                AnalyticsSectionKind::DispatchCountries,
+                10,
+                limit,
+                &overview,
+            )?,
+            self.analytics_section_with_overview(
+                &q,
+                AnalyticsSectionKind::TradeCountries,
+                10,
+                limit,
+                &overview,
+            )?,
+        ];
+        let price_sections = self.analytics_price_metrics(&q)?;
+        let top_products = section_rows(&product_sections, AnalyticsSectionKind::ProductCodes);
+        let top_origin_countries =
+            section_rows(&country_sections, AnalyticsSectionKind::OriginCountries);
         let top_senders = self
             .analytics_group(
                 &q,
@@ -1237,22 +1389,13 @@ impl Db {
                 &overview,
             )?
             .rows;
-        let top_origin_countries = self
-            .analytics_group(
-                &q,
-                AnalyticsSectionKind::OriginCountries,
-                "r.origin_country",
-                AnalyticsFilterField::OriginCountry,
-                limit,
-                &overview,
-            )?
-            .rows;
 
         let mut names = Vec::new();
         let mut stmt = self.conn.prepare(
             "SELECT TRIM(recipient) AS name, COUNT(*) AS n
              FROM records
              WHERE TRIM(edrpou) = ?1 AND TRIM(COALESCE(recipient, '')) <> ''
+                AND dup_first_file IS NULL
              GROUP BY name ORDER BY n DESC LIMIT 8",
         )?;
         let rows = stmt.query_map([edrpou.trim()], |row| row.get::<_, String>(0))?;
@@ -1268,6 +1411,9 @@ impl Db {
             top_products,
             top_senders,
             top_origin_countries,
+            product_sections,
+            country_sections,
+            price_sections,
         })
     }
 
@@ -1282,7 +1428,7 @@ impl Db {
         min_samples: u64,
         limit: u64,
     ) -> rusqlite::Result<Undervaluation> {
-        let (joins, where_sql, params) = self.build_where(q);
+        let (joins, where_sql, params) = self.build_where(q, true);
         let cond = if where_sql.is_empty() {
             " WHERE"
         } else {
@@ -1357,7 +1503,7 @@ impl Db {
         limits: PivotLimits,
         others_label: &str,
     ) -> rusqlite::Result<PivotResult> {
-        let (joins, where_sql, params) = self.build_where(q);
+        let (joins, where_sql, params) = self.build_where(q, true);
         let row_sql = row_dim.sql();
         let col_sql = col_dim.sql();
         let non_empty = format!("{row_sql} <> '' AND {col_sql} <> ''");
@@ -1474,7 +1620,7 @@ impl Db {
         limit: u64,
         overview: &AnalyticsOverview,
     ) -> rusqlite::Result<AnalyticsSection> {
-        let (joins, where_sql, mut params) = self.build_where(q);
+        let (joins, where_sql, mut params) = self.build_where(q, true);
         let label_sql = format!("label_value({label_expr})");
         let non_empty = format!("{label_sql} <> ''");
         let filter_sql = if where_sql.is_empty() {
@@ -1542,13 +1688,49 @@ impl Db {
         })
     }
 
+    fn analytics_price_metrics(&self, q: &Query) -> rusqlite::Result<Vec<AnalyticsPriceMetric>> {
+        Ok(vec![
+            self.price_metric(
+                q,
+                PriceMetricKind::ValuePerNetKg,
+                "CASE
+                    WHEN num_value(r.currency_control_value) IS NOT NULL
+                        AND num_value(r.net_kg) IS NOT NULL
+                        AND num_value(r.net_kg) > 0
+                    THEN num_value(r.currency_control_value) / num_value(r.net_kg)
+                 END",
+            )?,
+            self.price_metric(q, PriceMetricKind::RfvUsdKg, "num_value(r.rfv_usd_kg)")?,
+            self.price_metric(
+                q,
+                PriceMetricKind::RmvNetUsdKg,
+                "num_value(r.rmv_net_usd_kg)",
+            )?,
+            self.price_metric(
+                q,
+                PriceMetricKind::RmvUsdExtraUnit,
+                "num_value(r.rmv_usd_extra_unit)",
+            )?,
+            self.price_metric(
+                q,
+                PriceMetricKind::RmvGrossUsdKg,
+                "num_value(r.rmv_gross_usd_kg)",
+            )?,
+            self.price_metric(
+                q,
+                PriceMetricKind::MinBaseUsdKg,
+                "num_value(r.min_base_usd_kg)",
+            )?,
+        ])
+    }
+
     fn price_metric(
         &self,
         q: &Query,
         kind: PriceMetricKind,
         price_expr: &str,
     ) -> rusqlite::Result<AnalyticsPriceMetric> {
-        let (joins, where_sql, params) = self.build_where(q);
+        let (joins, where_sql, params) = self.build_where(q, true);
         let sql = format!(
             "SELECT
                 COUNT(price),
@@ -2006,6 +2188,45 @@ fn glob_escape(value: &str) -> String {
         }
     }
     out
+}
+
+fn product_code_search_prefix(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if !(4..=10).contains(&value.len()) || !value.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let chapter = value.get(..2)?.parse::<u8>().ok()?;
+    if !(1..=97).contains(&chapter) {
+        return None;
+    }
+    // Avoid turning likely year/declaration-number searches into product-code
+    // searches. HS chapter 20 headings are 2001..2009, so 20xx years are not
+    // useful product-code prefixes in practice.
+    if value.len() == 4 && value.starts_with("20") {
+        return None;
+    }
+    Some(value)
+}
+
+fn uses_fast_result_order(q: &Query) -> bool {
+    if q.is_empty() || product_code_search_prefix(&q.text).is_some() {
+        return true;
+    }
+    if !q.text.trim().is_empty() {
+        return false;
+    }
+    let f = &q.filters;
+    [
+        &f.trademark,
+        &f.description,
+        &f.sender,
+        &f.recipient,
+        &f.trade_country,
+        &f.dispatch_country,
+        &f.origin_country,
+    ]
+    .iter()
+    .all(|value| value.trim().is_empty())
 }
 
 /// Extracts a 20xx year from date text.

@@ -13,6 +13,7 @@ use base_search::db::{
 use base_search::export;
 use base_search::import::{self, ImportPhase};
 use base_search::schema::RESULT_COLUMNS;
+use base_search::web;
 
 const USAGE: &str = "base-search-cli — техническая проверка базы Base Search
 
@@ -23,10 +24,12 @@ const USAGE: &str = "base-search-cli — техническая проверка
   base-search-cli search <db> [запрос...] [--limit N] [--year Y] [--code C]
                      [--sender S] [--recipient R] [--edrpou E]
                      [--trademark T] [--description D]
+                     [--repeat N] [--warmups N] [--no-print-rows] [--json]
   base-search-cli analytics <db> [запрос...] [--year Y] [--code C]
                        [--sender S] [--recipient R] [--edrpou E]
                        [--trademark T] [--description D]
-  base-search-cli export <db> <out.csv|out.xlsx> [запрос...]";
+  base-search-cli export <db> <out.csv|out.xlsx> [запрос...]
+  base-search-cli web [db] [--host 127.0.0.1] [--port 7832] [--no-open]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -37,6 +40,7 @@ fn main() -> ExitCode {
         Some("search") if args.len() >= 2 => cmd_search(Path::new(&args[1]), &args[2..]),
         Some("analytics") if args.len() >= 2 => cmd_analytics(Path::new(&args[1]), &args[2..]),
         Some("export") if args.len() >= 3 => cmd_export(Path::new(&args[1]), &args[2], &args[3..]),
+        Some("web") => cmd_web(&args[1..]),
         Some("sql") if args.len() == 3 => cmd_sql(Path::new(&args[1]), &args[2]),
         _ => {
             eprintln!("{USAGE}");
@@ -50,6 +54,43 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn cmd_web(args: &[String]) -> Result<(), String> {
+    let mut config = web::WebConfig::new(base_search::app::default_db_path());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" => {
+                i += 1;
+                config.host = args
+                    .get(i)
+                    .ok_or_else(|| "--host requires a value".to_string())?
+                    .clone();
+            }
+            "--port" => {
+                i += 1;
+                config.port = args
+                    .get(i)
+                    .ok_or_else(|| "--port requires a value".to_string())?
+                    .parse()
+                    .map_err(|_| "--port must be a number from 0 to 65535".to_string())?;
+            }
+            "--no-open" => config.open_browser = false,
+            "--token" => {
+                i += 1;
+                config.token = Some(
+                    args.get(i)
+                        .ok_or_else(|| "--token requires a value".to_string())?
+                        .clone(),
+                );
+            }
+            value if !value.starts_with("--") => config.db_path = PathBuf::from(value),
+            other => return Err(format!("Unknown web option: {other}")),
+        }
+        i += 1;
+    }
+    web::run(config)
 }
 
 fn cmd_stats(db_path: &Path) -> Result<(), String> {
@@ -211,6 +252,75 @@ fn parse_query(args: &[String]) -> (Query, u64) {
     (q, limit)
 }
 
+#[derive(Debug, Clone)]
+struct SearchOptions {
+    repeat: usize,
+    warmups: usize,
+    print_rows: bool,
+    json: bool,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            repeat: 1,
+            warmups: 0,
+            print_rows: true,
+            json: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SearchRun {
+    count_ms: f64,
+    page_ms: f64,
+    total: u64,
+    page_rows: usize,
+    rows: Option<Vec<Vec<String>>>,
+}
+
+fn parse_search_args(args: &[String]) -> Result<(Vec<String>, SearchOptions), String> {
+    let mut query_args = Vec::new();
+    let mut options = SearchOptions::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--repeat" => {
+                i += 1;
+                options.repeat = parse_positive_usize(args.get(i), "--repeat")?;
+            }
+            "--warmups" => {
+                i += 1;
+                options.warmups = parse_usize(args.get(i), "--warmups")?;
+            }
+            "--no-print-rows" => options.print_rows = false,
+            "--json" => {
+                options.json = true;
+                options.print_rows = false;
+            }
+            arg => query_args.push(arg.to_string()),
+        }
+        i += 1;
+    }
+    Ok((query_args, options))
+}
+
+fn parse_usize(value: Option<&String>, flag: &str) -> Result<usize, String> {
+    value
+        .ok_or_else(|| format!("{flag} requires a value"))?
+        .parse()
+        .map_err(|_| format!("{flag} must be a non-negative integer"))
+}
+
+fn parse_positive_usize(value: Option<&String>, flag: &str) -> Result<usize, String> {
+    let parsed = parse_usize(value, flag)?;
+    if parsed == 0 {
+        return Err(format!("{flag} must be at least 1"));
+    }
+    Ok(parsed)
+}
+
 /// Completes the search index after an interrupted import or migration.
 fn ensure_indexed(db: &mut Db) -> Result<(), String> {
     if db.unindexed_rows() > 0 {
@@ -225,15 +335,66 @@ fn ensure_indexed(db: &mut Db) -> Result<(), String> {
 fn cmd_search(db_path: &Path, args: &[String]) -> Result<(), String> {
     let mut db = Db::open(db_path)?;
     ensure_indexed(&mut db)?;
-    let (q, limit) = parse_query(args);
+    let (query_args, options) = parse_search_args(args)?;
+    let (q, limit) = parse_query(&query_args);
+    for _ in 0..options.warmups {
+        run_search_once(&db, &q, limit, false)?;
+    }
+    let mut runs = Vec::with_capacity(options.repeat);
+    for idx in 0..options.repeat {
+        let keep_rows = options.print_rows && options.repeat == 1 && idx == 0;
+        runs.push(run_search_once(&db, &q, limit, keep_rows)?);
+    }
+    if options.json {
+        print_search_json(&q, limit, &options, &runs);
+        return Ok(());
+    }
+    if options.repeat == 1 {
+        let run = &runs[0];
+        println!(
+            "Найдено: {} (count {:.3} мс, страница {:.3} мс)",
+            run.total, run.count_ms, run.page_ms
+        );
+    } else {
+        for (idx, run) in runs.iter().enumerate() {
+            println!(
+                "Run {}: found {} (count {:.3} ms, page {:.3} ms, rows {})",
+                idx + 1,
+                run.total,
+                run.count_ms,
+                run.page_ms,
+                run.page_rows
+            );
+        }
+        print_search_summary(&runs);
+    }
+    if options.print_rows
+        && options.repeat == 1
+        && let Some(rows) = &runs[0].rows
+    {
+        print_search_rows(rows);
+    }
+    Ok(())
+}
+
+fn run_search_once(db: &Db, q: &Query, limit: u64, keep_rows: bool) -> Result<SearchRun, String> {
     let started = Instant::now();
-    let total = db.count(&q).map_err(|e| e.to_string())?;
-    let count_ms = started.elapsed().as_millis();
+    let total = db.count(q).map_err(|e| e.to_string())?;
+    let count_ms = started.elapsed().as_secs_f64() * 1000.0;
     let started = Instant::now();
-    let (_ids, rows) = db.search_page(&q, limit, 0).map_err(|e| e.to_string())?;
-    let page_ms = started.elapsed().as_millis();
-    println!("Найдено: {total} (count {count_ms} мс, страница {page_ms} мс)");
-    for row in &rows {
+    let (_ids, rows, _dups) = db.search_page(q, limit, 0).map_err(|e| e.to_string())?;
+    let page_ms = started.elapsed().as_secs_f64() * 1000.0;
+    Ok(SearchRun {
+        count_ms,
+        page_ms,
+        total,
+        page_rows: rows.len(),
+        rows: keep_rows.then_some(rows),
+    })
+}
+
+fn print_search_rows(rows: &[Vec<String>]) {
+    for row in rows {
         let desc: String = result_value(row, "description").chars().take(60).collect();
         println!(
             "  {} | {} | {} | {} | {} | {}",
@@ -245,7 +406,83 @@ fn cmd_search(db_path: &Path, args: &[String]) -> Result<(), String> {
             desc
         );
     }
-    Ok(())
+}
+
+fn print_search_summary(runs: &[SearchRun]) {
+    println!(
+        "Summary: count avg {:.3} ms min {:.3} max {:.3}; page avg {:.3} ms min {:.3} max {:.3}",
+        avg_ms(runs, |run| run.count_ms),
+        min_ms(runs, |run| run.count_ms),
+        max_ms(runs, |run| run.count_ms),
+        avg_ms(runs, |run| run.page_ms),
+        min_ms(runs, |run| run.page_ms),
+        max_ms(runs, |run| run.page_ms),
+    );
+}
+
+fn print_search_json(q: &Query, limit: u64, options: &SearchOptions, runs: &[SearchRun]) {
+    let total = runs.first().map(|run| run.total).unwrap_or(0);
+    let page_rows = runs.first().map(|run| run.page_rows).unwrap_or(0);
+    print!(
+        "{{\"query\":\"{}\",\"limit\":{},\"repeat\":{},\"warmups\":{},\"total\":{},\"page_rows\":{},",
+        json_escape(&q.text),
+        limit,
+        options.repeat,
+        options.warmups,
+        total,
+        page_rows
+    );
+    print!(
+        "\"count_ms\":{{\"avg\":{:.3},\"min\":{:.3},\"max\":{:.3}}},",
+        avg_ms(runs, |run| run.count_ms),
+        min_ms(runs, |run| run.count_ms),
+        max_ms(runs, |run| run.count_ms),
+    );
+    print!(
+        "\"page_ms\":{{\"avg\":{:.3},\"min\":{:.3},\"max\":{:.3}}},\"runs\":[",
+        avg_ms(runs, |run| run.page_ms),
+        min_ms(runs, |run| run.page_ms),
+        max_ms(runs, |run| run.page_ms),
+    );
+    for (idx, run) in runs.iter().enumerate() {
+        if idx > 0 {
+            print!(",");
+        }
+        print!(
+            "{{\"count_ms\":{:.3},\"page_ms\":{:.3},\"total\":{},\"page_rows\":{}}}",
+            run.count_ms, run.page_ms, run.total, run.page_rows
+        );
+    }
+    println!("]}}");
+}
+
+fn avg_ms(runs: &[SearchRun], value: impl Fn(&SearchRun) -> f64) -> f64 {
+    if runs.is_empty() {
+        return 0.0;
+    }
+    runs.iter().map(value).sum::<f64>() / runs.len() as f64
+}
+
+fn min_ms(runs: &[SearchRun], value: impl Fn(&SearchRun) -> f64) -> f64 {
+    runs.iter().map(value).fold(f64::INFINITY, f64::min)
+}
+
+fn max_ms(runs: &[SearchRun], value: impl Fn(&SearchRun) -> f64) -> f64 {
+    runs.iter().map(value).fold(0.0, f64::max)
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| match ch {
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\\' => "\\\\".chars().collect(),
+            '\n' => "\\n".chars().collect(),
+            '\r' => "\\r".chars().collect(),
+            '\t' => "\\t".chars().collect(),
+            ch => vec![ch],
+        })
+        .collect()
 }
 
 fn cmd_analytics(db_path: &Path, args: &[String]) -> Result<(), String> {
