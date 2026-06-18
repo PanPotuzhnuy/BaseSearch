@@ -40,7 +40,7 @@ impl Lang {
     pub fn from_code(code: &str) -> Lang {
         match code {
             "ua" => Lang::Ua,
-            "ru" => Lang::Ru,
+            "ru" => Lang::Ua,
             "de" => Lang::De,
             "es" => Lang::Es,
             "fr" => Lang::Fr,
@@ -49,7 +49,7 @@ impl Lang {
             "ro" => Lang::Ro,
             "hu" => Lang::Hu,
             "bg" => Lang::Bg,
-            "be" => Lang::Be,
+            "be" => Lang::Ua,
             "zh" => Lang::Zh,
             _ => Lang::En,
         }
@@ -73,10 +73,9 @@ impl Lang {
         }
     }
 
-    pub const ALL: [Lang; 13] = [
+    pub const ALL: [Lang; 11] = [
         Lang::En,
         Lang::Ua,
-        Lang::Ru,
         Lang::De,
         Lang::Es,
         Lang::Fr,
@@ -85,7 +84,6 @@ impl Lang {
         Lang::Ro,
         Lang::Hu,
         Lang::Bg,
-        Lang::Be,
         Lang::Zh,
     ];
 }

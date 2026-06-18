@@ -48,9 +48,9 @@ on the user's computer.
   browser. This is still local: it is not an internet service.
 - Keep the interface responsive while importing, searching, exporting, or
   cleaning the database.
-- Use light/dark theme, adjustable UI scale, and a 13-language interface
-  (English by default; also Ukrainian, Russian, German, Spanish, French,
-  Polish, Portuguese, Romanian, Hungarian, Bulgarian, Belarusian, and Chinese).
+- Use light/dark theme, adjustable UI scale, and an 11-language interface
+  (English by default; also Ukrainian, German, Spanish, French, Polish,
+  Portuguese, Romanian, Hungarian, Bulgarian, and Chinese).
 - Run fully locally with no server and no cloud upload.
 
 ## Why Not Just Excel?
@@ -386,7 +386,7 @@ application executable.
   directly from the current product, company, EDRPOU, year, or country filter
   into the right analytical view: companies, goods, countries, prices, monthly
   dynamics, pivots, full group lists, or company dossiers. The menu is
-  translated for all 13 interface languages.
+  translated for all supported interface languages.
 - **Expanded column glossary.** Abbreviated customs table headers now show
   hover explanations for technical fields such as `43`, `43_01`, `Вага по МД`,
   `Умови пост.`, `Місце пост`, `Вага.один.`, `Вага різн.`, `3001`, `3002`,
@@ -404,10 +404,10 @@ application executable.
   step in the terminal — it checks the OS, installs the Rust toolchain (and the
   Linux GUI libraries) only when missing, builds the app, and launches it — so
   a non-technical user can set everything up with a single command.
-- **13 interface languages, English by default.** The app now starts in
-  English everywhere; the interface is also available in Ukrainian, Russian,
-  German, Spanish, French, Polish, Portuguese, Romanian, Hungarian, Bulgarian,
-  Belarusian, and Chinese, switchable any time in Settings.
+- **11 interface languages, English by default.** The app now starts in
+  English everywhere; the interface is also available in Ukrainian, German,
+  Spanish, French, Polish, Portuguese, Romanian, Hungarian, Bulgarian, and
+  Chinese, switchable any time in Settings.
 - **CJK font fallback.** Base Search uses system CJK fonts when available so
   the Chinese interface renders without bundling a large font into the binary.
 - **Localization cleanup.** UI strings that used to be hardcoded in the app are

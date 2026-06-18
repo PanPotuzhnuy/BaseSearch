@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ru">
+<html lang="uk">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -13,7 +13,7 @@
           <div class="brand-mark">BS</div>
           <div>
             <div class="brand-title">Base Search</div>
-            <div class="brand-subtitle" id="db-status">Локальная база</div>
+            <div class="brand-subtitle" id="db-status">Локальна база</div>
           </div>
         </div>
 
@@ -23,9 +23,9 @@
             name="text"
             autocomplete="off"
             data-i18n-ph="search_hint"
-            placeholder="Товар, компания, код товара, № декларации, бренд…"
+            placeholder="Товар, компанія, код товару, № декларації, бренд…"
           />
-          <button class="primary" type="submit" data-i18n="find">Найти</button>
+          <button class="primary" type="submit" data-i18n="find">Знайти</button>
         </form>
 
         <div class="top-actions">
@@ -37,30 +37,30 @@
 
       <main class="workbench">
         <aside class="filters">
-          <div class="side-title" data-i18n="filters">Фильтры</div>
-          <label><span data-i18n="year">Год</span><input id="year" inputmode="numeric" placeholder="2024" /></label>
-          <label><span data-i18n="product_code">Код товара</span><input id="product_code" placeholder="8517" /></label>
+          <div class="side-title" data-i18n="filters">Фільтри</div>
+          <label><span data-i18n="year">Рік</span><input id="year" inputmode="numeric" placeholder="2024" /></label>
+          <label><span data-i18n="product_code">Код товару</span><input id="product_code" placeholder="8517" /></label>
           <label><span data-i18n="edrpou">ЕДРПОУ</span><input id="edrpou" placeholder="12345678" /></label>
-          <label><span data-i18n="trademark">Торговая марка</span><input id="trademark" placeholder="Apple" /></label>
-          <label><span data-i18n="recipient">Получатель</span><input id="recipient" placeholder="—" /></label>
-          <label><span data-i18n="sender">Отправитель</span><input id="sender" placeholder="—" /></label>
-          <label><span data-i18n="description">Описание</span><input id="description" placeholder="iPhone…" /></label>
-          <label><span data-i18n="origin_country">Страна происхождения</span><input id="origin_country" placeholder="CN" /></label>
-          <label><span data-i18n="dispatch_country">Страна отправления</span><input id="dispatch_country" placeholder="PL" /></label>
-          <label><span data-i18n="trade_country">Страна торговли</span><input id="trade_country" placeholder="IE" /></label>
-          <button class="clear" id="clear-filters" type="button" data-i18n="clear_filters">Сбросить фильтры</button>
+          <label><span data-i18n="trademark">Торгова марка</span><input id="trademark" placeholder="Apple" /></label>
+          <label><span data-i18n="recipient">Одержувач</span><input id="recipient" placeholder="—" /></label>
+          <label><span data-i18n="sender">Відправник</span><input id="sender" placeholder="—" /></label>
+          <label><span data-i18n="description">Опис</span><input id="description" placeholder="iPhone…" /></label>
+          <label><span data-i18n="origin_country">Країна походження</span><input id="origin_country" placeholder="CN" /></label>
+          <label><span data-i18n="dispatch_country">Країна відправлення</span><input id="dispatch_country" placeholder="PL" /></label>
+          <label><span data-i18n="trade_country">Країна торгівлі</span><input id="trade_country" placeholder="IE" /></label>
+          <button class="clear" id="clear-filters" type="button" data-i18n="clear_filters">Скинути фільтри</button>
         </aside>
 
         <section class="main-panel">
           <nav class="tabs">
-            <button class="tab active" data-tab="results" type="button" data-i18n="results_tab">Результаты</button>
-            <button class="tab" data-tab="analytics" type="button" data-i18n="analytics">Аналитика</button>
+            <button class="tab active" data-tab="results" type="button" data-i18n="results_tab">Результати</button>
+            <button class="tab" data-tab="analytics" type="button" data-i18n="analytics">Аналітика</button>
           </nav>
 
           <section class="tab-panel active" id="results-panel">
             <div class="panel-head">
               <div>
-                <div class="panel-title" data-i18n="results_tab">Результаты</div>
+                <div class="panel-title" data-i18n="results_tab">Результати</div>
                 <div class="panel-subtitle" id="results-meta">—</div>
               </div>
               <div class="pager">
@@ -80,7 +80,7 @@
           <section class="tab-panel" id="analytics-panel">
             <div class="panel-head">
               <div>
-                <div class="panel-title" data-i18n="analytics">Аналитика</div>
+                <div class="panel-title" data-i18n="analytics">Аналітика</div>
                 <div class="panel-subtitle" id="analytics-meta">—</div>
               </div>
               <select id="analytics-limit" title="Top N">
@@ -90,14 +90,14 @@
               </select>
             </div>
             <nav class="subtabs" id="analytics-subtabs">
-              <button class="chip active" data-group="overview" type="button" data-i18n="tab_overview">Обзор</button>
-              <button class="chip" data-group="companies" type="button" data-i18n="companies_section">Компании</button>
-              <button class="chip" data-group="goods" type="button" data-i18n="products_section">Товары</button>
-              <button class="chip" data-group="countries" type="button" data-i18n="countries_section">Страны</button>
-              <button class="chip" data-group="prices" type="button" data-i18n="prices_section">Цены</button>
+              <button class="chip active" data-group="overview" type="button" data-i18n="tab_overview">Огляд</button>
+              <button class="chip" data-group="companies" type="button" data-i18n="companies_section">Компанії</button>
+              <button class="chip" data-group="goods" type="button" data-i18n="products_section">Товари</button>
+              <button class="chip" data-group="countries" type="button" data-i18n="countries_section">Країни</button>
+              <button class="chip" data-group="prices" type="button" data-i18n="prices_section">Ціни</button>
             </nav>
             <div class="analytics-scroll" id="analytics-scroll">
-              <div class="empty" data-i18n="analytics_hint">Введите запрос или фильтр.</div>
+              <div class="empty" data-i18n="analytics_hint">Введіть запит або фільтр.</div>
             </div>
           </section>
         </section>
@@ -111,7 +111,7 @@
           <div class="drawer-title" id="drawer-title">—</div>
           <div class="drawer-subtitle" id="drawer-subtitle"></div>
         </div>
-        <button id="drawer-close" type="button" data-i18n="close">Закрыть</button>
+        <button id="drawer-close" type="button" data-i18n="close">Закрити</button>
       </div>
       <div id="drawer-body" class="drawer-body"></div>
     </aside>
@@ -121,7 +121,7 @@
         <div class="modal-head">
           <div class="modal-title" id="modal-title">—</div>
           <input id="modal-search" class="modal-search" autocomplete="off" />
-          <button id="modal-copy" type="button" data-i18n="copy_visible">Копировать</button>
+          <button id="modal-copy" type="button" data-i18n="copy_visible">Копіювати</button>
           <button id="modal-close" type="button">✕</button>
         </div>
         <div class="modal-meta" id="modal-meta"></div>

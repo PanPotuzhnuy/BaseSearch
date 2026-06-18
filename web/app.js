@@ -78,9 +78,9 @@ const PRICE_KEY = {
 };
 
 const $ = (id) => document.getElementById(id);
-const fmtInt = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 });
-const fmtNum = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 });
-const fmtKg = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 3 });
+const fmtInt = new Intl.NumberFormat("uk-UA", { maximumFractionDigits: 0 });
+const fmtNum = new Intl.NumberFormat("uk-UA", { maximumFractionDigits: 2 });
+const fmtKg = new Intl.NumberFormat("uk-UA", { maximumFractionDigits: 3 });
 
 function esc(value) {
   return String(value ?? "")
@@ -120,7 +120,7 @@ function cleanParams(params) {
 
 async function api(path, params = {}) {
   if (!state.token) {
-    throw new Error("Нет локального токена сессии. Запустите браузерный режим заново.");
+    throw new Error("Немає локального токена сесії. Запустіть браузерний режим заново.");
   }
   const qs = new URLSearchParams(cleanParams({ ...params, token: state.token }));
   const response = await fetch(`${path}?${qs.toString()}`, { cache: "no-store" });
@@ -175,7 +175,7 @@ async function loadI18n() {
 }
 
 function applyI18n() {
-  document.documentElement.lang = state.lang;
+  document.documentElement.lang = state.lang === "ua" ? "uk" : state.lang;
   for (const el of document.querySelectorAll("[data-i18n]")) {
     const value = state.i18n[el.dataset.i18n];
     if (value) el.textContent = value;
@@ -297,14 +297,14 @@ function closeDrawer() {
 async function openCard(id) {
   try {
     const data = await api("/api/card", { id });
-    $("drawer-title").textContent = `${t("details", "Карточка")} #${id}`;
+    $("drawer-title").textContent = `${t("details", "Картка")} #${id}`;
     $("drawer-subtitle").textContent = data.source_file || "";
     $("drawer-body").innerHTML = data.fields
       .map((field) => {
         const value = esc(field.value || "");
         const profile =
           field.label.includes("ЕДРПОУ") && field.value
-            ? `<button class="profile-button" data-edrpou="${esc(field.value)}" type="button">${esc(t("company_profile", "Профиль"))}</button>`
+            ? `<button class="profile-button" data-edrpou="${esc(field.value)}" type="button">${esc(t("company_profile", "Профіль"))}</button>`
             : "";
         return `<div class="field"><div class="field-label">${esc(field.label)}</div><div class="field-value">${value || "&nbsp;"}</div>${profile}</div>`;
       })
@@ -326,7 +326,7 @@ async function openCompany(edrpou) {
   try {
     const data = await api("/api/company", { edrpou, limit: 10 });
     const profile = data.profile;
-    $("drawer-title").textContent = `${t("company_profile", "Компания")} ${profile.edrpou}`;
+    $("drawer-title").textContent = `${t("company_profile", "Компанія")} ${profile.edrpou}`;
     $("drawer-subtitle").textContent = (profile.names || []).join(" · ");
     $("drawer-body").innerHTML = `
       <div class="kpi-grid drawer-kpis">${kpiHtml(profile.overview)}</div>
@@ -369,7 +369,7 @@ async function loadAnalytics() {
     scroll.innerHTML = `
       <div class="analytics-group" data-group="overview">
         <div class="kpi-grid">${kpiHtml(a.overview)}</div>
-        <div class="block-title">${esc(t("months_section", "Динамика по месяцам"))}</div>
+        <div class="block-title">${esc(t("months_section", "Динаміка за місяцями"))}</div>
         <div class="month-chart">${monthsHtml(a.months || [])}</div>
       </div>
       <div class="analytics-group" data-group="companies">${grid(t("nothing_found", "—"), sectionsHtml(a.company_sections || []))}</div>
@@ -397,11 +397,11 @@ function applyAnalyticsGroup() {
 function kpiHtml(overview) {
   if (!overview) return "";
   const items = [
-    [t("rows_label", "Строки"), fmtInt.format(overview.row_count)],
-    [t("declarations_label", "Декларации"), fmtInt.format(overview.declaration_count)],
-    [t("recipients_label", "Получатели"), fmtInt.format(overview.distinct_recipients)],
-    [t("unique_senders", "Отправители"), fmtInt.format(overview.distinct_senders)],
-    [t("total_value", "Сумма"), `${fmtNum.format(overview.total_value_usd)} $`],
+    [t("rows_label", "Рядки"), fmtInt.format(overview.row_count)],
+    [t("declarations_label", "Декларації"), fmtInt.format(overview.declaration_count)],
+    [t("recipients_label", "Одержувачі"), fmtInt.format(overview.distinct_recipients)],
+    [t("unique_senders", "Відправники"), fmtInt.format(overview.distinct_senders)],
+    [t("total_value", "Сума"), `${fmtNum.format(overview.total_value_usd)} $`],
     [t("net_weight", "Нетто"), `${fmtKg.format(overview.total_net_kg)}`],
     [t("gross_weight", "Брутто"), `${fmtKg.format(overview.total_gross_kg)}`],
     [t("avg_value_kg", "$/кг"), fmtNum.format(overview.avg_value_per_net_kg)],
@@ -435,7 +435,7 @@ function sectionsHtml(sections, allowAll = true) {
       const title = sectionTitle(section.kind, section.title);
       const allButton =
         allowAll && section.kind
-          ? `<button class="all-btn" type="button" data-kind="${esc(section.kind)}" data-title="${esc(title)}">${esc(t("all_label", "Все"))}</button>`
+          ? `<button class="all-btn" type="button" data-kind="${esc(section.kind)}" data-title="${esc(title)}">${esc(t("all_label", "Усі"))}</button>`
           : "";
       const rows = section.rows
         .map((row) => {
@@ -467,13 +467,13 @@ function pricesHtml(metrics) {
       (metric) => `<div class="rank-row static">
         <div class="rank-name">${esc(priceTitle(metric.kind, metric.title))}</div>
         <div class="rank-stats">
-          ${esc(t("median", "медиана"))} <b>${fmtNum.format(metric.median)}</b><br />
+          ${esc(t("median", "медіана"))} <b>${fmtNum.format(metric.median)}</b><br />
           ${fmtNum.format(metric.average)} · ${fmtInt.format(metric.count)}
         </div>
       </div>`,
     )
     .join("");
-  return rows ? `<section class="section"><div class="section-head"><h3>${esc(t("prices_section", "Цены"))}</h3></div>${rows}</section>` : "";
+  return rows ? `<section class="section"><div class="section-head"><h3>${esc(t("prices_section", "Ціни"))}</h3></div>${rows}</section>` : "";
 }
 
 function applyFilterAction(field, value) {
@@ -495,13 +495,13 @@ function bindAnalyticsClicks() {
 /* ---------- drill-down modal (show all groups) ---------- */
 function sectionColumns() {
   return [
-    { key: "label", label: t("col_label", "Название"), text: true },
-    { key: "rows", label: t("rows_label", "Строк"), fmt: (v) => fmtInt.format(v) },
-    { key: "declarations", label: t("declarations_label", "Деклараций"), fmt: (v) => fmtInt.format(v) },
-    { key: "companies", label: t("col_companies", "Компаний"), fmt: (v) => fmtInt.format(v) },
-    { key: "total_value_usd", label: t("total_value", "Сумма"), fmt: (v) => fmtNum.format(v) },
+    { key: "label", label: t("col_label", "Назва"), text: true },
+    { key: "rows", label: t("rows_label", "Рядків"), fmt: (v) => fmtInt.format(v) },
+    { key: "declarations", label: t("declarations_label", "Декларацій"), fmt: (v) => fmtInt.format(v) },
+    { key: "companies", label: t("col_companies", "Компаній"), fmt: (v) => fmtInt.format(v) },
+    { key: "total_value_usd", label: t("total_value", "Сума"), fmt: (v) => fmtNum.format(v) },
     { key: "total_net_kg", label: t("net_weight", "Нетто"), fmt: (v) => fmtKg.format(v) },
-    { key: "share_percent", label: t("col_share", "Доля"), fmt: (v) => `${fmtNum.format(v)}%` },
+    { key: "share_percent", label: t("col_share", "Частка"), fmt: (v) => `${fmtNum.format(v)}%` },
     { key: "avg_value_kg", label: t("avg_value_kg", "$/кг"), src: "avg_value_per_net_kg", fmt: (v) => fmtNum.format(v) },
   ];
 }
@@ -581,9 +581,9 @@ function renderSection() {
 
 async function openSection(kind, title) {
   state.section = { kind, title, rows: [], sort: "total_value_usd", desc: true, filter: "", limited: false };
-  $("modal-title").textContent = title || t("all_label", "Все");
+  $("modal-title").textContent = title || t("all_label", "Усі");
   $("modal-search").value = "";
-  $("modal-search").placeholder = t("group_search_hint", "Поиск в списке");
+  $("modal-search").placeholder = t("group_search_hint", "Пошук у списку");
   $("modal-meta").textContent = t("searching", "…");
   document.querySelector("#modal-table thead").innerHTML = "";
   document.querySelector("#modal-table tbody").innerHTML = "";
@@ -642,7 +642,7 @@ function activateTab(tab) {
 
 function exportCurrentPage() {
   if (!state.token) {
-    toast("Нет локального токена сессии");
+    toast("Немає локального токена сесії");
     return;
   }
   const params = new URLSearchParams(cleanParams({ ...queryWithPaging(), token: state.token }));
@@ -719,7 +719,7 @@ function bindEvents() {
 async function boot() {
   bindEvents();
   if (!state.token) {
-    toast("Запустите браузерный режим через BaseSearch.exe --web");
+    toast("Запустіть браузерний режим через BaseSearch.exe --web");
     return;
   }
   try {
