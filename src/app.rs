@@ -11,9 +11,9 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::db::{
     Analytics, AnalyticsFilterAction, AnalyticsFilterField, AnalyticsGroupRow, AnalyticsMonthRow,
-    AnalyticsPriceMetric, AnalyticsScope, AnalyticsSection, AnalyticsSectionKind, CompanyProfile,
-    Db, Filters, PivotDim, PivotMetric, PivotResult, PriceMetricKind, Query, RecordCard,
-    Undervaluation, pivot_filter_action,
+    AnalyticsOverview, AnalyticsPriceMetric, AnalyticsScope, AnalyticsSection,
+    AnalyticsSectionKind, CompanyProfile, Db, Filters, PivotDim, PivotMetric, PivotResult,
+    PriceMetricKind, Query, RecordCard, Undervaluation, pivot_filter_action,
 };
 use crate::export::ExportError;
 use crate::i18n::{Lang, Tr, fmt, group_digits, help_sections, tr};
@@ -152,6 +152,15 @@ impl MonthMetric {
             }
         }
     }
+
+    fn index(self) -> u8 {
+        match self {
+            MonthMetric::Value => 0,
+            MonthMetric::Rows => 1,
+            MonthMetric::NetWeight => 2,
+            MonthMetric::AvgPrice => 3,
+        }
+    }
 }
 
 /// Sub-tab of the Analytics view: Overview, four data categories, and the
@@ -165,16 +174,21 @@ enum AnalyticsView {
     Countries,
     Prices,
     Pivot,
+    Report,
+    Compare,
 }
 
 impl AnalyticsView {
-    const ALL: [AnalyticsView; 6] = [
+    const COUNT: usize = 8;
+    const ALL: [AnalyticsView; Self::COUNT] = [
         AnalyticsView::Overview,
         AnalyticsView::Companies,
         AnalyticsView::Products,
         AnalyticsView::Countries,
         AnalyticsView::Prices,
         AnalyticsView::Pivot,
+        AnalyticsView::Report,
+        AnalyticsView::Compare,
     ];
 
     fn index(self) -> usize {
@@ -185,6 +199,8 @@ impl AnalyticsView {
             AnalyticsView::Countries => 3,
             AnalyticsView::Prices => 4,
             AnalyticsView::Pivot => 5,
+            AnalyticsView::Report => 6,
+            AnalyticsView::Compare => 7,
         }
     }
 
@@ -195,7 +211,10 @@ impl AnalyticsView {
             AnalyticsView::Products => Some(AnalyticsScope::Products),
             AnalyticsView::Countries => Some(AnalyticsScope::Countries),
             AnalyticsView::Prices => Some(AnalyticsScope::Prices),
-            AnalyticsView::Overview | AnalyticsView::Pivot => None,
+            AnalyticsView::Overview
+            | AnalyticsView::Pivot
+            | AnalyticsView::Report
+            | AnalyticsView::Compare => None,
         }
     }
 
@@ -397,7 +416,6 @@ fn decode_component(value: &str) -> Option<String> {
 fn recent_queries_label(lang: Lang) -> &'static str {
     match lang {
         Lang::Ua => "Недавні запити",
-        Lang::Ru => "Недавние запросы",
         _ => "Recent searches",
     }
 }
@@ -405,7 +423,6 @@ fn recent_queries_label(lang: Lang) -> &'static str {
 fn saved_queries_label(lang: Lang) -> &'static str {
     match lang {
         Lang::Ua => "Збережені запити",
-        Lang::Ru => "Сохранённые запросы",
         _ => "Saved searches",
     }
 }
@@ -413,7 +430,6 @@ fn saved_queries_label(lang: Lang) -> &'static str {
 fn save_current_query_label(lang: Lang) -> &'static str {
     match lang {
         Lang::Ua => "Зберегти поточний запит",
-        Lang::Ru => "Сохранить текущий запрос",
         _ => "Save current search",
     }
 }
@@ -421,7 +437,6 @@ fn save_current_query_label(lang: Lang) -> &'static str {
 fn empty_recent_queries_label(lang: Lang) -> &'static str {
     match lang {
         Lang::Ua => "Недавніх запитів ще немає",
-        Lang::Ru => "Недавних запросов пока нет",
         _ => "No recent searches yet",
     }
 }
@@ -429,7 +444,6 @@ fn empty_recent_queries_label(lang: Lang) -> &'static str {
 fn empty_saved_queries_label(lang: Lang) -> &'static str {
     match lang {
         Lang::Ua => "Збережених запитів ще немає",
-        Lang::Ru => "Сохранённых запросов пока нет",
         _ => "No saved searches yet",
     }
 }
@@ -437,7 +451,6 @@ fn empty_saved_queries_label(lang: Lang) -> &'static str {
 fn clear_recent_queries_label(lang: Lang) -> &'static str {
     match lang {
         Lang::Ua => "Очистити історію",
-        Lang::Ru => "Очистить историю",
         _ => "Clear history",
     }
 }
@@ -446,7 +459,6 @@ fn guided_questions_label(lang: Lang) -> &'static str {
     match lang {
         Lang::En => "Questions",
         Lang::Ua => "Питання",
-        Lang::Ru => "Вопросы",
         Lang::De => "Fragen",
         Lang::Es => "Preguntas",
         Lang::Fr => "Questions",
@@ -455,7 +467,6 @@ fn guided_questions_label(lang: Lang) -> &'static str {
         Lang::Ro => "Întrebări",
         Lang::Hu => "Kérdések",
         Lang::Bg => "Въпроси",
-        Lang::Be => "Пытанні",
         Lang::Zh => "问题",
     }
 }
@@ -464,7 +475,6 @@ fn guided_questions_hover(lang: Lang) -> &'static str {
     match lang {
         Lang::En => "Smart shortcuts for the current product, company, or filtered slice.",
         Lang::Ua => "Розумні сценарії для поточного товару, компанії або фільтра.",
-        Lang::Ru => "Умные сценарии для текущего товара, компании или фильтра.",
         Lang::De => "Intelligente Wege für Ware, Firma oder aktuellen Filter.",
         Lang::Es => "Atajos inteligentes para el producto, empresa o filtro actual.",
         Lang::Fr => "Raccourcis intelligents pour le produit, l'entreprise ou le filtre actuel.",
@@ -473,7 +483,6 @@ fn guided_questions_hover(lang: Lang) -> &'static str {
         Lang::Ro => "Scurtături inteligente pentru produs, companie sau filtrul curent.",
         Lang::Hu => "Okos útvonalak az aktuális termékhez, céghez vagy szűrőhöz.",
         Lang::Bg => "Умни преки пътища за текущия продукт, фирма или филтър.",
-        Lang::Be => "Разумныя сцэнарыі для тавару, кампаніі або бягучага фільтра.",
         Lang::Zh => "当前商品、公司或筛选范围的智能分析入口。",
     }
 }
@@ -482,7 +491,6 @@ fn guided_questions_empty(lang: Lang) -> &'static str {
     match lang {
         Lang::En => "Enter a product, company, code, year, or country first.",
         Lang::Ua => "Спочатку введіть товар, компанію, код, рік або країну.",
-        Lang::Ru => "Сначала введите товар, компанию, код, год или страну.",
         Lang::De => "Geben Sie zuerst Ware, Firma, Code, Jahr oder Land ein.",
         Lang::Es => "Primero introduzca producto, empresa, código, año o país.",
         Lang::Fr => "Saisissez d'abord un produit, une entreprise, un code, une année ou un pays.",
@@ -491,7 +499,6 @@ fn guided_questions_empty(lang: Lang) -> &'static str {
         Lang::Ro => "Introduceți mai întâi produs, companie, cod, an sau țară.",
         Lang::Hu => "Először adjon meg terméket, céget, kódot, évet vagy országot.",
         Lang::Bg => "Първо въведете продукт, фирма, код, година или държава.",
-        Lang::Be => "Спачатку ўвядзіце тавар, кампанію, код, год або краіну.",
         Lang::Zh => "请先输入商品、公司、编码、年份或国家。",
     }
 }
@@ -501,7 +508,6 @@ fn guided_section_title(section: GuidedQuestionSection, lang: Lang) -> &'static 
         GuidedQuestionSection::Product => match lang {
             Lang::En => "For this product or search",
             Lang::Ua => "Для цього товару або запиту",
-            Lang::Ru => "По этому товару или запросу",
             Lang::De => "Zu dieser Ware oder Suche",
             Lang::Es => "Para este producto o búsqueda",
             Lang::Fr => "Pour ce produit ou cette recherche",
@@ -510,13 +516,11 @@ fn guided_section_title(section: GuidedQuestionSection, lang: Lang) -> &'static 
             Lang::Ro => "Pentru acest produs sau căutare",
             Lang::Hu => "Ehhez a termékhez vagy kereséshez",
             Lang::Bg => "За този продукт или търсене",
-            Lang::Be => "Для гэтага тавару або запыту",
             Lang::Zh => "针对当前商品或搜索",
         },
         GuidedQuestionSection::Company => match lang {
             Lang::En => "For this company",
             Lang::Ua => "Для цієї компанії",
-            Lang::Ru => "По этой компании",
             Lang::De => "Zu dieser Firma",
             Lang::Es => "Para esta empresa",
             Lang::Fr => "Pour cette entreprise",
@@ -525,13 +529,11 @@ fn guided_section_title(section: GuidedQuestionSection, lang: Lang) -> &'static 
             Lang::Ro => "Pentru această companie",
             Lang::Hu => "Ehhez a céghez",
             Lang::Bg => "За тази фирма",
-            Lang::Be => "Для гэтай кампаніі",
             Lang::Zh => "针对当前公司",
         },
         GuidedQuestionSection::Market => match lang {
             Lang::En => "For the current slice",
             Lang::Ua => "Для поточної вибірки",
-            Lang::Ru => "По текущей выборке",
             Lang::De => "Zum aktuellen Ausschnitt",
             Lang::Es => "Para la selección actual",
             Lang::Fr => "Pour le périmètre actuel",
@@ -540,7 +542,6 @@ fn guided_section_title(section: GuidedQuestionSection, lang: Lang) -> &'static 
             Lang::Ro => "Pentru selecția curentă",
             Lang::Hu => "Az aktuális szűréshez",
             Lang::Bg => "За текущата извадка",
-            Lang::Be => "Для бягучай выбаркі",
             Lang::Zh => "针对当前筛选范围",
         },
     }
@@ -551,7 +552,6 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
         GuidedQuestionKind::ProductCompanies => match lang {
             Lang::En => "Who received or imported it?",
             Lang::Ua => "Хто отримував або ввозив це?",
-            Lang::Ru => "Кто получал или ввозил это?",
             Lang::De => "Wer hat es erhalten oder importiert?",
             Lang::Es => "¿Quién lo recibió o importó?",
             Lang::Fr => "Qui l'a reçu ou importé ?",
@@ -560,13 +560,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Cine a primit sau importat?",
             Lang::Hu => "Ki kapta vagy importálta?",
             Lang::Bg => "Кой го е получавал или внасял?",
-            Lang::Be => "Хто атрымліваў або ўвозіў гэта?",
             Lang::Zh => "谁接收或进口了它？",
         },
         GuidedQuestionKind::ProductAllCompanies => match lang {
             Lang::En => "Show every company and EDRPOU",
             Lang::Ua => "Показати всі компанії та ЄДРПОУ",
-            Lang::Ru => "Показать все компании и ЕДРПОУ",
             Lang::De => "Alle Firmen und EDRPOU anzeigen",
             Lang::Es => "Mostrar todas las empresas y EDRPOU",
             Lang::Fr => "Afficher toutes les entreprises et EDRPOU",
@@ -575,13 +573,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Arată toate companiile și EDRPOU",
             Lang::Hu => "Összes cég és EDRPOU megjelenítése",
             Lang::Bg => "Покажи всички фирми и ЕДРПОУ",
-            Lang::Be => "Паказаць усе кампаніі і ЕДРПОУ",
             Lang::Zh => "显示所有公司和EDRPOU",
         },
         GuidedQuestionKind::ProductGoods => match lang {
             Lang::En => "Which product codes and brands are inside?",
             Lang::Ua => "Які коди товару та бренди всередині?",
-            Lang::Ru => "Какие коды товара и бренды внутри?",
             Lang::De => "Welche Warencodes und Marken stecken darin?",
             Lang::Es => "¿Qué códigos y marcas contiene?",
             Lang::Fr => "Quels codes produit et marques contient-il ?",
@@ -590,13 +586,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Ce coduri de produs și mărci conține?",
             Lang::Hu => "Milyen termékkódok és márkák vannak benne?",
             Lang::Bg => "Какви кодове и марки има вътре?",
-            Lang::Be => "Якія коды тавару і брэнды ўнутры?",
             Lang::Zh => "包含哪些商品编码和品牌？",
         },
         GuidedQuestionKind::ProductCountries => match lang {
             Lang::En => "From which countries and routes?",
             Lang::Ua => "З яких країн і маршрутів?",
-            Lang::Ru => "Из каких стран и маршрутов?",
             Lang::De => "Aus welchen Ländern und Routen?",
             Lang::Es => "¿Desde qué países y rutas?",
             Lang::Fr => "Depuis quels pays et routes ?",
@@ -605,13 +599,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Din ce țări și rute?",
             Lang::Hu => "Mely országokból és útvonalakon?",
             Lang::Bg => "От кои държави и маршрути?",
-            Lang::Be => "З якіх краін і маршрутаў?",
             Lang::Zh => "来自哪些国家和路线？",
         },
         GuidedQuestionKind::ProductPrices => match lang {
             Lang::En => "What is the price and $/kg picture?",
             Lang::Ua => "Яка ціна та картина $/кг?",
-            Lang::Ru => "Какая картина по цене и $/кг?",
             Lang::De => "Wie sieht Preis und $/kg aus?",
             Lang::Es => "¿Cómo se ven precio y $/kg?",
             Lang::Fr => "Quelle est la situation prix et $/kg ?",
@@ -620,13 +612,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Cum arată prețul și $/kg?",
             Lang::Hu => "Milyen az ár és $/kg képe?",
             Lang::Bg => "Как изглеждат цена и $/кг?",
-            Lang::Be => "Якая карціна па цане і $/кг?",
             Lang::Zh => "价格和$/公斤情况如何？",
         },
         GuidedQuestionKind::ProductTimeline => match lang {
             Lang::En => "How did value and weight change by month?",
             Lang::Ua => "Як змінювались вартість і вага по місяцях?",
-            Lang::Ru => "Как менялись сумма и вес по месяцам?",
             Lang::De => "Wie änderten sich Wert und Gewicht je Monat?",
             Lang::Es => "¿Cómo cambiaron valor y peso por mes?",
             Lang::Fr => "Comment valeur et poids ont-ils changé par mois ?",
@@ -635,13 +625,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Cum s-au schimbat valoarea și greutatea lunar?",
             Lang::Hu => "Hogyan változott az érték és a súly havonta?",
             Lang::Bg => "Как се променяха стойност и тегло по месеци?",
-            Lang::Be => "Як змяняліся сума і вага па месяцах?",
             Lang::Zh => "金额和重量按月如何变化？",
         },
         GuidedQuestionKind::ProductCompaniesByMonth => match lang {
             Lang::En => "Compare companies by month",
             Lang::Ua => "Порівняти компанії по місяцях",
-            Lang::Ru => "Сравнить компании по месяцам",
             Lang::De => "Firmen nach Monaten vergleichen",
             Lang::Es => "Comparar empresas por mes",
             Lang::Fr => "Comparer les entreprises par mois",
@@ -650,13 +638,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Compară companiile pe luni",
             Lang::Hu => "Cégek összehasonlítása hónaponként",
             Lang::Bg => "Сравни фирмите по месеци",
-            Lang::Be => "Параўнаць кампаніі па месяцах",
             Lang::Zh => "按月比较公司",
         },
         GuidedQuestionKind::CompanyProfile => match lang {
             Lang::En => "Open the full company dossier",
             Lang::Ua => "Відкрити повне досьє компанії",
-            Lang::Ru => "Открыть полное досье компании",
             Lang::De => "Vollständiges Firmendossier öffnen",
             Lang::Es => "Abrir el expediente completo de la empresa",
             Lang::Fr => "Ouvrir le dossier complet de l'entreprise",
@@ -665,13 +651,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Deschide dosarul complet al companiei",
             Lang::Hu => "Teljes cégdosszié megnyitása",
             Lang::Bg => "Отвори пълното досие на фирмата",
-            Lang::Be => "Адкрыць поўнае дасье кампаніі",
             Lang::Zh => "打开完整公司档案",
         },
         GuidedQuestionKind::CompanyGoods => match lang {
             Lang::En => "What did this company move?",
             Lang::Ua => "Що переміщувала ця компанія?",
-            Lang::Ru => "Что возила эта компания?",
             Lang::De => "Welche Waren bewegte diese Firma?",
             Lang::Es => "¿Qué movió esta empresa?",
             Lang::Fr => "Quelles marchandises cette entreprise a-t-elle traitées ?",
@@ -680,13 +664,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Ce a transportat această companie?",
             Lang::Hu => "Mit mozgatott ez a cég?",
             Lang::Bg => "Какво е превозвала тази фирма?",
-            Lang::Be => "Што вазіла гэта кампанія?",
             Lang::Zh => "这家公司运输了什么？",
         },
         GuidedQuestionKind::CompanySuppliers => match lang {
             Lang::En => "Who supplied this company?",
             Lang::Ua => "Хто постачав цій компанії?",
-            Lang::Ru => "Кто поставлял этой компании?",
             Lang::De => "Wer belieferte diese Firma?",
             Lang::Es => "¿Quién abasteció a esta empresa?",
             Lang::Fr => "Qui a fourni cette entreprise ?",
@@ -695,13 +677,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Cine a furnizat această companie?",
             Lang::Hu => "Ki szállított ennek a cégnek?",
             Lang::Bg => "Кой е доставял на тази фирма?",
-            Lang::Be => "Хто пастаўляў гэтай кампаніі?",
             Lang::Zh => "谁给这家公司供货？",
         },
         GuidedQuestionKind::CompanyCountries => match lang {
             Lang::En => "Which countries did it work with?",
             Lang::Ua => "З якими країнами вона працювала?",
-            Lang::Ru => "С какими странами она работала?",
             Lang::De => "Mit welchen Ländern arbeitete sie?",
             Lang::Es => "¿Con qué países trabajó?",
             Lang::Fr => "Avec quels pays a-t-elle travaillé ?",
@@ -710,13 +690,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Cu ce țări a lucrat?",
             Lang::Hu => "Mely országokkal dolgozott?",
             Lang::Bg => "С кои държави е работила?",
-            Lang::Be => "З якімі краінамі яна працавала?",
             Lang::Zh => "它与哪些国家往来？",
         },
         GuidedQuestionKind::CompanyTimeline => match lang {
             Lang::En => "How did this company change by month?",
             Lang::Ua => "Як ця компанія змінювалась по місяцях?",
-            Lang::Ru => "Как эта компания менялась по месяцам?",
             Lang::De => "Wie veränderte sich diese Firma je Monat?",
             Lang::Es => "¿Cómo cambió esta empresa por mes?",
             Lang::Fr => "Comment cette entreprise a-t-elle évolué par mois ?",
@@ -725,13 +703,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Cum s-a schimbat compania pe luni?",
             Lang::Hu => "Hogyan változott a cég havonta?",
             Lang::Bg => "Как се променяше фирмата по месеци?",
-            Lang::Be => "Як гэта кампанія змянялася па месяцах?",
             Lang::Zh => "这家公司按月如何变化？",
         },
         GuidedQuestionKind::CompanyGoodsByMonth => match lang {
             Lang::En => "Compare product codes by month",
             Lang::Ua => "Порівняти коди товару по місяцях",
-            Lang::Ru => "Сравнить коды товара по месяцам",
             Lang::De => "Warencodes nach Monaten vergleichen",
             Lang::Es => "Comparar códigos de producto por mes",
             Lang::Fr => "Comparer les codes produit par mois",
@@ -740,13 +716,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Compară codurile de produs pe luni",
             Lang::Hu => "Termékkódok összehasonlítása hónaponként",
             Lang::Bg => "Сравни кодовете по месеци",
-            Lang::Be => "Параўнаць коды тавараў па месяцах",
             Lang::Zh => "按月比较商品编码",
         },
         GuidedQuestionKind::MarketCompanies => match lang {
             Lang::En => "Who are the biggest companies here?",
             Lang::Ua => "Хто найбільші компанії у вибірці?",
-            Lang::Ru => "Кто крупнейшие компании в выборке?",
             Lang::De => "Wer sind hier die größten Firmen?",
             Lang::Es => "¿Cuáles son las empresas más grandes aquí?",
             Lang::Fr => "Quelles sont les plus grandes entreprises ici ?",
@@ -755,13 +729,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Care sunt cele mai mari companii aici?",
             Lang::Hu => "Melyek itt a legnagyobb cégek?",
             Lang::Bg => "Кои са най-големите фирми тук?",
-            Lang::Be => "Хто найбуйнейшыя кампаніі ў выбарцы?",
             Lang::Zh => "这里最大的公司是谁？",
         },
         GuidedQuestionKind::MarketGoods => match lang {
             Lang::En => "Which goods dominate this slice?",
             Lang::Ua => "Які товари домінують у вибірці?",
-            Lang::Ru => "Какие товары доминируют в выборке?",
             Lang::De => "Welche Waren dominieren diesen Ausschnitt?",
             Lang::Es => "¿Qué mercancías dominan esta selección?",
             Lang::Fr => "Quelles marchandises dominent ce périmètre ?",
@@ -770,13 +742,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Ce mărfuri domină această selecție?",
             Lang::Hu => "Mely áruk dominálnak ebben a szűrésben?",
             Lang::Bg => "Кои стоки доминират в тази извадка?",
-            Lang::Be => "Якія тавары дамінуюць у выбарцы?",
             Lang::Zh => "这个范围内哪些商品占主导？",
         },
         GuidedQuestionKind::MarketCountries => match lang {
             Lang::En => "Which countries and routes dominate?",
             Lang::Ua => "Які країни та маршрути домінують?",
-            Lang::Ru => "Какие страны и маршруты доминируют?",
             Lang::De => "Welche Länder und Routen dominieren?",
             Lang::Es => "¿Qué países y rutas dominan?",
             Lang::Fr => "Quels pays et routes dominent ?",
@@ -785,13 +755,11 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Ce țări și rute domină?",
             Lang::Hu => "Mely országok és útvonalak dominálnak?",
             Lang::Bg => "Кои държави и маршрути доминират?",
-            Lang::Be => "Якія краіны і маршруты дамінуюць?",
             Lang::Zh => "哪些国家和路线占主导？",
         },
         GuidedQuestionKind::MarketPrices => match lang {
             Lang::En => "Are prices normal in this slice?",
             Lang::Ua => "Чи нормальні ціни в цій вибірці?",
-            Lang::Ru => "Нормальные ли цены в этой выборке?",
             Lang::De => "Sind die Preise in diesem Ausschnitt normal?",
             Lang::Es => "¿Son normales los precios en esta selección?",
             Lang::Fr => "Les prix sont-ils normaux dans ce périmètre ?",
@@ -800,7 +768,6 @@ fn guided_question_title(kind: GuidedQuestionKind, lang: Lang) -> &'static str {
             Lang::Ro => "Sunt prețurile normale în această selecție?",
             Lang::Hu => "Normálisak az árak ebben a szűrésben?",
             Lang::Bg => "Нормални ли са цените в тази извадка?",
-            Lang::Be => "Ці нармальныя цэны ў гэтай выбарцы?",
             Lang::Zh => "这个范围内价格是否正常？",
         },
     }
@@ -968,7 +935,6 @@ fn guided_question_action(
 fn analytics_calc_title(lang: Lang) -> &'static str {
     match lang {
         Lang::Ua => "Як рахуються цифри",
-        Lang::Ru => "Как считаются цифры",
         _ => "How the numbers are calculated",
     }
 }
@@ -976,7 +942,6 @@ fn analytics_calc_title(lang: Lang) -> &'static str {
 fn analytics_calc_short_note(lang: Lang) -> &'static str {
     match lang {
         Lang::Ua => "Усі цифри рахуються за поточним запитом і фільтрами.",
-        Lang::Ru => "Все цифры считаются по текущему запросу и фильтрам.",
         _ => "All numbers are calculated from the current search and filters.",
     }
 }
@@ -990,14 +955,6 @@ fn analytics_calc_lines(lang: Lang) -> &'static [&'static str] {
             "$/кг = сума / нетто; якщо нетто порожнє або нульове, показник не рахується.",
             "У групах частка рахується від суми; якщо суми немає, використовується нетто, потім кількість рядків.",
             "Аналітика рахує унікальні рядки: дублікати, позначені як повтори, не подвоюють підсумки.",
-        ],
-        Lang::Ru => &[
-            "Строки = найденные товарные строки, не уникальные декларации.",
-            "Декларации = уникальные номера МД в текущей выборке.",
-            "Сумма = сумма поля «ФВ вал.контр», если оно заполнено в источнике.",
-            "$/кг = сумма / нетто; если нетто пустое или нулевое, показатель не считается.",
-            "В группах доля считается от суммы; если суммы нет, используется нетто, затем количество строк.",
-            "Аналитика считает уникальные строки: дубликаты, помеченные как повторы, не удваивают итоги.",
         ],
         _ => &[
             "Rows = matching product rows, not unique declarations.",
@@ -1013,7 +970,6 @@ fn analytics_calc_lines(lang: Lang) -> &'static [&'static str] {
 fn price_average_help(lang: Lang) -> &'static str {
     match lang {
         Lang::Ua => "Звичайне середнє за рядками з числовим значенням.",
-        Lang::Ru => "Обычное среднее по строкам с числовым значением.",
         _ => "Simple average across rows with a numeric value.",
     }
 }
@@ -1021,7 +977,6 @@ fn price_average_help(lang: Lang) -> &'static str {
 fn price_weighted_help(lang: Lang) -> &'static str {
     match lang {
         Lang::Ua => "Середнє, зважене за нетто кг: SUM(ціна * нетто) / SUM(нетто).",
-        Lang::Ru => "Среднее, взвешенное по нетто кг: SUM(цена * нетто) / SUM(нетто).",
         _ => "Net-kg weighted average: SUM(price * net kg) / SUM(net kg).",
     }
 }
@@ -1029,7 +984,6 @@ fn price_weighted_help(lang: Lang) -> &'static str {
 fn price_median_help(lang: Lang) -> &'static str {
     match lang {
         Lang::Ua => "Медіана: половина значень нижче, половина вище.",
-        Lang::Ru => "Медиана: половина значений ниже, половина выше.",
         _ => "Median: half the values are lower and half are higher.",
     }
 }
@@ -1037,7 +991,6 @@ fn price_median_help(lang: Lang) -> &'static str {
 fn price_range_help(lang: Lang) -> &'static str {
     match lang {
         Lang::Ua => "P25-P75: середній діапазон без крайніх 25% знизу і зверху.",
-        Lang::Ru => "P25-P75: средний диапазон без крайних 25% снизу и сверху.",
         _ => "P25-P75: middle range after excluding the lowest and highest quarters.",
     }
 }
@@ -1045,7 +998,6 @@ fn price_range_help(lang: Lang) -> &'static str {
 fn price_count_help(lang: Lang) -> &'static str {
     match lang {
         Lang::Ua => "Кількість рядків, де цей показник можна прочитати як число.",
-        Lang::Ru => "Количество строк, где этот показатель можно прочитать как число.",
         _ => "Rows where this metric can be parsed as a number.",
     }
 }
@@ -1126,7 +1078,7 @@ pub struct App {
     /// Active sub-tab on the Analytics view.
     analytics_view: AnalyticsView,
     /// Which sub-tabs are loaded for `analytics_gen` (indexed by view).
-    analytics_loaded: [bool; 6],
+    analytics_loaded: [bool; AnalyticsView::COUNT],
     analytics_loading: bool,
     /// Product code grouping level: 2/4/6 digits or 10 for full codes.
     hs_level: u8,
@@ -1137,6 +1089,12 @@ pub struct App {
     pivot_row_dim: PivotDim,
     pivot_col_dim: PivotDim,
     pivot_metric: PivotMetric,
+    compare_text: String,
+    compare_year: String,
+    compare_query: Option<Query>,
+    compare_analytics: Option<Analytics>,
+    compare_loading: bool,
+    compare_gen: u64,
     /// Undervaluation scan (in the Prices sub-tab).
     underpricing: Option<Undervaluation>,
     underpricing_loading: bool,
@@ -1251,7 +1209,7 @@ impl App {
             analytics_limit: 10,
             analytics_gen: 0,
             analytics_view: AnalyticsView::default(),
-            analytics_loaded: [false; 6],
+            analytics_loaded: [false; AnalyticsView::COUNT],
             analytics_loading: false,
             hs_level: 10,
             group_explorer: None,
@@ -1260,6 +1218,12 @@ impl App {
             pivot_row_dim: PivotDim::Recipient,
             pivot_col_dim: PivotDim::Month,
             pivot_metric: PivotMetric::Value,
+            compare_text: String::new(),
+            compare_year: String::new(),
+            compare_query: None,
+            compare_analytics: None,
+            compare_loading: false,
+            compare_gen: 0,
             underpricing: None,
             underpricing_loading: false,
             underpricing_gen: 0,
@@ -1419,10 +1383,13 @@ impl App {
         self.last_search_ms = None;
         // The query changed; loaded analytics no longer matches the results.
         self.analytics = None;
-        self.analytics_loaded = [false; 6];
+        self.analytics_loaded = [false; AnalyticsView::COUNT];
         self.analytics_loading = false;
         self.group_explorer = None;
         self.pivot = None;
+        self.compare_analytics = None;
+        self.compare_query = None;
+        self.compare_loading = false;
         self.underpricing = None;
         self.underpricing_loading = false;
         invalidate_underpricing_generation(&mut self.underpricing_gen);
@@ -1456,6 +1423,23 @@ impl App {
         if self.active_query.is_empty() {
             return;
         }
+        if self.analytics_view == AnalyticsView::Report {
+            self.request_report_data();
+            return;
+        }
+        if self.analytics_view == AnalyticsView::Compare {
+            if self.analytics.is_none() || self.analytics_gen != self.search_gen {
+                self.analytics_loading = true;
+                let _ = self.search_tx.send(WorkerReq::Analytics {
+                    q: Box::new(self.active_query.clone()),
+                    limit: self.analytics_limit,
+                    scope: None,
+                    hs_level: self.hs_level,
+                    generation: self.search_gen,
+                });
+            }
+            return;
+        }
         if self.analytics_view == AnalyticsView::Pivot {
             // Pivot needs the headline overview too (summary line + guard);
             // load it once if it is missing for this query.
@@ -1484,6 +1468,71 @@ impl App {
             scope: self.analytics_view.scope(),
             hs_level: self.hs_level,
             generation: self.search_gen,
+        });
+    }
+
+    fn request_report_data(&mut self) {
+        let base_needed = self.analytics.is_none() || self.analytics_gen != self.search_gen;
+        if base_needed {
+            self.analytics_loading = true;
+            let _ = self.search_tx.send(WorkerReq::Analytics {
+                q: Box::new(self.active_query.clone()),
+                limit: self.analytics_limit,
+                scope: None,
+                hs_level: self.hs_level,
+                generation: self.search_gen,
+            });
+        }
+        for scope in AnalyticsScope::ALL {
+            let view = AnalyticsView::from_scope(Some(scope));
+            if self.analytics_gen == self.search_gen && self.analytics_loaded[view.index()] {
+                continue;
+            }
+            self.analytics_loading = true;
+            let _ = self.search_tx.send(WorkerReq::Analytics {
+                q: Box::new(self.active_query.clone()),
+                limit: self.analytics_limit,
+                scope: Some(scope),
+                hs_level: self.hs_level,
+                generation: self.search_gen,
+            });
+        }
+    }
+
+    fn report_ready(&self) -> bool {
+        self.analytics_gen == self.search_gen
+            && self.analytics.is_some()
+            && self.analytics_loaded[AnalyticsView::Companies.index()]
+            && self.analytics_loaded[AnalyticsView::Products.index()]
+            && self.analytics_loaded[AnalyticsView::Countries.index()]
+            && self.analytics_loaded[AnalyticsView::Prices.index()]
+    }
+
+    fn comparison_query(&self) -> Query {
+        let mut q = self.active_query.clone();
+        let text = self.compare_text.trim();
+        if !text.is_empty() {
+            q.text = text.to_string();
+        }
+        let year = self.compare_year.trim();
+        if !year.is_empty() {
+            q.filters.year = year.to_string();
+        }
+        q
+    }
+
+    fn request_compare(&mut self) {
+        let q = self.comparison_query();
+        if q.is_empty() {
+            return;
+        }
+        self.compare_gen = self.compare_gen.wrapping_add(1);
+        self.compare_loading = true;
+        self.compare_query = Some(q.clone());
+        self.compare_analytics = None;
+        let _ = self.search_tx.send(WorkerReq::Compare {
+            q: Box::new(q),
+            generation: self.compare_gen,
         });
     }
 
@@ -1615,7 +1664,7 @@ impl App {
                             }
                             _ => {
                                 self.analytics = Some(*analytics);
-                                self.analytics_loaded = [false; 6];
+                                self.analytics_loaded = [false; AnalyticsView::COUNT];
                             }
                         }
                         self.analytics_gen = generation;
@@ -1661,6 +1710,29 @@ impl App {
                     if generation == self.profile_gen {
                         self.profile = Some(*profile);
                         self.profile_loading = false;
+                    }
+                }
+                Msg::CompareDone {
+                    generation,
+                    query,
+                    analytics,
+                } => {
+                    if generation == self.compare_gen {
+                        self.compare_query = Some(*query);
+                        self.compare_analytics = Some(*analytics);
+                        self.compare_loading = false;
+                    }
+                }
+                Msg::CompareError {
+                    generation,
+                    message,
+                } => {
+                    if generation == self.compare_gen {
+                        self.compare_loading = false;
+                        self.status = StatusLine {
+                            text: format!("{}: {message}", self.t().error),
+                            is_error: true,
+                        };
                     }
                 }
                 Msg::PivotDone { generation, pivot } => {
@@ -1816,6 +1888,32 @@ impl App {
             self.msg_tx.clone(),
             ctx.clone(),
         );
+    }
+
+    fn save_report_html(&mut self, html: String) {
+        let dest = rfd::FileDialog::new()
+            .set_title("Export report")
+            .add_filter("HTML report", &["html"])
+            .set_file_name("base_search_report.html")
+            .save_file();
+        let Some(mut dest) = dest else { return };
+        if dest.extension().is_none() {
+            dest.set_extension("html");
+        }
+        match std::fs::write(&dest, html) {
+            Ok(()) => {
+                self.status = StatusLine {
+                    text: format!("Report exported: {}", dest.display()),
+                    is_error: false,
+                };
+            }
+            Err(err) => {
+                self.status = StatusLine {
+                    text: format!("{}: {err}", self.t().error),
+                    is_error: true,
+                };
+            }
+        }
     }
 
     fn start_clear_db(&mut self, ctx: &egui::Context) {
@@ -2566,8 +2664,13 @@ impl App {
             let mut new_pivot_col: Option<PivotDim> = None;
             let mut new_pivot_metric: Option<PivotMetric> = None;
             let mut copy_pivot = false;
+            let mut copy_report = false;
+            let mut export_report = false;
             let mut scan_underpricing = false;
             let mut open_card_id: Option<i64> = None;
+            let mut compare_text = self.compare_text.clone();
+            let mut compare_year = self.compare_year.clone();
+            let mut run_compare = false;
             let p_row = self.pivot_row_dim;
             let p_col = self.pivot_col_dim;
             let p_metric = self.pivot_metric;
@@ -2577,6 +2680,10 @@ impl App {
             let loading = self.analytics_loading;
             let lang = self.lang;
             let hs_level = self.hs_level;
+            let report_ready = self.report_ready();
+            let compare_snapshot = self.compare_analytics.clone();
+            let compare_query_snapshot = self.compare_query.clone();
+            let compare_loading = self.compare_loading;
 
             // Analytics sub-tabs: each one is a focused screen.
             ui.horizontal(|ui| {
@@ -2588,6 +2695,8 @@ impl App {
                         AnalyticsView::Countries => t.countries_section,
                         AnalyticsView::Prices => t.prices_section,
                         AnalyticsView::Pivot => t.tab_pivot,
+                        AnalyticsView::Report => analytics_report_label(lang),
+                        AnalyticsView::Compare => analytics_compare_label(lang),
                     };
                     if ui.selectable_label(view == v, label).clicked() && v != view {
                         new_view = Some(v);
@@ -2657,6 +2766,8 @@ impl App {
                     AnalyticsView::Overview => {
                         ui.label(egui::RichText::new(t.analytics_scope_note).weak().small());
                         ui.add_space(6.0);
+                        overview_story_cards(ui, &analytics.overview, lang);
+                        ui.add_space(10.0);
                         ui.horizontal_wrapped(|ui| {
                             kpi_tile(
                                 ui,
@@ -2678,6 +2789,18 @@ impl App {
                             );
                             kpi_tile(
                                 ui,
+                                t.sender,
+                                group_digits(analytics.overview.distinct_senders),
+                                overview_senders_help(lang),
+                            );
+                            kpi_tile(
+                                ui,
+                                t.edrpou,
+                                group_digits(analytics.overview.distinct_edrpou),
+                                overview_edrpou_help(lang),
+                            );
+                            kpi_tile(
+                                ui,
                                 t.total_value,
                                 fmt_compact(analytics.overview.total_value_usd),
                                 t.total_value_help,
@@ -2687,6 +2810,18 @@ impl App {
                                 t.net_weight,
                                 format!("{} kg", fmt_compact(analytics.overview.total_net_kg)),
                                 t.net_weight_help,
+                            );
+                            kpi_tile(
+                                ui,
+                                t.gross_weight,
+                                format!("{} kg", fmt_compact(analytics.overview.total_gross_kg)),
+                                overview_gross_help(lang),
+                            );
+                            kpi_tile(
+                                ui,
+                                t.quantity,
+                                fmt_compact(analytics.overview.total_quantity),
+                                overview_quantity_help(lang),
                             );
                             kpi_tile(
                                 ui,
@@ -2702,9 +2837,27 @@ impl App {
                             );
                             kpi_tile(
                                 ui,
-                                t.countries_count,
+                                t.trademark,
+                                group_digits(analytics.overview.distinct_trademarks),
+                                overview_trademarks_help(lang),
+                            );
+                            kpi_tile(
+                                ui,
+                                overview_origin_countries_label(lang),
                                 group_digits(analytics.overview.distinct_origin_countries),
                                 t.countries_help,
+                            );
+                            kpi_tile(
+                                ui,
+                                overview_dispatch_countries_label(lang),
+                                group_digits(analytics.overview.distinct_dispatch_countries),
+                                overview_dispatch_countries_help(lang),
+                            );
+                            kpi_tile(
+                                ui,
+                                overview_trade_countries_label(lang),
+                                group_digits(analytics.overview.distinct_trade_countries),
+                                overview_trade_countries_help(lang),
                             );
                         });
                         ui.add_space(12.0);
@@ -2885,6 +3038,97 @@ impl App {
                             }
                         }
                     }
+                    AnalyticsView::Report => {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(report_title(lang)).strong());
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            report_ready,
+                                            egui::Button::new(format!(
+                                                "\u{29C9} {}",
+                                                report_copy_label(lang)
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        copy_report = true;
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            report_ready,
+                                            egui::Button::new(report_export_label(lang)),
+                                        )
+                                        .clicked()
+                                    {
+                                        export_report = true;
+                                    }
+                                },
+                            );
+                        });
+                        ui.label(egui::RichText::new(report_hint(lang)).weak().small());
+                        ui.add_space(8.0);
+                        if !report_ready {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(t.searching);
+                            });
+                        } else {
+                            report_ui(ui, analytics, &self.active_query, lang);
+                        }
+                    }
+                    AnalyticsView::Compare => {
+                        ui.label(egui::RichText::new(compare_hint(lang)).weak().small());
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new(compare_text_label(lang)).strong());
+                            ui.add(
+                                egui::TextEdit::singleline(&mut compare_text).desired_width(220.0),
+                            );
+                            ui.label(egui::RichText::new(t.year).strong());
+                            ui.add(
+                                egui::TextEdit::singleline(&mut compare_year).desired_width(80.0),
+                            );
+                            if ui.button(compare_previous_year_label(lang)).clicked() {
+                                if let Ok(year) =
+                                    self.active_query.filters.year.trim().parse::<i32>()
+                                {
+                                    compare_year = (year - 1).to_string();
+                                }
+                                if compare_text.trim().is_empty() {
+                                    compare_text = self.active_query.text.clone();
+                                }
+                            }
+                            if ui.button(compare_run_label(lang)).clicked() {
+                                run_compare = true;
+                            }
+                        });
+                        ui.add_space(8.0);
+                        if compare_loading {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(t.searching);
+                            });
+                        }
+                        match (&compare_snapshot, &compare_query_snapshot) {
+                            (Some(other), Some(other_query)) => {
+                                compare_ui(
+                                    ui,
+                                    analytics,
+                                    other,
+                                    &self.active_query,
+                                    other_query,
+                                    lang,
+                                );
+                            }
+                            _ if !compare_loading => {
+                                ui.label(egui::RichText::new(compare_empty(lang)).weak());
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 ui.add_space(8.0);
             });
@@ -2900,6 +3144,18 @@ impl App {
                 self.hs_level = level;
                 self.analytics_loaded[AnalyticsView::Products.index()] = false;
                 need_request = true;
+            }
+            if copy_pivot && let Some(pivot) = &self.pivot {
+                let tsv = pivot_tsv(pivot, self.pivot_row_dim, self.pivot_col_dim, self.lang);
+                ui.ctx().copy_text(tsv);
+            }
+            if copy_report {
+                ui.ctx()
+                    .copy_text(report_markdown(analytics, &self.active_query, self.lang));
+            }
+            if export_report {
+                let html = report_html(analytics, &self.active_query, self.lang);
+                self.save_report_html(html);
             }
             let mut repivot = false;
             if let Some(d) = new_pivot_row {
@@ -2917,9 +3173,14 @@ impl App {
             if repivot {
                 self.request_pivot();
             }
-            if copy_pivot && let Some(pivot) = &self.pivot {
-                let tsv = pivot_tsv(pivot, self.pivot_row_dim, self.pivot_col_dim, self.lang);
-                ui.ctx().copy_text(tsv);
+            if self.compare_text != compare_text {
+                self.compare_text = compare_text;
+            }
+            if self.compare_year != compare_year {
+                self.compare_year = compare_year;
+            }
+            if run_compare {
+                self.request_compare();
             }
             if scan_underpricing {
                 self.request_underpricing();
@@ -2929,7 +3190,7 @@ impl App {
             }
             if show_more {
                 self.analytics_limit = 50;
-                self.analytics_loaded = [false; 6];
+                self.analytics_loaded = [false; AnalyticsView::COUNT];
                 need_request = true;
             }
             if let Some(action) = action {
@@ -3250,30 +3511,58 @@ impl App {
             };
             let lang = self.lang;
 
-            // Company names (variants) and EDRPOU.
+            // Company identity and first-read highlights.
             let primary = profile.names.first().cloned().unwrap_or_default();
-            ui.label(
-                egui::RichText::new(if primary.is_empty() {
-                    profile.edrpou.clone()
-                } else {
-                    primary.clone()
-                })
-                .size(18.0)
-                .strong(),
-            );
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("{}: {}", t.edrpou, profile.edrpou)).weak());
-                if ui.small_button(t.show_results).clicked() {
-                    filter_all = true;
-                }
-            });
-            if profile.names.len() > 1 {
-                ui.label(
-                    egui::RichText::new(fmt(t.also_known_as, &[&profile.names[1..].join(" · ")]))
-                        .weak()
-                        .small(),
-                );
-            }
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.columns(2, |cols| {
+                        cols[0].label(
+                            egui::RichText::new(if primary.is_empty() {
+                                profile.edrpou.clone()
+                            } else {
+                                primary.clone()
+                            })
+                            .size(20.0)
+                            .strong(),
+                        );
+                        cols[0].horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{}: {}", t.edrpou, profile.edrpou))
+                                    .weak(),
+                            );
+                            if ui.small_button(t.show_results).clicked() {
+                                filter_all = true;
+                            }
+                        });
+                        if profile.names.len() > 1 {
+                            cols[0].label(
+                                egui::RichText::new(fmt(
+                                    t.also_known_as,
+                                    &[&profile.names[1..].join(" · ")],
+                                ))
+                                .weak()
+                                .small(),
+                            );
+                        }
+
+                        profile_highlight_row(
+                            &mut cols[1],
+                            profile_highlight_product(lang),
+                            profile.top_products.first(),
+                        );
+                        profile_highlight_row(
+                            &mut cols[1],
+                            profile_highlight_sender(lang),
+                            profile.top_senders.first(),
+                        );
+                        profile_highlight_row(
+                            &mut cols[1],
+                            profile_highlight_country(lang),
+                            profile.top_origin_countries.first(),
+                        );
+                    });
+                });
             ui.add_space(8.0);
 
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -3331,41 +3620,50 @@ impl App {
                     ui.add_space(12.0);
                 }
 
-                ui.label(egui::RichText::new(t.products_section).strong());
-                ui.label(egui::RichText::new(t.products_section_hint).weak().small());
-                if let Some(next) =
-                    analytics_cards_with_options(ui, &profile.product_sections, lang, false)
-                    && let AnalyticsCardAction::Filter(filter) = next
-                {
-                    action = Some(filter);
-                }
-                ui.add_space(8.0);
+                ui.columns(2, |cols| {
+                    cols[0].label(egui::RichText::new(t.products_section).strong());
+                    cols[0].label(egui::RichText::new(t.products_section_hint).weak().small());
+                    if let Some(next) = analytics_cards_with_options(
+                        &mut cols[0],
+                        &profile.product_sections,
+                        lang,
+                        false,
+                    ) && let AnalyticsCardAction::Filter(filter) = next
+                    {
+                        action = Some(filter);
+                    }
 
-                ui.label(egui::RichText::new(t.companies_section).strong());
-                let sender_section = [AnalyticsSection {
-                    kind: AnalyticsSectionKind::Senders,
-                    rows: profile.top_senders.clone(),
-                }];
-                if let Some(next) = analytics_cards_with_options(ui, &sender_section, lang, false)
-                    && let AnalyticsCardAction::Filter(filter) = next
-                {
-                    action = Some(filter);
-                }
-                ui.add_space(8.0);
+                    cols[1].label(egui::RichText::new(t.companies_section).strong());
+                    let sender_section = [AnalyticsSection {
+                        kind: AnalyticsSectionKind::Senders,
+                        rows: profile.top_senders.clone(),
+                    }];
+                    if let Some(next) =
+                        analytics_cards_with_options(&mut cols[1], &sender_section, lang, false)
+                        && let AnalyticsCardAction::Filter(filter) = next
+                    {
+                        action = Some(filter);
+                    }
+                });
+                ui.add_space(10.0);
 
-                ui.label(egui::RichText::new(t.countries_section).strong());
-                ui.label(egui::RichText::new(t.countries_section_hint).weak().small());
-                if let Some(next) =
-                    analytics_cards_with_options(ui, &profile.country_sections, lang, false)
-                    && let AnalyticsCardAction::Filter(filter) = next
-                {
-                    action = Some(filter);
-                }
-                ui.add_space(8.0);
+                ui.columns(2, |cols| {
+                    cols[0].label(egui::RichText::new(t.countries_section).strong());
+                    cols[0].label(egui::RichText::new(t.countries_section_hint).weak().small());
+                    if let Some(next) = analytics_cards_with_options(
+                        &mut cols[0],
+                        &profile.country_sections,
+                        lang,
+                        false,
+                    ) && let AnalyticsCardAction::Filter(filter) = next
+                    {
+                        action = Some(filter);
+                    }
 
-                ui.label(egui::RichText::new(t.prices_section).strong());
-                ui.label(egui::RichText::new(t.prices_section_hint).weak().small());
-                price_table(ui, &profile.price_sections, lang);
+                    cols[1].label(egui::RichText::new(t.prices_section).strong());
+                    cols[1].label(egui::RichText::new(t.prices_section_hint).weak().small());
+                    price_table(&mut cols[1], &profile.price_sections, lang);
+                });
                 ui.add_space(8.0);
             });
         });
@@ -3828,6 +4126,7 @@ fn months_chart(ui: &mut egui::Ui, months: &[AnalyticsMonthRow], metric: MonthMe
     let bar_w = (slot * 0.72).clamp(3.0, 64.0);
     let hover_x = response.hover_pos().map(|p| p.x);
     let mut hovered: Option<usize> = None;
+    let mut hovered_bar: Option<egui::Rect> = None;
 
     let bar_color = if visuals.dark_mode {
         egui::Color32::from_rgb(80, 140, 255)
@@ -3842,24 +4141,32 @@ fn months_chart(ui: &mut egui::Ui, months: &[AnalyticsMonthRow], metric: MonthMe
     for (i, month) in months.iter().enumerate() {
         let cx = plot.left() + slot * (i as f32 + 0.5);
         let value = metric.of(month);
-        let bar_h = (plot.height() * (value / max_value) as f32).max(1.5);
-        let bar = egui::Rect::from_min_max(
-            egui::pos2(cx - bar_w / 2.0, plot.bottom() - bar_h),
-            egui::pos2(cx + bar_w / 2.0, plot.bottom()),
-        );
         let is_hovered = hover_x
             .map(|x| (x - cx).abs() <= slot / 2.0)
             .unwrap_or(false);
+        let hover_t = ui.ctx().animate_bool_with_time(
+            egui::Id::new(("month_chart_bar", i, metric.index())),
+            is_hovered,
+            0.12,
+        );
+        let bar_h = (plot.height() * (value / max_value) as f32 * (1.0 + hover_t * 0.035))
+            .max(1.5)
+            .min(plot.height());
+        let lift = hover_t * 2.0;
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(cx - bar_w / 2.0, plot.bottom() - bar_h - lift),
+            egui::pos2(cx + bar_w / 2.0, plot.bottom()),
+        );
         if is_hovered {
             hovered = Some(i);
+            hovered_bar = Some(bar);
         }
-        let color = if is_hovered {
-            bar_color
-        } else {
-            bar_color.gamma_multiply(0.62)
-        };
-        ui.painter()
-            .rect_filled(bar, egui::CornerRadius::same(2), color);
+        let color = bar_color.gamma_multiply(0.58 + hover_t * 0.42);
+        ui.painter().rect_filled(
+            bar,
+            egui::CornerRadius::same(2 + (hover_t * 2.0) as u8),
+            color,
+        );
         if i % label_every == 0 {
             ui.painter().text(
                 egui::pos2(cx, rect.bottom() - 4.0),
@@ -3881,27 +4188,138 @@ fn months_chart(ui: &mut egui::Ui, months: &[AnalyticsMonthRow], metric: MonthMe
         }
     }
 
-    if let Some(i) = hovered {
+    if let (Some(i), Some(bar)) = (hovered, hovered_bar) {
         let month = &months[i];
-        let t = tr(lang);
-        let (rows_l, decls_l, value_l, weight_l) = (
-            t.chart_rows,
+        draw_month_popup(ui, rect, bar, month, metric, lang);
+    }
+}
+
+fn draw_month_popup(
+    ui: &mut egui::Ui,
+    chart_rect: egui::Rect,
+    bar: egui::Rect,
+    month: &AnalyticsMonthRow,
+    metric: MonthMetric,
+    lang: Lang,
+) {
+    let visuals = ui.visuals();
+    let popup_w = 226.0;
+    let popup_h = 112.0;
+    let x = (bar.center().x - popup_w / 2.0)
+        .clamp(chart_rect.left() + 8.0, chart_rect.right() - popup_w - 8.0);
+    let y = (bar.top() - popup_h - 10.0).max(chart_rect.top() + 8.0);
+    let rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(popup_w, popup_h));
+    let fill = if visuals.dark_mode {
+        egui::Color32::from_rgb(32, 38, 48)
+    } else {
+        egui::Color32::from_rgb(255, 255, 255)
+    };
+    let stroke = egui::Stroke::new(
+        1.0,
+        if visuals.dark_mode {
+            egui::Color32::from_rgb(84, 112, 160)
+        } else {
+            egui::Color32::from_rgb(188, 203, 230)
+        },
+    );
+    let shadow = rect.translate(egui::vec2(0.0, 2.0));
+    ui.painter().rect_filled(
+        shadow,
+        egui::CornerRadius::same(7),
+        egui::Color32::from_black_alpha(if visuals.dark_mode { 70 } else { 26 }),
+    );
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(7), fill);
+    ui.painter().rect_stroke(
+        rect,
+        egui::CornerRadius::same(7),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    let arrow_x = bar
+        .center()
+        .x
+        .clamp(rect.left() + 16.0, rect.right() - 16.0);
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(arrow_x - 6.0, rect.bottom() - 1.0),
+            egui::pos2(arrow_x + 6.0, rect.bottom() - 1.0),
+            egui::pos2(arrow_x, rect.bottom() + 7.0),
+        ],
+        fill,
+        stroke,
+    ));
+
+    let t = tr(lang);
+    let metric_value = metric.of(month);
+    let price = if month.total_net_kg > 0.0 {
+        month.total_value_usd / month.total_net_kg
+    } else {
+        0.0
+    };
+    let lines = [
+        month.month.clone(),
+        format!(
+            "{}: {}",
+            month_metric_label(metric, lang),
+            month_metric_value(metric, metric_value)
+        ),
+        format!("{}: {}", t.chart_rows, group_digits(month.rows)),
+        format!(
+            "{}: {}",
             t.chart_declarations,
+            group_digits(month.declarations)
+        ),
+        format!(
+            "{}: {}",
             t.chart_value,
+            fmt_decimal(month.total_value_usd, 0)
+        ),
+        format!(
+            "{}: {} kg  |  {}: {}",
             t.chart_net_weight,
-        );
-        response.on_hover_text(format!(
-            "{}\n{}: {}\n{}: {}\n{}: {}\n{}: {} kg",
-            month.month,
-            rows_l,
-            group_digits(month.rows),
-            decls_l,
-            group_digits(month.declarations),
-            value_l,
-            fmt_decimal(month.total_value_usd, 0),
-            weight_l,
             fmt_decimal(month.total_net_kg, 0),
-        ));
+            t.metric_price,
+            fmt_decimal(price, 2)
+        ),
+    ];
+    for (idx, line) in lines.iter().enumerate() {
+        let color = if idx == 0 {
+            visuals.text_color()
+        } else {
+            visuals.weak_text_color()
+        };
+        let font = if idx == 0 {
+            egui::FontId::new(13.0, egui::FontFamily::Proportional)
+        } else {
+            egui::FontId::new(11.5, egui::FontFamily::Proportional)
+        };
+        ui.painter().text(
+            egui::pos2(rect.left() + 10.0, rect.top() + 9.0 + idx as f32 * 16.0),
+            egui::Align2::LEFT_TOP,
+            line,
+            font,
+            color,
+        );
+    }
+}
+
+fn month_metric_label(metric: MonthMetric, lang: Lang) -> &'static str {
+    let t = tr(lang);
+    match metric {
+        MonthMetric::Value => t.metric_value,
+        MonthMetric::Rows => t.metric_rows,
+        MonthMetric::NetWeight => t.metric_weight,
+        MonthMetric::AvgPrice => t.metric_price,
+    }
+}
+
+fn month_metric_value(metric: MonthMetric, value: f64) -> String {
+    match metric {
+        MonthMetric::Rows => group_digits(value as u64),
+        MonthMetric::AvgPrice => fmt_decimal(value, 2),
+        MonthMetric::NetWeight => format!("{} kg", fmt_decimal(value, 0)),
+        MonthMetric::Value => fmt_decimal(value, 0),
     }
 }
 
@@ -3929,6 +4347,606 @@ fn fmt_compact(value: f64) -> String {
     }
 }
 
+fn analytics_report_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Звіт",
+        _ => "Report",
+    }
+}
+
+fn analytics_compare_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Порівняння",
+        _ => "Compare",
+    }
+}
+
+fn report_title(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Звіт по поточному запиту",
+        _ => "Report for the current query",
+    }
+}
+
+fn report_hint(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => {
+            "Короткий підсумок для роботи: головні цифри, компанії, товари, країни і ціни. HTML-звіт можна зберегти як PDF через друк у браузері."
+        }
+        _ => {
+            "A clean working summary: headline numbers, companies, goods, countries, and prices. The HTML report can be saved as PDF from the browser print dialog."
+        }
+    }
+}
+
+fn report_copy_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Копіювати звіт",
+        _ => "Copy report",
+    }
+}
+
+fn report_export_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Експорт HTML/PDF",
+        _ => "Export HTML/PDF",
+    }
+}
+
+fn compare_hint(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => {
+            "Порівняйте поточний запит з іншим товаром, компанією або роком. Фільтри зліва зберігаються, якщо не змінити текст чи рік."
+        }
+        _ => {
+            "Compare the current query with another product, company, or year. Current filters are reused unless you override text or year."
+        }
+    }
+}
+
+fn compare_text_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Порівняти з:",
+        _ => "Compare with:",
+    }
+}
+
+fn compare_previous_year_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Попередній рік",
+        _ => "Previous year",
+    }
+}
+
+fn compare_run_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Порівняти",
+        _ => "Compare",
+    }
+}
+
+fn compare_empty(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Вкажіть текст або рік для порівняння і натисніть «Порівняти».",
+        _ => "Enter a text or year to compare with, then click Compare.",
+    }
+}
+
+fn profile_highlight_product(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Головний товар",
+        _ => "Main good",
+    }
+}
+
+fn profile_highlight_sender(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Головний відправник",
+        _ => "Main sender",
+    }
+}
+
+fn profile_highlight_country(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Головна країна",
+        _ => "Main country",
+    }
+}
+
+fn profile_highlight_row(ui: &mut egui::Ui, label: &str, row: Option<&AnalyticsGroupRow>) {
+    let value = row
+        .map(|row| {
+            format!(
+                "{} · {}",
+                trunc_label(&row.label, 34),
+                fmt_compact(row.total_value_usd)
+            )
+        })
+        .unwrap_or_else(|| "—".to_string());
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).weak().small());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(value).monospace());
+        });
+    });
+}
+
+fn report_ui(ui: &mut egui::Ui, analytics: &Analytics, query: &Query, lang: Lang) {
+    ui.label(
+        egui::RichText::new(query_summary(query, tr(lang)))
+            .weak()
+            .small(),
+    );
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        kpi_tile(
+            ui,
+            tr(lang).rows_label,
+            group_digits(analytics.overview.row_count),
+            tr(lang).rows_help,
+        );
+        kpi_tile(
+            ui,
+            tr(lang).declarations_label,
+            group_digits(analytics.overview.declaration_count),
+            tr(lang).declarations_help,
+        );
+        kpi_tile(
+            ui,
+            tr(lang).total_value,
+            fmt_compact(analytics.overview.total_value_usd),
+            tr(lang).total_value_help,
+        );
+        kpi_tile(
+            ui,
+            tr(lang).net_weight,
+            format!("{} kg", fmt_compact(analytics.overview.total_net_kg)),
+            tr(lang).net_weight_help,
+        );
+        kpi_tile(
+            ui,
+            tr(lang).avg_value_kg,
+            fmt_decimal(analytics.overview.avg_value_per_net_kg, 2),
+            tr(lang).avg_value_kg_help,
+        );
+        kpi_tile(
+            ui,
+            tr(lang).unique_edrpou,
+            group_digits(analytics.overview.distinct_edrpou),
+            tr(lang).unique_edrpou,
+        );
+    });
+    ui.add_space(12.0);
+
+    if !analytics.months.is_empty() {
+        ui.label(egui::RichText::new(tr(lang).months_section).strong());
+        months_chart(ui, &analytics.months, MonthMetric::Value, lang);
+        ui.add_space(12.0);
+    }
+
+    ui.columns(2, |cols| {
+        report_section(
+            &mut cols[0],
+            tr(lang).companies_section,
+            &analytics.company_sections,
+            lang,
+        );
+        report_section(
+            &mut cols[1],
+            tr(lang).products_section,
+            &analytics.product_sections,
+            lang,
+        );
+    });
+    ui.add_space(10.0);
+    ui.columns(2, |cols| {
+        report_section(
+            &mut cols[0],
+            tr(lang).countries_section,
+            &analytics.country_sections,
+            lang,
+        );
+        report_prices(&mut cols[1], analytics, lang);
+    });
+}
+
+fn report_section(ui: &mut egui::Ui, title: &str, sections: &[AnalyticsSection], lang: Lang) {
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(title).strong());
+            ui.add_space(4.0);
+            for section in sections.iter().filter(|s| !s.rows.is_empty()).take(2) {
+                ui.label(
+                    egui::RichText::new(section_title(section.kind, lang))
+                        .weak()
+                        .small(),
+                );
+                for row in section.rows.iter().take(5) {
+                    report_group_row(ui, row);
+                }
+                ui.add_space(4.0);
+            }
+        });
+}
+
+fn report_group_row(ui: &mut egui::Ui, row: &AnalyticsGroupRow) {
+    ui.horizontal(|ui| {
+        ui.label(trunc_label(&row.label, 38));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} · {}%",
+                    fmt_compact(row.total_value_usd),
+                    fmt_decimal(row.share_percent, 1)
+                ))
+                .monospace(),
+            );
+        });
+    });
+}
+
+fn report_prices(ui: &mut egui::Ui, analytics: &Analytics, lang: Lang) {
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(tr(lang).prices_section).strong());
+            ui.add_space(4.0);
+            for metric in analytics
+                .price_sections
+                .iter()
+                .filter(|m| m.count > 0)
+                .take(5)
+            {
+                ui.horizontal(|ui| {
+                    ui.label(price_metric_title(metric.kind, lang));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}: {}",
+                                tr(lang).median,
+                                fmt_decimal(metric.median, 2)
+                            ))
+                            .monospace(),
+                        );
+                    });
+                });
+            }
+        });
+}
+
+fn compare_ui(
+    ui: &mut egui::Ui,
+    left: &Analytics,
+    right: &Analytics,
+    left_query: &Query,
+    right_query: &Query,
+    lang: Lang,
+) {
+    ui.columns(2, |cols| {
+        compare_side_card(
+            &mut cols[0],
+            query_summary(left_query, tr(lang)),
+            left,
+            lang,
+        );
+        compare_side_card(
+            &mut cols[1],
+            query_summary(right_query, tr(lang)),
+            right,
+            lang,
+        );
+    });
+    ui.add_space(10.0);
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(compare_delta_title(lang)).strong());
+            ui.add_space(4.0);
+            egui::Grid::new("compare_delta_grid")
+                .num_columns(4)
+                .striped(true)
+                .show(ui, |ui| {
+                    compare_metric_row(
+                        ui,
+                        tr(lang).rows_label,
+                        left.overview.row_count as f64,
+                        right.overview.row_count as f64,
+                        0,
+                    );
+                    compare_metric_row(
+                        ui,
+                        tr(lang).declarations_label,
+                        left.overview.declaration_count as f64,
+                        right.overview.declaration_count as f64,
+                        0,
+                    );
+                    compare_metric_row(
+                        ui,
+                        tr(lang).total_value,
+                        left.overview.total_value_usd,
+                        right.overview.total_value_usd,
+                        2,
+                    );
+                    compare_metric_row(
+                        ui,
+                        tr(lang).net_weight,
+                        left.overview.total_net_kg,
+                        right.overview.total_net_kg,
+                        2,
+                    );
+                    compare_metric_row(
+                        ui,
+                        tr(lang).avg_value_kg,
+                        left.overview.avg_value_per_net_kg,
+                        right.overview.avg_value_per_net_kg,
+                        2,
+                    );
+                    compare_metric_row(
+                        ui,
+                        tr(lang).unique_edrpou,
+                        left.overview.distinct_edrpou as f64,
+                        right.overview.distinct_edrpou as f64,
+                        0,
+                    );
+                });
+        });
+}
+
+fn compare_side_card(ui: &mut egui::Ui, title: String, analytics: &Analytics, lang: Lang) {
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(title).strong());
+            ui.add_space(4.0);
+            ui.label(format!(
+                "{}: {}",
+                tr(lang).rows_label,
+                group_digits(analytics.overview.row_count)
+            ));
+            ui.label(format!(
+                "{}: {}",
+                tr(lang).total_value,
+                fmt_compact(analytics.overview.total_value_usd)
+            ));
+            ui.label(format!(
+                "{}: {} kg",
+                tr(lang).net_weight,
+                fmt_compact(analytics.overview.total_net_kg)
+            ));
+            ui.label(format!(
+                "{}: {}",
+                tr(lang).avg_value_kg,
+                fmt_decimal(analytics.overview.avg_value_per_net_kg, 2)
+            ));
+        });
+}
+
+fn compare_delta_title(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Різниця",
+        _ => "Difference",
+    }
+}
+
+fn compare_metric_row(ui: &mut egui::Ui, label: &str, left: f64, right: f64, decimals: usize) {
+    ui.label(label);
+    ui.label(egui::RichText::new(format_metric(left, decimals)).monospace());
+    ui.label(egui::RichText::new(format_metric(right, decimals)).monospace());
+    let delta = right - left;
+    let pct = if left.abs() > f64::EPSILON {
+        delta / left * 100.0
+    } else {
+        0.0
+    };
+    let text = if left.abs() > f64::EPSILON {
+        format!("{} ({:+.1}%)", format_metric(delta, decimals), pct)
+    } else {
+        format_metric(delta, decimals)
+    };
+    ui.label(egui::RichText::new(text).monospace().strong());
+    ui.end_row();
+}
+
+fn format_metric(value: f64, decimals: usize) -> String {
+    if decimals == 0 {
+        let rounded = value.round();
+        if rounded < 0.0 {
+            format!("-{}", group_digits((-rounded) as u64))
+        } else {
+            group_digits(rounded as u64)
+        }
+    } else {
+        fmt_decimal(value, decimals)
+    }
+}
+
+fn report_markdown(analytics: &Analytics, query: &Query, lang: Lang) -> String {
+    let mut out = String::new();
+    out.push_str("# Base Search Report\n\n");
+    out.push_str(&format!("Query: {}\n\n", query_summary(query, tr(lang))));
+    out.push_str("## Summary\n");
+    out.push_str(&format!(
+        "- Rows: {}\n",
+        group_digits(analytics.overview.row_count)
+    ));
+    out.push_str(&format!(
+        "- Declarations: {}\n",
+        group_digits(analytics.overview.declaration_count)
+    ));
+    out.push_str(&format!(
+        "- Total value: {:.2}\n",
+        analytics.overview.total_value_usd
+    ));
+    out.push_str(&format!(
+        "- Net weight: {:.3} kg\n",
+        analytics.overview.total_net_kg
+    ));
+    out.push_str(&format!(
+        "- Average value/kg: {:.2}\n\n",
+        analytics.overview.avg_value_per_net_kg
+    ));
+    append_report_sections(&mut out, "Companies", &analytics.company_sections);
+    append_report_sections(&mut out, "Goods", &analytics.product_sections);
+    append_report_sections(&mut out, "Countries", &analytics.country_sections);
+    out
+}
+
+fn report_html(analytics: &Analytics, query: &Query, lang: Lang) -> String {
+    let mut body = String::new();
+    body.push_str(&format!(
+        "<h1>Base Search Report</h1><p class=\"query\">{}</p>",
+        esc_html(&query_summary(query, tr(lang)))
+    ));
+    body.push_str("<section class=\"kpis\">");
+    for (label, value) in [
+        (
+            tr(lang).rows_label,
+            group_digits(analytics.overview.row_count),
+        ),
+        (
+            tr(lang).declarations_label,
+            group_digits(analytics.overview.declaration_count),
+        ),
+        (
+            tr(lang).total_value,
+            format!("{:.2}", analytics.overview.total_value_usd),
+        ),
+        (
+            tr(lang).net_weight,
+            format!("{:.3} kg", analytics.overview.total_net_kg),
+        ),
+        (
+            tr(lang).avg_value_kg,
+            fmt_decimal(analytics.overview.avg_value_per_net_kg, 2),
+        ),
+        (
+            tr(lang).unique_edrpou,
+            group_digits(analytics.overview.distinct_edrpou),
+        ),
+    ] {
+        body.push_str(&format!(
+            "<article><span>{}</span><strong>{}</strong></article>",
+            esc_html(label),
+            esc_html(&value)
+        ));
+    }
+    body.push_str("</section>");
+    append_html_sections(
+        &mut body,
+        tr(lang).companies_section,
+        &analytics.company_sections,
+        lang,
+    );
+    append_html_sections(
+        &mut body,
+        tr(lang).products_section,
+        &analytics.product_sections,
+        lang,
+    );
+    append_html_sections(
+        &mut body,
+        tr(lang).countries_section,
+        &analytics.country_sections,
+        lang,
+    );
+    append_html_prices(&mut body, analytics, lang);
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Base Search Report</title>{}</head><body>{}</body></html>",
+        report_css(),
+        body
+    )
+}
+
+fn append_html_sections(out: &mut String, title: &str, sections: &[AnalyticsSection], lang: Lang) {
+    out.push_str(&format!("<section><h2>{}</h2>", esc_html(title)));
+    for section in sections.iter().filter(|s| !s.rows.is_empty()).take(3) {
+        out.push_str(&format!(
+            "<h3>{}</h3><table><thead><tr><th>Name</th><th>Value</th><th>Net kg</th><th>Rows</th><th>Share</th></tr></thead><tbody>",
+            esc_html(section_title(section.kind, lang))
+        ));
+        for row in section.rows.iter().take(10) {
+            out.push_str(&format!(
+                "<tr><td>{}</td><td>{:.2}</td><td>{:.3}</td><td>{}</td><td>{:.1}%</td></tr>",
+                esc_html(&row.label),
+                row.total_value_usd,
+                row.total_net_kg,
+                row.rows,
+                row.share_percent
+            ));
+        }
+        out.push_str("</tbody></table>");
+    }
+    out.push_str("</section>");
+}
+
+fn append_html_prices(out: &mut String, analytics: &Analytics, lang: Lang) {
+    out.push_str(&format!(
+        "<section><h2>{}</h2><table><thead><tr><th>Metric</th><th>Average</th><th>Weighted</th><th>Median</th><th>P25-P75</th><th>Rows</th></tr></thead><tbody>",
+        esc_html(tr(lang).prices_section)
+    ));
+    for metric in analytics
+        .price_sections
+        .iter()
+        .filter(|m| m.count > 0)
+        .take(8)
+    {
+        out.push_str(&format!(
+            "<tr><td>{}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3} - {:.3}</td><td>{}</td></tr>",
+            esc_html(price_metric_title(metric.kind, lang)),
+            metric.average,
+            metric.weighted_average,
+            metric.median,
+            metric.p25,
+            metric.p75,
+            metric.count
+        ));
+    }
+    out.push_str("</tbody></table></section>");
+}
+
+fn report_css() -> &'static str {
+    "<style>
+      :root { color-scheme: light; font-family: Segoe UI, Arial, sans-serif; color: #1b2430; }
+      body { margin: 36px; background: #fff; font-size: 13px; line-height: 1.45; }
+      h1 { margin: 0 0 4px; font-size: 26px; }
+      h2 { margin: 26px 0 8px; font-size: 18px; border-bottom: 1px solid #d7dde5; padding-bottom: 4px; }
+      h3 { margin: 16px 0 6px; font-size: 14px; color: #34404e; }
+      .query { margin: 0 0 18px; color: #6a7682; }
+      .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 18px 0 20px; }
+      .kpis article { border: 1px solid #d7dde5; border-radius: 6px; padding: 10px 12px; }
+      .kpis span { display: block; color: #6a7682; font-size: 11px; }
+      .kpis strong { display: block; margin-top: 4px; font-size: 18px; font-family: Consolas, monospace; }
+      table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+      th, td { border-bottom: 1px solid #e4e8ee; padding: 6px 7px; text-align: left; vertical-align: top; }
+      th { background: #f3f6f9; color: #34404e; font-size: 11px; text-transform: uppercase; }
+      td:not(:first-child), th:not(:first-child) { text-align: right; font-family: Consolas, monospace; }
+      @media print { body { margin: 18mm; } .kpis { grid-template-columns: repeat(3, 1fr); } h2 { break-after: avoid; } table { break-inside: avoid; } }
+    </style>"
+}
+
+fn esc_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn append_report_sections(out: &mut String, title: &str, sections: &[AnalyticsSection]) {
+    out.push_str(&format!("## {title}\n"));
+    for section in sections.iter().filter(|s| !s.rows.is_empty()).take(3) {
+        out.push_str(&format!("### {:?}\n", section.kind));
+        for row in section.rows.iter().take(10) {
+            out.push_str(&format!(
+                "- {}: value {:.2}, net {:.3} kg, rows {}, share {:.1}%\n",
+                row.label, row.total_value_usd, row.total_net_kg, row.rows, row.share_percent
+            ));
+        }
+    }
+    out.push('\n');
+}
+
 fn kpi_tile(ui: &mut egui::Ui, label: &str, value: String, help: &str) {
     let frame = egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(8));
     let response = frame
@@ -3940,6 +4958,338 @@ fn kpi_tile(ui: &mut egui::Ui, label: &str, value: String, help: &str) {
         })
         .response;
     response.on_hover_text(help);
+}
+
+fn overview_story_cards(ui: &mut egui::Ui, overview: &AnalyticsOverview, lang: Lang) {
+    let rows_per_decl = safe_ratio(overview.row_count as f64, overview.declaration_count as f64);
+    let value_per_decl = safe_ratio(overview.total_value_usd, overview.declaration_count as f64);
+    let net_per_decl = safe_ratio(overview.total_net_kg, overview.declaration_count as f64);
+    let country_total = overview
+        .distinct_origin_countries
+        .max(overview.distinct_dispatch_countries)
+        .max(overview.distinct_trade_countries);
+    let cards = [
+        (
+            overview_scale_title(lang),
+            fmt_compact(overview.total_value_usd),
+            overview_weight_line(overview, lang),
+            format!(
+                "{}: {}",
+                tr(lang).avg_value_kg,
+                fmt_decimal(overview.avg_value_per_net_kg, 2)
+            ),
+            overview_scale_help(lang),
+        ),
+        (
+            overview_documents_title(lang),
+            group_digits(overview.declaration_count),
+            overview_rows_line(overview.row_count, lang),
+            overview_declaration_density_line(rows_per_decl, value_per_decl, lang),
+            overview_documents_help(lang),
+        ),
+        (
+            overview_participants_title(lang),
+            group_digits(overview.distinct_edrpou),
+            overview_participants_line(overview, lang),
+            overview_net_per_declaration_line(net_per_decl, lang),
+            overview_participants_help(lang),
+        ),
+        (
+            overview_goods_title(lang),
+            group_digits(overview.distinct_product_codes),
+            overview_trademarks_line(overview.distinct_trademarks, lang),
+            overview_countries_line(country_total, lang),
+            overview_goods_help(lang),
+        ),
+    ];
+
+    let gap = 10.0;
+    let avail = ui.available_width();
+    let per_row = if avail >= 1040.0 {
+        4
+    } else if avail >= 660.0 {
+        2
+    } else {
+        1
+    };
+    let card_w = ((avail - gap * (per_row as f32 - 1.0)) / per_row as f32).max(250.0);
+    for chunk in cards.chunks(per_row) {
+        ui.horizontal(|ui| {
+            for (idx, (title, value, line1, line2, help)) in chunk.iter().enumerate() {
+                if idx > 0 {
+                    ui.add_space(gap);
+                }
+                ui.allocate_ui_with_layout(
+                    egui::vec2(card_w, 98.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| overview_story_card(ui, title, value, line1, line2, help),
+                );
+            }
+        });
+        ui.add_space(8.0);
+    }
+}
+
+fn overview_story_card(
+    ui: &mut egui::Ui,
+    title: &str,
+    value: &str,
+    line1: &str,
+    line2: &str,
+    help: &str,
+) {
+    let response = egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(egui::RichText::new(title).weak().small());
+            ui.add_space(3.0);
+            ui.label(egui::RichText::new(value).strong().monospace().size(20.0));
+            ui.add_space(3.0);
+            ui.label(egui::RichText::new(line1).small());
+            ui.label(egui::RichText::new(line2).weak().small());
+        })
+        .response;
+    let strip = egui::Rect::from_min_max(
+        response.rect.left_top() + egui::vec2(1.0, 7.0),
+        egui::pos2(response.rect.left() + 4.0, response.rect.bottom() - 7.0),
+    );
+    ui.painter().rect_filled(
+        strip,
+        egui::CornerRadius::same(3),
+        ACCENT.gamma_multiply(0.85),
+    );
+    response.on_hover_text(help);
+}
+
+fn safe_ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator.abs() <= f64::EPSILON {
+        0.0
+    } else {
+        numerator / denominator
+    }
+}
+
+fn overview_weight_line(overview: &AnalyticsOverview, lang: Lang) -> String {
+    match lang {
+        Lang::Ua => format!(
+            "{} кг нетто | {} кг брутто",
+            fmt_compact(overview.total_net_kg),
+            fmt_compact(overview.total_gross_kg)
+        ),
+        _ => format!(
+            "{} kg net | {} kg gross",
+            fmt_compact(overview.total_net_kg),
+            fmt_compact(overview.total_gross_kg)
+        ),
+    }
+}
+
+fn overview_rows_line(rows: u64, lang: Lang) -> String {
+    match lang {
+        Lang::Ua => format!("{} товарних рядків", group_digits(rows)),
+        _ => format!("{} goods rows", group_digits(rows)),
+    }
+}
+
+fn overview_declaration_density_line(
+    rows_per_decl: f64,
+    value_per_decl: f64,
+    lang: Lang,
+) -> String {
+    match lang {
+        Lang::Ua => format!(
+            "{}: {} рядків | {} сума",
+            overview_per_declaration_label(lang),
+            fmt_decimal(rows_per_decl, 1),
+            fmt_compact(value_per_decl)
+        ),
+        _ => format!(
+            "{}: {} rows | {} value",
+            overview_per_declaration_label(lang),
+            fmt_decimal(rows_per_decl, 1),
+            fmt_compact(value_per_decl)
+        ),
+    }
+}
+
+fn overview_participants_line(overview: &AnalyticsOverview, lang: Lang) -> String {
+    match lang {
+        Lang::Ua => format!(
+            "{} одержувачів | {} відправників",
+            group_digits(overview.distinct_recipients),
+            group_digits(overview.distinct_senders)
+        ),
+        _ => format!(
+            "{} recipients | {} senders",
+            group_digits(overview.distinct_recipients),
+            group_digits(overview.distinct_senders)
+        ),
+    }
+}
+
+fn overview_net_per_declaration_line(net_per_decl: f64, lang: Lang) -> String {
+    match lang {
+        Lang::Ua => format!("Нетто на декларацію: {} кг", fmt_compact(net_per_decl)),
+        _ => format!("Net per declaration: {} kg", fmt_compact(net_per_decl)),
+    }
+}
+
+fn overview_trademarks_line(trademarks: u64, lang: Lang) -> String {
+    match lang {
+        Lang::Ua => format!("{} торгових марок", group_digits(trademarks)),
+        _ => format!("{} trademarks", group_digits(trademarks)),
+    }
+}
+
+fn overview_countries_line(countries: u64, lang: Lang) -> String {
+    match lang {
+        Lang::Ua => format!("{} країн", group_digits(countries)),
+        _ => format!("{} countries", group_digits(countries)),
+    }
+}
+
+fn overview_scale_title(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Масштаб запиту",
+        _ => "Query scale",
+    }
+}
+
+fn overview_scale_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => {
+            "Головна відповідь про обсяг: сума, вага та середня вартість за кг для поточного запиту."
+        }
+        _ => "Headline scale: value, weight, and average value per kg for the current query.",
+    }
+}
+
+fn overview_documents_title(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Документи",
+        _ => "Documents",
+    }
+}
+
+fn overview_documents_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => {
+            "Пояснює базу розрахунку: скільки декларацій і товарних рядків потрапили в аналітику."
+        }
+        _ => "Shows the calculation base: declarations and goods rows included in analytics.",
+    }
+}
+
+fn overview_participants_title(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Учасники",
+        _ => "Participants",
+    }
+}
+
+fn overview_participants_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => {
+            "Скільки різних компаній, одержувачів і відправників знайдено у поточному запиті."
+        }
+        _ => "How many companies, recipients, and senders appear in the current query.",
+    }
+}
+
+fn overview_goods_title(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Товари і географія",
+        _ => "Goods and geography",
+    }
+}
+
+fn overview_goods_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => {
+            "Ширина товарної групи: коди товару, торгові марки та країни, які зустрічаються у запиті."
+        }
+        _ => {
+            "Breadth of the goods set: product codes, trademarks, and countries present in the query."
+        }
+    }
+}
+
+fn overview_per_declaration_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "На декларацію",
+        _ => "Per declaration",
+    }
+}
+
+fn overview_senders_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Унікальні відправники у знайдених рядках.",
+        _ => "Unique senders in the matched rows.",
+    }
+}
+
+fn overview_edrpou_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Унікальні коди ЄДРПОУ у знайдених рядках.",
+        _ => "Unique EDRPOU company identifiers in the matched rows.",
+    }
+}
+
+fn overview_gross_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Сумарна вага брутто у знайдених рядках.",
+        _ => "Total gross weight across the matched rows.",
+    }
+}
+
+fn overview_quantity_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Сума поля кількості там, де воно заповнене числом.",
+        _ => "Sum of the quantity field where it can be parsed as a number.",
+    }
+}
+
+fn overview_trademarks_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Кількість різних торгових марок у знайдених рядках.",
+        _ => "Number of distinct trademarks in the matched rows.",
+    }
+}
+
+fn overview_origin_countries_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Країни походження",
+        _ => "Origin countries",
+    }
+}
+
+fn overview_dispatch_countries_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Країни відправлення",
+        _ => "Dispatch countries",
+    }
+}
+
+fn overview_dispatch_countries_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Кількість різних країн відправлення у знайдених рядках.",
+        _ => "Number of distinct dispatch countries in the matched rows.",
+    }
+}
+
+fn overview_trade_countries_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Країни торгівлі",
+        _ => "Trade countries",
+    }
+}
+
+fn overview_trade_countries_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Кількість різних країн торгівлі у знайдених рядках.",
+        _ => "Number of distinct trade countries in the matched rows.",
+    }
 }
 
 /// Cards of one analytics scope, laid out side by side so the whole scope
@@ -4104,9 +5454,17 @@ fn compact_bar_row(
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
     let visuals = ui.visuals();
     let rounding = egui::CornerRadius::same(3);
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, rounding, visuals.widgets.hovered.weak_bg_fill);
+    let hover_t = ui.ctx().animate_bool_with_time(
+        egui::Id::new(("analytics_bar_row", &row.label)),
+        response.hovered(),
+        0.10,
+    );
+    if hover_t > 0.0 {
+        ui.painter().rect_filled(
+            rect,
+            rounding,
+            visuals.widgets.hovered.weak_bg_fill.gamma_multiply(hover_t),
+        );
     }
     let share_width = (rect.width() * (row.share_percent as f32 / 100.0)).clamp(0.0, rect.width());
     let share_rect = egui::Rect::from_min_size(
@@ -4124,7 +5482,11 @@ fn compact_bar_row(
     };
     ui.painter()
         .rect_filled(bar_bg, rounding, visuals.faint_bg_color);
-    ui.painter().rect_filled(share_rect, rounding, bar_color);
+    ui.painter().rect_filled(
+        share_rect,
+        rounding,
+        bar_color.gamma_multiply(0.72 + hover_t * 0.28),
+    );
 
     let label_font = egui::FontId::new(12.5, egui::FontFamily::Proportional);
     let mono_font = egui::FontId::new(11.5, egui::FontFamily::Monospace);
@@ -4152,12 +5514,65 @@ fn compact_bar_row(
         visuals.weak_text_color(),
     );
 
-    let response = response.on_hover_text(row_hover_text(row, lang));
+    if response.hovered() {
+        response.show_tooltip_ui(|ui| analytics_row_tooltip_ui(ui, row, lang));
+    }
     if response.clicked() {
         row.filter_action.clone()
     } else {
         None
     }
+}
+
+fn analytics_row_tooltip_ui(ui: &mut egui::Ui, row: &AnalyticsGroupRow, lang: Lang) {
+    ui.set_min_width(240.0);
+    ui.strong(&row.label);
+    ui.add_space(3.0);
+    ui.label(
+        egui::RichText::new(row_counts_label(row, lang))
+            .weak()
+            .small(),
+    );
+    ui.separator();
+    egui::Grid::new(("analytics_row_tip", &row.label))
+        .num_columns(2)
+        .spacing([14.0, 4.0])
+        .show(ui, |ui| {
+            tooltip_metric(
+                ui,
+                tr(lang).total_value,
+                fmt_decimal(row.total_value_usd, 2),
+            );
+            tooltip_metric(
+                ui,
+                tr(lang).net_weight,
+                format!("{} kg", fmt_decimal(row.total_net_kg, 3)),
+            );
+            tooltip_metric(
+                ui,
+                tr(lang).gross_weight,
+                format!("{} kg", fmt_decimal(row.total_gross_kg, 3)),
+            );
+            tooltip_metric(ui, tr(lang).quantity, fmt_decimal(row.total_quantity, 3));
+            tooltip_metric(
+                ui,
+                share_header(lang),
+                format!("{}%", fmt_decimal(row.share_percent, 2)),
+            );
+            tooltip_metric(
+                ui,
+                tr(lang).avg_value_kg,
+                fmt_decimal(row.avg_value_per_net_kg, 2),
+            );
+        });
+    ui.add_space(3.0);
+    ui.label(egui::RichText::new(pivot_click_hint(lang)).weak().small());
+}
+
+fn tooltip_metric(ui: &mut egui::Ui, label: &str, value: String) {
+    ui.label(egui::RichText::new(label).weak().small());
+    ui.label(egui::RichText::new(value).monospace());
+    ui.end_row();
 }
 
 fn group_explorer_table(
@@ -4708,19 +6123,46 @@ fn underpricing_table(
     let mut open_id = None;
     ui.horizontal(|ui| {
         ui.label(
-            egui::RichText::new(fmt(
-                tr(lang).underpricing_found,
-                &[
-                    &group_digits(uv.rows.len() as u64),
-                    &group_digits(uv.checked_codes),
-                ],
-            ))
-            .weak()
-            .small(),
+            egui::RichText::new(underpricing_found_text(uv, lang))
+                .weak()
+                .small(),
         );
         if ui.small_button(tr(lang).underpricing_rescan).clicked() {
             *rescan = true;
         }
+    });
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        kpi_tile(
+            ui,
+            underpricing_checked_rows_label(lang),
+            group_digits(uv.checked_rows),
+            underpricing_checked_rows_help(lang),
+        );
+        kpi_tile(
+            ui,
+            underpricing_checked_codes_label(lang),
+            group_digits(uv.checked_codes),
+            underpricing_checked_codes_help(lang),
+        );
+        kpi_tile(
+            ui,
+            underpricing_flagged_rows_label(lang),
+            group_digits(uv.flagged_rows),
+            underpricing_flagged_rows_help(lang),
+        );
+        kpi_tile(
+            ui,
+            underpricing_flagged_value_label(lang),
+            fmt_compact(uv.flagged_value),
+            underpricing_flagged_value_help(lang),
+        );
+        kpi_tile(
+            ui,
+            underpricing_estimated_gap_label(lang),
+            fmt_compact(uv.estimated_gap),
+            underpricing_estimated_gap_help(lang),
+        );
     });
     if uv.rows.is_empty() {
         ui.add_space(8.0);
@@ -4728,8 +6170,7 @@ fn underpricing_table(
         return None;
     }
     ui.add_space(4.0);
-    let (date_h, recip_h, code_h, desc_h) = (
-        tr(lang).year,
+    let (recip_h, code_h, desc_h) = (
         tr(lang).recipient,
         tr(lang).product_code,
         tr(lang).description,
@@ -4737,7 +6178,7 @@ fn underpricing_table(
     let price_h = tr(lang).per_kg;
     let median_h = tr(lang).median;
     let below_h = tr(lang).below_by;
-    let _ = date_h;
+    let dark_mode = ui.visuals().dark_mode;
     egui::ScrollArea::horizontal()
         .id_salt("underpricing_scroll")
         .show(ui, |ui| {
@@ -4747,17 +6188,24 @@ fn underpricing_table(
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .column(Column::initial(82.0).at_least(70.0))
                 .column(Column::initial(180.0).at_least(100.0).clip(true))
+                .column(Column::initial(86.0).at_least(64.0).clip(true))
                 .column(Column::initial(96.0).at_least(70.0))
                 .column(Column::initial(300.0).at_least(120.0).clip(true))
-                .column(Column::initial(70.0).at_least(50.0))
-                .column(Column::initial(70.0).at_least(50.0))
+                .column(Column::initial(76.0).at_least(54.0))
+                .column(Column::initial(76.0).at_least(54.0))
+                .column(Column::initial(96.0).at_least(68.0))
                 .column(Column::initial(72.0).at_least(56.0))
+                .column(Column::initial(92.0).at_least(68.0))
+                .column(Column::initial(76.0).at_least(58.0))
                 .header(24.0, |mut h| {
                     h.col(|ui| {
                         ui.strong(header_for("declaration_date"));
                     });
                     h.col(|ui| {
                         ui.strong(recip_h);
+                    });
+                    h.col(|ui| {
+                        ui.strong(tr(lang).edrpou);
                     });
                     h.col(|ui| {
                         ui.strong(code_h);
@@ -4772,63 +6220,98 @@ fn underpricing_table(
                         ui.strong(median_h);
                     });
                     h.col(|ui| {
+                        ui.strong("P25-P75");
+                    });
+                    h.col(|ui| {
                         ui.strong(below_h);
+                    });
+                    h.col(|ui| {
+                        ui.strong(underpricing_gap_header(lang));
+                    });
+                    h.col(|ui| {
+                        ui.strong(underpricing_samples_header(lang));
                     });
                 })
                 .body(|mut body| {
                     for row in &uv.rows {
                         body.row(22.0, |mut tr_row| {
                             let mut clicked = false;
+                            let hover = underpricing_row_hover(row, lang);
+                            let risk_color = undervaluation_risk_color(row.ratio, dark_mode);
                             tr_row.col(|ui| {
-                                clicked |= ui
-                                    .add(egui::Label::new(&row.declaration_date).selectable(false))
-                                    .clicked();
+                                clicked |= underpricing_cell(ui, &row.declaration_date, &hover);
                             });
                             tr_row.col(|ui| {
-                                clicked |= ui
-                                    .add(
-                                        egui::Label::new(&row.recipient)
-                                            .selectable(false)
-                                            .truncate(),
-                                    )
-                                    .clicked();
+                                clicked |= underpricing_cell(ui, &row.recipient, &hover);
                             });
                             tr_row.col(|ui| {
-                                clicked |= ui
-                                    .add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&row.product_code).monospace(),
-                                        )
-                                        .selectable(false),
-                                    )
-                                    .clicked();
+                                clicked |= underpricing_cell(ui, &row.edrpou, &hover);
                             });
                             tr_row.col(|ui| {
-                                clicked |= ui
-                                    .add(
-                                        egui::Label::new(&row.description)
-                                            .selectable(false)
-                                            .truncate(),
-                                    )
-                                    .clicked();
-                            });
-                            tr_row.col(|ui| {
-                                ui.label(
-                                    egui::RichText::new(fmt_decimal(row.price_per_kg, 2))
-                                        .monospace()
-                                        .color(egui::Color32::from_rgb(200, 60, 60)),
+                                clicked |= underpricing_rich_cell(
+                                    ui,
+                                    egui::RichText::new(&row.product_code).monospace(),
+                                    &hover,
                                 );
                             });
                             tr_row.col(|ui| {
-                                ui.label(
+                                clicked |= underpricing_cell(ui, &row.description, &hover);
+                            });
+                            tr_row.col(|ui| {
+                                clicked |= underpricing_rich_cell(
+                                    ui,
+                                    egui::RichText::new(fmt_decimal(row.price_per_kg, 2))
+                                        .monospace()
+                                        .color(risk_color),
+                                    &hover,
+                                );
+                            });
+                            tr_row.col(|ui| {
+                                clicked |= underpricing_rich_cell(
+                                    ui,
                                     egui::RichText::new(fmt_decimal(row.code_median, 2))
                                         .monospace(),
+                                    &hover,
+                                );
+                            });
+                            tr_row.col(|ui| {
+                                clicked |= underpricing_rich_cell(
+                                    ui,
+                                    egui::RichText::new(format!(
+                                        "{}-{}",
+                                        fmt_decimal(row.code_p25, 2),
+                                        fmt_decimal(row.code_p75, 2)
+                                    ))
+                                    .monospace(),
+                                    &hover,
                                 );
                             });
                             tr_row.col(|ui| {
                                 let pct = ((1.0 - row.ratio) * 100.0).round() as i64;
-                                ui.label(
-                                    egui::RichText::new(format!("{pct}%")).monospace().strong(),
+                                clicked |= underpricing_rich_cell(
+                                    ui,
+                                    egui::RichText::new(format!("{pct}%"))
+                                        .monospace()
+                                        .strong()
+                                        .color(risk_color),
+                                    &hover,
+                                );
+                            });
+                            tr_row.col(|ui| {
+                                clicked |= underpricing_rich_cell(
+                                    ui,
+                                    egui::RichText::new(fmt_compact(row.estimated_gap))
+                                        .monospace()
+                                        .color(risk_color),
+                                    &hover,
+                                );
+                            });
+                            tr_row.col(|ui| {
+                                clicked |= underpricing_rich_cell(
+                                    ui,
+                                    egui::RichText::new(group_digits(row.code_sample_count))
+                                        .monospace(),
+                                    &hover,
                                 );
                             });
                             if clicked {
@@ -4839,6 +6322,190 @@ fn underpricing_table(
                 });
         });
     open_id
+}
+
+fn underpricing_cell(ui: &mut egui::Ui, text: &str, hover: &str) -> bool {
+    underpricing_rich_cell(ui, egui::RichText::new(text), hover)
+}
+
+fn underpricing_rich_cell(ui: &mut egui::Ui, text: egui::RichText, hover: &str) -> bool {
+    ui.add(egui::Label::new(text).selectable(false).truncate())
+        .on_hover_text(hover)
+        .clicked()
+}
+
+fn underpricing_found_text(uv: &Undervaluation, lang: Lang) -> String {
+    match lang {
+        Lang::Ua => format!(
+            "Знайдено {} підозрілих рядків у {} кодах; показано перші {}.",
+            group_digits(uv.flagged_rows),
+            group_digits(uv.flagged_codes),
+            group_digits(uv.rows.len() as u64)
+        ),
+        _ => format!(
+            "Found {} suspicious rows in {} codes; showing first {}.",
+            group_digits(uv.flagged_rows),
+            group_digits(uv.flagged_codes),
+            group_digits(uv.rows.len() as u64)
+        ),
+    }
+}
+
+fn underpricing_row_hover(row: &crate::db::UndervaluedRow, lang: Lang) -> String {
+    let below = ((1.0 - row.ratio) * 100.0).round().max(0.0) as i64;
+    match lang {
+        Lang::Ua => format!(
+            "{}\nМД: {}\nОдержувач: {}\nВідправник: {}\nКод: {}\nЦіна: {} / кг\nМедіана коду: {} / кг\nP25-P75: {}-{} / кг\nНижче медіани на: {}%\nОціночний розрив: {}\nЗначень у коді: {}\nФВ вал.контр: {}\nНетто: {} кг\nНатисніть, щоб відкрити картку рядка.",
+            undervaluation_severity(row.ratio, lang),
+            row.declaration_number,
+            row.recipient,
+            row.sender,
+            row.product_code,
+            fmt_decimal(row.price_per_kg, 2),
+            fmt_decimal(row.code_median, 2),
+            fmt_decimal(row.code_p25, 2),
+            fmt_decimal(row.code_p75, 2),
+            below,
+            fmt_decimal(row.estimated_gap, 2),
+            group_digits(row.code_sample_count),
+            fmt_decimal(row.customs_value, 2),
+            fmt_decimal(row.net_kg, 3),
+        ),
+        _ => format!(
+            "{}\nDeclaration: {}\nRecipient: {}\nSender: {}\nCode: {}\nPrice: {} / kg\nCode median: {} / kg\nP25-P75: {}-{} / kg\nBelow median by: {}%\nEstimated gap: {}\nSamples in code: {}\nValue: {}\nNet: {} kg\nClick to open the row card.",
+            undervaluation_severity(row.ratio, lang),
+            row.declaration_number,
+            row.recipient,
+            row.sender,
+            row.product_code,
+            fmt_decimal(row.price_per_kg, 2),
+            fmt_decimal(row.code_median, 2),
+            fmt_decimal(row.code_p25, 2),
+            fmt_decimal(row.code_p75, 2),
+            below,
+            fmt_decimal(row.estimated_gap, 2),
+            group_digits(row.code_sample_count),
+            fmt_decimal(row.customs_value, 2),
+            fmt_decimal(row.net_kg, 3),
+        ),
+    }
+}
+
+fn undervaluation_severity(ratio: f64, lang: Lang) -> &'static str {
+    match (lang, ratio) {
+        (Lang::Ua, r) if r < 0.25 => "Критична різниця",
+        (Lang::Ua, r) if r < 0.4 => "Сильна різниця",
+        (Lang::Ua, _) => "Помітна різниця",
+        (_, r) if r < 0.25 => "Critical gap",
+        (_, r) if r < 0.4 => "Strong gap",
+        _ => "Visible gap",
+    }
+}
+
+fn undervaluation_risk_color(ratio: f64, dark_mode: bool) -> egui::Color32 {
+    if ratio < 0.25 {
+        if dark_mode {
+            egui::Color32::from_rgb(255, 105, 105)
+        } else {
+            egui::Color32::from_rgb(190, 35, 35)
+        }
+    } else if ratio < 0.4 {
+        if dark_mode {
+            egui::Color32::from_rgb(255, 165, 84)
+        } else {
+            egui::Color32::from_rgb(180, 88, 15)
+        }
+    } else if dark_mode {
+        egui::Color32::from_rgb(255, 207, 105)
+    } else {
+        egui::Color32::from_rgb(145, 105, 0)
+    }
+}
+
+fn underpricing_checked_rows_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Перевірено рядків",
+        _ => "Checked rows",
+    }
+}
+
+fn underpricing_checked_rows_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Рядки з ціною та нетто у кодах, де достатньо прикладів для порівняння.",
+        _ => "Rows with value and net weight in product codes with enough samples to compare.",
+    }
+}
+
+fn underpricing_checked_codes_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Перевірено кодів",
+        _ => "Checked codes",
+    }
+}
+
+fn underpricing_checked_codes_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Коди товару, де є мінімальна вибірка для медіани.",
+        _ => "Product codes that have the minimum sample size for a median.",
+    }
+}
+
+fn underpricing_flagged_rows_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Підозрілих рядків",
+        _ => "Suspicious rows",
+    }
+}
+
+fn underpricing_flagged_rows_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Рядки, де ціна за кг нижча за встановлений поріг від медіани коду.",
+        _ => "Rows where price per kg is below the selected share of the code median.",
+    }
+}
+
+fn underpricing_flagged_value_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Сума підозрілих",
+        _ => "Suspicious value",
+    }
+}
+
+fn underpricing_flagged_value_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "ФВ вал.контр у рядках, які потрапили в список підозрілих.",
+        _ => "Declared value of rows that were flagged as suspicious.",
+    }
+}
+
+fn underpricing_estimated_gap_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Оціночний розрив",
+        _ => "Estimated gap",
+    }
+}
+
+fn underpricing_estimated_gap_help(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => {
+            "Скільки б становила різниця, якби рядки рахувалися за медіанною ціною свого коду."
+        }
+        _ => "Difference versus valuing flagged rows at their product-code median price.",
+    }
+}
+
+fn underpricing_gap_header(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Розрив",
+        _ => "Gap",
+    }
+}
+
+fn underpricing_samples_header(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Вибірка",
+        _ => "Samples",
+    }
 }
 
 fn price_header_median(lang: Lang) -> &'static str {
@@ -5182,6 +6849,7 @@ fn setup_style(ctx: &egui::Context) {
         );
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(12.0, 5.0);
+        style.animation_time = 0.14;
         style.visuals.selection.bg_fill = ACCENT;
         style.visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
         style.visuals.hyperlink_color = ACCENT;

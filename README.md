@@ -34,10 +34,13 @@ on the user's computer.
   by month.
 - Open a separate Analytics tab for the current search/filter set: product
   rows, unique declarations, companies, value, net/gross weight, average value
-  per kg, product codes, brands, countries, and price indicators.
-- See monthly dynamics on a bar chart: how value, row count, or net weight
-  changed month to month for the matching rows — seasonality, spikes, and
-  when a company started or stopped importing.
+  per kg, product codes, brands, countries, and price indicators. The Overview
+  screen includes visual decision cards, detailed counters, and richer
+  month-bar popups.
+- See monthly dynamics on a bar chart: how value, row count, net weight, or
+  average value per kg changed month to month for the matching rows. Hovering a
+  bar shows a visual popup with the month, selected metric, declarations,
+  value, weight, and price per kg.
 - Compare who received/imported goods, who sent them, which product codes and
   brands dominate, where goods came from, and how much value/weight each group
   represents.
@@ -205,12 +208,14 @@ summary (rows · value · net weight · period) stays visible on every sub-tab.
 
 | Sub-tab | What it answers |
 |---|---|
-| **Overview** | Headline numbers (rows, declarations, companies, source value, weight, value per kg, distinct codes and countries) plus a **monthly dynamics** bar chart. Switch the chart metric between source value, rows, net weight, and **value per kg**. Hover a bar for the full month. |
+| **Overview** | Visual decision cards for scale, documents, participants, goods, and geography; detailed counters for value, net/gross weight, quantity, companies, trademarks, and countries; plus a **monthly dynamics** bar chart. Switch the chart metric between source value, rows, net weight, and **value per kg**. Hover a bar for a popup with the full month. |
 | **Companies** | Which organization codes dominate, who received/imported, and who sent. EDRPOU is shown first because it is more stable than company names with address variants. |
 | **Goods** | Which product codes, brands, and product groups dominate. Codes can be grouped by HS level — **2 / 4 / 6 digits or full** — to see structure from chapter down to exact code. Brand totals depend on source files that actually contain trademark data. |
 | **Countries** | Origin, dispatch, and trade countries for the matching shipments. Common country name/code variants are normalized, for example `CN` and `КИТАЙ` are grouped together. |
-| **Prices** | Per price field: average, weighted average, **median, and the P25–P75 range** with the value count. Below the table, a **price-undervaluation scan** lists declarations priced per kg far below the median for their own product code — the classic signal of customs undervaluation (or a data-entry error). |
+| **Prices** | Per price field: average, weighted average, **median, and the P25–P75 range** with the value count. Below the table, a **price-undervaluation scan** compares each row's value per kg with the median for its own product code, shows how many rows/codes were judged, the suspicious value, an estimated value gap, sample size, quartile range, and row-level risk details. |
 | **Pivot** | A **cross-tab**: pick any dimension for rows and any for columns (company, EDRPOU, product code, trademark, origin/dispatch/trade country, month, year) and a value (source value, rows, net weight). The result is a heatmap with row, column, and grand totals; row/column labels drill into the Results table, and the whole matrix copies into Excel. |
+| **Report** | A one-screen working report for the current query: headline totals, monthly dynamics, top companies, goods, countries, and price metrics. The report can be copied as text or exported as a print-ready HTML file that can be saved as PDF from the browser print dialog. |
+| **Compare** | Compare the current query against another product/company text or another year while keeping the same filters. The app shows both sides and the delta for rows, declarations, value, net weight, value per kg, and EDRPOU count. |
 
 Only the active sub-tab is calculated, which keeps the tab fast even on very
 broad queries. Companies, Goods, and Countries are shown as side-by-side cards
@@ -244,10 +249,11 @@ search term or filter before running large calculations.
 Right-click any result row and choose **Company profile** (by EDRPOU) to open a
 one-screen dossier for that importer: all name variants seen for the code,
 headline numbers (rows, declarations, value, net weight, value per kg, distinct
-product codes and suppliers), a monthly dynamics chart, and the company's top
-product codes, suppliers, and origin countries. Any card row drills back into
-the filtered Results table, so "tell me everything about this company, then show
-me the underlying lines" is a couple of clicks.
+product codes and suppliers), first-read highlights for the main good, sender,
+and origin country, a monthly dynamics chart, and the company's top product
+codes, suppliers, countries, and price metrics. Any card row drills back into the
+filtered Results table, so "tell me everything about this company, then show me
+the underlying lines" is a couple of clicks.
 
 ## Built-in Quick Guide
 
@@ -397,6 +403,13 @@ application executable.
 - **Search and analytics workflow polish.** Recent and saved searches preserve
   full filters, broad structural searches page faster, and analytics explains
   how rows, declarations, totals, shares, and price metrics are calculated.
+- **Report and Compare modes.** Analytics now includes a printable Report view
+  for the current query and a Compare view for checking another product,
+  company, or year against the current selection. Reports export as Unicode-safe
+  HTML that can be saved as PDF from the browser print dialog.
+- **Company dossier polish.** Company profiles now open with a clearer identity
+  block and first-read highlights for the main good, sender, and country before
+  the detailed sections.
 
 ### 1.1.1
 

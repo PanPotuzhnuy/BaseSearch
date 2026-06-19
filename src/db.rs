@@ -317,10 +317,18 @@ pub struct UndervaluedRow {
     pub declaration_date: String,
     pub declaration_number: String,
     pub recipient: String,
+    pub sender: String,
+    pub edrpou: String,
     pub product_code: String,
     pub description: String,
+    pub customs_value: f64,
+    pub net_kg: f64,
     pub price_per_kg: f64,
     pub code_median: f64,
+    pub code_p25: f64,
+    pub code_p75: f64,
+    pub code_sample_count: u64,
+    pub estimated_gap: f64,
     /// price_per_kg / code_median (0.3 means 30% of the typical price).
     pub ratio: f64,
 }
@@ -330,6 +338,12 @@ pub struct Undervaluation {
     pub rows: Vec<UndervaluedRow>,
     /// Number of distinct product codes that had enough samples to judge.
     pub checked_codes: u64,
+    /// Priced rows in those judged product codes.
+    pub checked_rows: u64,
+    pub flagged_rows: u64,
+    pub flagged_codes: u64,
+    pub flagged_value: f64,
+    pub estimated_gap: f64,
 }
 
 /// Dimension for the pivot table (rows or columns).
@@ -1434,16 +1448,18 @@ impl Db {
         } else {
             " AND"
         };
-        // priced: one row per declaration line with a usable $/kg.
-        // code_stats: median $/kg and sample count per product code.
-        let sql = format!(
+        let cte = format!(
             "WITH priced AS (
                 SELECT r.id AS id,
                     TRIM(r.product_code) AS code,
+                    num_value(r.currency_control_value) AS customs_value,
+                    num_value(r.net_kg) AS net_kg,
                     num_value(r.currency_control_value) / num_value(r.net_kg) AS price,
                     r.declaration_date AS dt,
                     r.declaration_number AS num,
                     r.recipient AS recipient,
+                    r.sender AS sender,
+                    r.edrpou AS edrpou,
                     r.description AS descr
                 FROM records r{joins}{where_sql}{cond}
                     TRIM(r.product_code) <> ''
@@ -1451,14 +1467,54 @@ impl Db {
                     AND num_value(r.currency_control_value) > 0
              ),
              code_stats AS (
-                SELECT code, median_num(price) AS med, COUNT(*) AS n
+                SELECT code, median_num(price) AS med, pctl_text(price) AS pctls, COUNT(*) AS n
                 FROM priced GROUP BY code HAVING n >= ?
+             ),
+             flagged AS (
+                SELECT p.id, p.dt, p.num, p.recipient, p.sender, p.edrpou, p.code, p.descr,
+                    p.customs_value, p.net_kg, p.price, c.med, c.pctls, c.n,
+                    p.price / c.med AS ratio,
+                    MAX((c.med * p.net_kg) - p.customs_value, 0.0) AS estimated_gap
+                FROM priced p JOIN code_stats c ON c.code = p.code
+                WHERE c.med > 0 AND p.price < c.med * ?
              )
-             SELECT p.id, p.dt, p.num, p.recipient, p.code, p.descr,
-                    p.price, c.med, p.price / c.med AS ratio
-             FROM priced p JOIN code_stats c ON c.code = p.code
-             WHERE c.med > 0 AND p.price < c.med * ?
-             ORDER BY ratio ASC
+             "
+        );
+
+        let summary_sql = format!(
+            "{cte}
+             SELECT
+                COALESCE((SELECT SUM(n) FROM code_stats), 0),
+                COALESCE((SELECT COUNT(*) FROM code_stats), 0),
+                COALESCE((SELECT COUNT(*) FROM flagged), 0),
+                COALESCE((SELECT COUNT(DISTINCT code) FROM flagged), 0),
+                COALESCE((SELECT SUM(customs_value) FROM flagged), 0.0),
+                COALESCE((SELECT SUM(estimated_gap) FROM flagged), 0.0)"
+        );
+        let mut summary_bind: Vec<rusqlite::types::Value> = params.clone();
+        summary_bind.push((min_samples as i64).into());
+        summary_bind.push(threshold.into());
+        let summary = self.conn.query_row(
+            &summary_sql,
+            params_from_iter(summary_bind),
+            |row| -> rusqlite::Result<(u64, u64, u64, u64, f64, f64)> {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                    row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                ))
+            },
+        )?;
+
+        let sql = format!(
+            "{cte}
+             SELECT id, dt, num, recipient, sender, edrpou, code, descr,
+                    customs_value, net_kg, price, med, pctls, n, ratio, estimated_gap
+             FROM flagged
+             ORDER BY ratio ASC, estimated_gap DESC
              LIMIT ?"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -1468,25 +1524,45 @@ impl Db {
         bind.push((limit as i64).into());
         let mut rows = stmt.query(params_from_iter(bind))?;
         let mut out = Vec::new();
-        let mut codes = std::collections::HashSet::new();
         while let Some(row) = rows.next()? {
-            let code: String = row.get(4)?;
-            codes.insert(code.clone());
+            let code: String = row.get(6)?;
+            let pctls: Option<String> = row.get(12)?;
+            let mut parts = pctls
+                .as_deref()
+                .unwrap_or("")
+                .split('|')
+                .map(|p| p.parse::<f64>().unwrap_or(0.0));
             out.push(UndervaluedRow {
                 id: row.get(0)?,
                 declaration_date: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                 declaration_number: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 recipient: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                sender: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                edrpou: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
                 product_code: code,
-                description: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                price_per_kg: row.get(6)?,
-                code_median: row.get(7)?,
-                ratio: row.get(8)?,
+                description: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                customs_value: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
+                net_kg: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+                price_per_kg: row.get(10)?,
+                code_median: row.get(11)?,
+                code_p25: parts.next().unwrap_or(0.0),
+                code_p75: {
+                    let _median = parts.next();
+                    parts.next().unwrap_or(0.0)
+                },
+                code_sample_count: row.get::<_, i64>(13)? as u64,
+                ratio: row.get(14)?,
+                estimated_gap: row.get::<_, Option<f64>>(15)?.unwrap_or(0.0),
             });
         }
         Ok(Undervaluation {
             rows: out,
-            checked_codes: codes.len() as u64,
+            checked_rows: summary.0,
+            checked_codes: summary.1,
+            flagged_rows: summary.2,
+            flagged_codes: summary.3,
+            flagged_value: summary.4,
+            estimated_gap: summary.5,
         })
     }
 

@@ -47,8 +47,13 @@ Basic workflow
    companies, value, net/gross weight, average value per kg, product codes,
    brands, countries, and price indicators.
    The Analytics tab is split into Overview, Companies, Goods, Countries,
-   Prices, and Pivot. Click an analytics row to apply its filter back to the
-   results.
+   Prices, Pivot, Report, and Compare. Report creates a working summary that
+   can be copied or exported as print-ready HTML for saving as PDF from the
+   browser print dialog. Compare checks another product/company/year against
+   the current selection. Overview has decision cards and richer month-bar
+   popups; Prices has a stronger undervaluation scan with judged samples,
+   suspicious value, estimated gap, and row-level risk details. Click an
+   analytics row to apply its filter back to the results.
 7. Double-click a row to see all imported fields; right-click for quick
    filters and the company profile.
 8. Export matching rows to CSV or XLSX when needed.

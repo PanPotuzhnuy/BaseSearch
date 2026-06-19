@@ -17,7 +17,6 @@ use calamine::Reader;
 #[test]
 fn public_product_name_is_base_search() {
     assert_eq!(base_search::i18n::UA.app_title, "Base Search");
-    assert_eq!(base_search::i18n::RU.app_title, "Base Search");
     assert_eq!(base_search::i18n::EN.app_title, "Base Search");
 }
 

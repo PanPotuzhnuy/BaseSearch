@@ -167,6 +167,8 @@ function priceTitle(kind, fallback) {
 /* ---------- i18n ---------- */
 async function loadI18n() {
   const data = await api("/api/i18n", { lang: state.lang });
+  state.lang = data.lang || state.lang;
+  localStorage.setItem("baseSearchLang", state.lang);
   state.i18n = data.strings || {};
   state.languages = data.languages || [];
   state.langLabel = data.language_label || "Language";

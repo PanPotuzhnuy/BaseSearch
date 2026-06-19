@@ -51,6 +51,11 @@ pub enum WorkerReq {
         others_label: String,
         generation: u64,
     },
+    /// Full analytics for the comparison side of Compare Mode.
+    Compare {
+        q: Box<Query>,
+        generation: u64,
+    },
     /// Undervaluation scan over the current query.
     Underpricing {
         q: Box<Query>,
@@ -104,6 +109,15 @@ pub enum Msg {
     PivotDone {
         generation: u64,
         pivot: Box<PivotResult>,
+    },
+    CompareDone {
+        generation: u64,
+        query: Box<Query>,
+        analytics: Box<Analytics>,
+    },
+    CompareError {
+        generation: u64,
+        message: String,
     },
     UnderpricingDone {
         generation: u64,
@@ -280,6 +294,24 @@ pub fn spawn_search_worker(
                             pivot: Box::new(pivot),
                         },
                         Err(e) => Msg::SearchError {
+                            generation,
+                            message: e.to_string(),
+                        },
+                    };
+                    let _ = tx.send(msg);
+                    ctx.request_repaint();
+                }
+                WorkerReq::Compare { q, generation } => {
+                    if !analytics_should_run(&q) {
+                        continue;
+                    }
+                    let msg = match db.analytics(&q, 10) {
+                        Ok(analytics) => Msg::CompareDone {
+                            generation,
+                            query: q,
+                            analytics: Box::new(analytics),
+                        },
+                        Err(e) => Msg::CompareError {
                             generation,
                             message: e.to_string(),
                         },
