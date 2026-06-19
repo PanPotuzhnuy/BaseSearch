@@ -1,4 +1,4 @@
-# Base Search 1.2.0
+# Base Search 1.3.0
 
 [![CI](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml)
 
@@ -186,8 +186,10 @@ Open Browser Mode.cmd
 
 The browser opens a local address such as `http://127.0.0.1:7832`. This is a
 localhost interface, not an internet service: the database remains on the same
-computer. The local API uses a temporary token in the URL so another page in
-the browser cannot casually read the local database.
+computer. The local API is protected by a per-session token sent in the request
+header, so another page in the browser cannot casually read the local database.
+Requests are served by a small fixed pool of worker threads that reuse their
+database connections.
 
 ## Analytics Tab
 
@@ -284,9 +286,13 @@ Supported input patterns include:
 | Pattern | What it means |
 |---|---|
 | Standard table | A regular spreadsheet table with recognizable columns. |
-| Extended table | A standard table with additional columns that can be ignored safely. |
+| Extended table | A standard table with extra columns; the extra columns are preserved, searchable, and shown on the record card. |
 | Registry-style export | A table where some logical fields are split across multiple columns. |
 | Header after title rows | A file with title or metadata rows before the actual table header. |
+
+Columns that do not match the known schema are not discarded: they are kept with
+each row, indexed for full-text search, and listed on the record card, so
+differently shaped exports import without losing data.
 
 If a file cannot be recognized, Base Search reports which required columns are
 missing instead of crashing.
@@ -385,6 +391,16 @@ selected local spreadsheets and writes a local SQLite database beside the
 application executable.
 
 ## Changelog
+
+### 1.3.0
+
+- **Universal column capture.** Columns beyond the known schema are now kept with
+  each imported row, included in full-text search, and listed on the record card.
+  Differently shaped customs exports import without losing data.
+- **Browser mode hardening.** The local web interface now runs on a fixed pool of
+  worker threads that reuse their database connections, parses requests more
+  strictly, and authenticates with a per-session token sent in the request header
+  instead of the URL.
 
 ### 1.2.0
 

@@ -1,4 +1,4 @@
-Base Search 1.2.0
+Base Search 1.3.0
 ===============
 
 How to run
