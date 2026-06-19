@@ -113,6 +113,27 @@ impl HeaderIndex {
         candidates.iter().find_map(|(h, occ)| self.get(h, *occ))
     }
 
+    fn get_norm(&self, header: &str, occurrence: usize) -> Option<usize> {
+        if let Some(pos) = self.get(header, occurrence) {
+            return Some(pos);
+        }
+        let wanted = norm_header(header);
+        let mut positions: Vec<usize> = self
+            .positions
+            .iter()
+            .filter(|(h, _)| norm_header(h) == wanted)
+            .flat_map(|(_, positions)| positions.iter().copied())
+            .collect();
+        positions.sort_unstable();
+        positions.get(occurrence).copied()
+    }
+
+    fn first_norm_of(&self, candidates: &[(&str, usize)]) -> Option<usize> {
+        candidates
+            .iter()
+            .find_map(|(h, occ)| self.get_norm(h, *occ))
+    }
+
     /// All columns whose header starts with the prefix, in file order.
     /// This handles split declaration-number columns, including known typos in
     /// the middle part.
@@ -124,6 +145,22 @@ impl HeaderIndex {
             .flat_map(|(_, positions)| positions.iter().copied())
             .collect();
         all.sort_unstable();
+        all
+    }
+
+    fn all_norm_with_prefixes(&self, prefixes: &[&str]) -> Vec<usize> {
+        let prefixes: Vec<String> = prefixes.iter().map(|p| norm_header(p)).collect();
+        let mut all: Vec<usize> = self
+            .positions
+            .iter()
+            .filter(|(h, _)| {
+                let header = norm_header(h);
+                prefixes.iter().any(|prefix| header.starts_with(prefix))
+            })
+            .flat_map(|(_, positions)| positions.iter().copied())
+            .collect();
+        all.sort_unstable();
+        all.dedup();
         all
     }
 }
@@ -230,6 +267,172 @@ fn map_format_b(idx: &HeaderIndex) -> Option<Vec<ColSrc>> {
                 "field_3001" => opt(duty_uah),
                 "field_3002" => opt(excise_uah),
                 "field_9610" => opt(vat_uah),
+                _ => ColSrc::Missing,
+            })
+            .collect(),
+    )
+}
+
+/// Wide customs export/import layout used by newer 2026 files.
+///
+/// These files have 50+ columns and repeated participant headers. For imports,
+/// the recipient code and recipient name are split into neighboring columns;
+/// for exports, the sender code and sender name are split the same way. The
+/// generic detector cannot infer that relationship from headers alone, so this
+/// layout is mapped explicitly.
+fn map_wide_customs(headers: &[String], idx: &HeaderIndex) -> Option<Vec<ColSrc>> {
+    if headers.len() < 45 {
+        return None;
+    }
+    let decl_number_parts = idx.all_norm_with_prefixes(&["Номер декларации", "Номер декларації"]);
+    let declaration_date = idx.first_norm_of(&[("Дата оформления", 0), ("Дата оформлення", 0)]);
+    let product_code =
+        idx.first_norm_of(&[("КОД ТОВАРУ", 0), ("Код товара", 0), ("Код товару", 0)]);
+    let description = idx.first_norm_of(&[
+        ("ОПИС ТОВАРУ", 0),
+        ("Описание товара", 0),
+        ("Опис товару", 0),
+        ("Найменування товару", 0),
+        ("Назва товару", 0),
+    ]);
+    let value_usd =
+        idx.first_norm_of(&[("Фактурная стоимость, $", 0), ("Фактурна вартість, $", 0)]);
+    if decl_number_parts.len() < 3
+        || declaration_date.is_none()
+        || product_code.is_none()
+        || description.is_none()
+        || value_usd.is_none()
+    {
+        return None;
+    }
+
+    let decl_type_parts = idx.all_norm_with_prefixes(&["Тип декларации", "Тип декларації"]);
+    let recipient_code = idx.first_norm_of(&[("Получатель", 0)]);
+    let sender_code = if recipient_code.is_none() {
+        idx.first_norm_of(&[("Отправитель", 0)])
+    } else {
+        None
+    };
+    let recipient_name = idx.first_norm_of(&[
+        ("ОТРИМУВАЧ", 0),
+        ("Отримувач", 0),
+        ("Получатель", 1),
+        ("Назва фірми отримувача", 0),
+    ]);
+    let sender_name = if recipient_code.is_some() {
+        idx.first_norm_of(&[
+            ("ВІДПРАВНИК", 0),
+            ("Відправник", 0),
+            ("Отправитель", 0),
+            ("Назва фірми відправника", 0),
+            ("Назва фірми відправиника", 0),
+        ])
+    } else {
+        idx.first_norm_of(&[
+            ("ВІДПРАВНИК", 0),
+            ("Відправник", 0),
+            ("Отправитель", 1),
+            ("Назва фірми відправника", 0),
+            ("Назва фірми відправиника", 0),
+        ])
+    };
+    if recipient_code.is_none() && sender_code.is_none() {
+        return None;
+    }
+
+    let opt = |pos: Option<usize>| pos.map(ColSrc::Cell).unwrap_or(ColSrc::Missing);
+    let join = |parts: &Vec<usize>| {
+        if parts.is_empty() {
+            ColSrc::Missing
+        } else {
+            ColSrc::Join(parts.clone(), "/")
+        }
+    };
+
+    Some(
+        COLUMNS
+            .iter()
+            .map(|c| match c.name {
+                "clearance_time" => {
+                    opt(idx.first_norm_of(&[("Час оформлення", 0), ("Время оформления", 0)]))
+                }
+                "customs_office" => opt(idx.first_norm_of(&[
+                    ("Таможня оформления", 0),
+                    ("Митниця оформлення", 0),
+                    ("Назва ПМО", 0),
+                ])),
+                "declaration_type" => join(&decl_type_parts),
+                "declaration_number" => join(&decl_number_parts),
+                "declaration_date" => opt(declaration_date),
+                "sender" => opt(sender_name.or_else(|| idx.first_norm_of(&[("Відправник", 0)]))),
+                "edrpou" => opt(recipient_code.or(sender_code)),
+                "recipient" => opt(recipient_name),
+                "item_number" => {
+                    opt(idx.first_norm_of(&[("Номер товара", 0), ("Номер товару", 0), ("№", 0)]))
+                }
+                "product_code" => opt(product_code),
+                "description" => opt(description),
+                "trade_country" => opt(idx.first_norm_of(&[
+                    ("Торгующая страна", 0),
+                    ("Торгуюча країна", 0),
+                    ("Кр.торг.", 0),
+                ])),
+                "dispatch_country" => opt(idx.first_norm_of(&[
+                    ("Страна отправления", 0),
+                    ("Країна відправлення", 0),
+                    ("Кр.відпр.", 0),
+                ])),
+                "origin_country" => opt(idx.first_norm_of(&[
+                    ("КРАЇНА ПОХОДЖЕННЯ", 0),
+                    ("Страна происхождения", 0),
+                    ("Країна походження", 0),
+                    ("КРАЇНА ПРИХНАЧЕННЯ", 0),
+                    ("КРАЇНА ПРИЗНАЧЕННЯ", 0),
+                    ("Страна назначения", 0),
+                ])),
+                "delivery_terms" => opt(idx
+                    .get_norm("Условия поставки", 0)
+                    .or_else(|| idx.get_norm("Умови поставки", 0))),
+                "delivery_place" => opt(idx
+                    .get_norm("Условия поставки", 1)
+                    .or_else(|| idx.get_norm("Умови поставки", 1))),
+                "quantity" => opt(idx
+                    .get_norm("Доп.ед", 0)
+                    .or_else(|| idx.get_norm("Дод.од", 0))),
+                "unit" => opt(idx
+                    .get_norm("Доп.ед", 1)
+                    .or_else(|| idx.get_norm("Дод.од", 1))),
+                "gross_kg" => opt(idx.first_norm_of(&[
+                    ("Вес брутто, кг", 0),
+                    ("Вага брутто, кг", 0),
+                    ("Брутто, кг.", 0),
+                ])),
+                "net_kg" => opt(idx.first_norm_of(&[
+                    ("Вес нетто, кг", 0),
+                    ("Вага нетто, кг", 0),
+                    ("Нетто, кг.", 0),
+                ])),
+                "currency_control_value" => opt(value_usd),
+                "movement_feature" => opt(idx.first_norm_of(&[
+                    ("ОЗНАКА ТОВАРУ В КОНТЕЙНЕРІ", 0),
+                    ("Признак товара в контейнере", 0),
+                    ("Ознака товару в контейнері", 0),
+                ])),
+                "field_43" => {
+                    opt(idx.first_norm_of(&[("Метод", 0), ("Метод визначення митної вартості", 0)]))
+                }
+                "rfv_usd_kg" => opt(idx.first_norm_of(&[
+                    ("ЦІНА, $/кг", 0),
+                    ("Цена, $/кг", 0),
+                    ("Вартість, $/кг", 0),
+                ])),
+                "field_3001" => opt(idx.first_norm_of(&[
+                    ("Пошлина, грн.", 0),
+                    ("Пошлина, грн", 0),
+                    ("Мито, грн.", 0),
+                ])),
+                "field_3002" => opt(idx.first_norm_of(&[("Акциз, грн.", 0), ("Акциз, грн", 0)])),
+                "field_9610" => opt(idx.first_norm_of(&[("ПДВ, грн.", 0), ("ПДВ, грн", 0)])),
                 _ => ColSrc::Missing,
             })
             .collect(),
@@ -464,6 +667,7 @@ fn detect_mapping(headers: &[String]) -> Option<Vec<ColSrc>> {
     let idx = HeaderIndex::new(headers);
     map_format_a(&idx)
         .or_else(|| map_format_b(&idx))
+        .or_else(|| map_wide_customs(headers, &idx))
         .or_else(|| map_generic(headers))
 }
 

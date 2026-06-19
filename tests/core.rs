@@ -1305,6 +1305,325 @@ fn import_registry_format_im12_variant() {
     assert_eq!(get("9610"), "74216.87");
 }
 
+#[test]
+fn import_wide_2026_import_layout_maps_participants() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("wide-import-2026.xlsx");
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    let headers = [
+        "Тип декларации",
+        "Тип декларации",
+        "Тип декларации",
+        "Тип декларации",
+        "Номер декларации",
+        "Номер декларации",
+        "Номер декларации",
+        "Дата оформления",
+        "Таможня оформления",
+        "Пост оформления",
+        "Торгующая страна",
+        "Страна отправления",
+        "КРАЇНА ПОХОДЖЕННЯ",
+        "ОЗНАКА ТОВАРУ В КОНТЕЙНЕРІ",
+        "НОМЕР КОНТЕЙНЕРА",
+        "Условия поставки",
+        "Условия поставки",
+        "Валюта контракта",
+        "Валюта контракта",
+        "Транспорт на границе",
+        "Транспорт на границе",
+        "Транспорт на границе",
+        "Транспорт на территории страны",
+        "Транспорт на территории страны",
+        "Транспорт на границе",
+        "Таможня на границе",
+        "Таможня на границе",
+        "Пост на границе",
+        "Номер товара",
+        "КОД ТОВАРУ",
+        "ОПИС ТОВАРУ",
+        "Получатель",
+        "ОТРИМУВАЧ",
+        "Обратная сторона",
+        "",
+        "",
+        "ВІДПРАВНИК",
+        "Контрактодержатель",
+        "Контрактодержатель",
+        "Метод",
+        "Доп.ед",
+        "Доп.ед",
+        "Вес брутто, кг",
+        "Вес нетто, кг",
+        "Фактурная стоимость, грн.",
+        "Фактурная стоимость, $",
+        "Курс, $",
+        "Таможенная стоимость, грн.",
+        "Таможенная стоимость, $",
+        "ЦІНА, $/кг",
+        "Пошлина, грн.",
+        "Акциз, грн.",
+        "ПДВ, грн.",
+    ];
+    for (c, h) in headers.iter().enumerate() {
+        sheet.write_string(0, c as u16, *h).unwrap();
+    }
+    let row = [
+        "40",
+        "0",
+        "ZZ",
+        "AA",
+        "UA305090",
+        "2026",
+        "1160",
+        "2026-03-01",
+        "ЗАКАРПАТСЬКА МИТНИЦЯ",
+        "ПУНКТ ПРОПУСКУ УЖГОРОД",
+        "СЛОВАЧЧИНА",
+        "СЛОВАЧЧИНА",
+        "КИТАЙ",
+        "",
+        "",
+        "DAP",
+        "UA KVITNEVE",
+        "980",
+        "UAH",
+        "30",
+        "ВАНТАЖНИЙ АВТОМОБІЛЬ",
+        "AO5940XP",
+        "0",
+        "НЕВІДОМИЙ",
+        "",
+        "UA305090",
+        "ЗАКАРПАТСЬКА МИТНИЦЯ",
+        "ПУНКТ ПРОПУСКУ УЖГОРОД",
+        "14",
+        "8516310090",
+        "МАШИНИ ЕЛЕКТРОМЕХАНІЧНІ ПОБУТОВІ",
+        "34474821",
+        "ТОВ ГРУП СЕБ УКРАЇНА",
+        "",
+        "",
+        "",
+        "GROUPE SEB SLOVENSKO SPOL S R O",
+        "34474821",
+        "ТОВ ГРУП СЕБ УКРАЇНА",
+        "1",
+        "96",
+        "ШТ",
+        "92.45",
+        "67.68",
+        "45432.96",
+        "1051.49",
+        "43.208",
+        "45476.12",
+        "1052.49",
+        "15.55",
+        "909.52",
+        "0",
+        "9277.13",
+    ];
+    for (c, v) in row.iter().enumerate() {
+        sheet.write_string(1, c as u16, *v).unwrap();
+    }
+    workbook.save(&xlsx).unwrap();
+
+    let db_path = dir.path().join("test.db");
+    let mut db = Db::open(&db_path).unwrap();
+    let cancel = AtomicBool::new(false);
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 1);
+
+    let q = Query {
+        text: "seb".into(),
+        ..Default::default()
+    };
+    let (ids, rows, _dups) = db.search_page(&q, 10, 0).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][result_col("declaration_number")],
+        "UA305090/2026/1160"
+    );
+    assert_eq!(rows[0][result_col("declaration_type")], "40/0/ZZ/AA");
+    assert_eq!(rows[0][result_col("edrpou")], "34474821");
+
+    let card = db.record_card(ids[0]).unwrap();
+    let get = |h: &str| {
+        card.fields
+            .iter()
+            .find(|(fh, _)| *fh == h)
+            .map(|(_, v)| v.clone())
+            .unwrap()
+    };
+    assert_eq!(get("Одержувач"), "ТОВ ГРУП СЕБ УКРАЇНА");
+    assert_eq!(get("Відправник"), "GROUPE SEB SLOVENSKO SPOL S R O");
+    assert_eq!(get("ФВ вал.контр"), "1051.49");
+    assert_eq!(get("43"), "1");
+    assert_eq!(get("РФВ Дол/кг."), "15.55");
+    assert_eq!(get("3001"), "909.52");
+    assert_eq!(get("3002"), "0");
+    assert_eq!(get("9610"), "9277.13");
+}
+
+#[test]
+fn import_wide_2026_export_layout_maps_sender_company() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("wide-export-2026.xlsx");
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    let headers = [
+        "Тип декларации",
+        "Тип декларации",
+        "Тип декларации",
+        "Тип декларации",
+        "Номер декларации",
+        "Номер декларации",
+        "Номер декларации",
+        "Дата оформления",
+        "Таможня оформления",
+        "Пост оформления",
+        "Торгующая страна",
+        "Страна отправления",
+        "КРАЇНА ПРИХНАЧЕННЯ",
+        "ОЗНАКА ТОВАРУ В КОНТЕЙНЕРІ",
+        "НОМЕР КОЛНТЕЙНЕРА",
+        "Условия поставки",
+        "Условия поставки",
+        "Валюта контракта",
+        "Валюта контракта",
+        "Транспорт на границе",
+        "Транспорт на границе",
+        "Транспорт на границе",
+        "Транспорт на территории страны",
+        "Транспорт на территории страны",
+        "Транспорт на границе",
+        "Таможня на границе",
+        "Таможня на границе",
+        "Пост на границе",
+        "Номер товара",
+        "КОД ТОВАРУ",
+        "ОПИС ТОВАРУ",
+        "Отправитель",
+        "ВІДПРАВНИК",
+        "Обратная сторона",
+        "",
+        "",
+        "ОТРИМУВАЧ",
+        "Контрактодержатель",
+        "Контрактодержатель",
+        "Метод",
+        "Доп.ед",
+        "Доп.ед",
+        "Вес брутто, кг",
+        "Вес нетто, кг",
+        "Фактурная стоимость, грн.",
+        "Фактурная стоимость, $",
+        "Курс, $",
+        "Таможенная стоимость, грн.",
+        "Таможенная стоимость, $",
+        "ЦІНА, $/кг",
+        "Пошлина, грн.",
+        "Акциз, грн.",
+        "ПДВ, грн.",
+    ];
+    for (c, h) in headers.iter().enumerate() {
+        sheet.write_string(0, c as u16, *h).unwrap();
+    }
+    let row = [
+        "10",
+        "0",
+        "ZZ",
+        "AA",
+        "UA401060",
+        "2026",
+        "2699",
+        "2026-03-01",
+        "ВІННИЦЬКА МИТНИЦЯ",
+        "МИТНИЙ ПОСТ ГАЙСИН",
+        "ВІРМЕНІЯ",
+        "УКРАЇНА",
+        "ВІРМЕНІЯ",
+        "",
+        "",
+        "FCA",
+        "UA ЛАДИЖИН",
+        "840",
+        "USD",
+        "30",
+        "ВАНТАЖНИЙ АВТОМОБІЛЬ",
+        "CE7554EX",
+        "30",
+        "ВАНТАЖНИЙ АВТОМОБІЛЬ",
+        "CE7554EX",
+        "UA408050",
+        "ЧЕРНІВЕЦЬКА МИТНИЦЯ",
+        "ПУНКТ ПРОПУСКУ ПОРУБНЕ",
+        "2",
+        "207129000",
+        "ТУШКА КУРЧАТИ БРОЙЛЕРА",
+        "30830662",
+        "ПРАТ МИРОНІВСЬКА ПФ",
+        "",
+        "",
+        "",
+        "ALEX AND HOLDING LLC",
+        "30830662",
+        "ПРАТ МИРОНІВСЬКА ПФ",
+        "",
+        "0",
+        "КГ",
+        "10367.93",
+        "9386",
+        "567771.72",
+        "13140.4",
+        "43.208",
+        "567771.72",
+        "13140",
+        "1.3999",
+        "0",
+        "",
+        "",
+    ];
+    for (c, v) in row.iter().enumerate() {
+        sheet.write_string(1, c as u16, *v).unwrap();
+    }
+    workbook.save(&xlsx).unwrap();
+
+    let db_path = dir.path().join("test.db");
+    let mut db = Db::open(&db_path).unwrap();
+    let cancel = AtomicBool::new(false);
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 1);
+
+    let q = Query {
+        text: "миронівська".into(),
+        ..Default::default()
+    };
+    let (ids, rows, _dups) = db.search_page(&q, 10, 0).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][result_col("declaration_number")],
+        "UA401060/2026/2699"
+    );
+    assert_eq!(rows[0][result_col("edrpou")], "30830662");
+
+    let card = db.record_card(ids[0]).unwrap();
+    let get = |h: &str| {
+        card.fields
+            .iter()
+            .find(|(fh, _)| *fh == h)
+            .map(|(_, v)| v.clone())
+            .unwrap()
+    };
+    assert_eq!(get("Відправник"), "ПРАТ МИРОНІВСЬКА ПФ");
+    assert_eq!(get("Одержувач"), "ALEX AND HOLDING LLC");
+    assert_eq!(get("Кр.пох."), "ВІРМЕНІЯ");
+    assert_eq!(get("ФВ вал.контр"), "13140.4");
+}
+
 /// Generic detector: an external export with Russian headers and title rows
 /// above the actual table header.
 #[test]

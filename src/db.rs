@@ -630,6 +630,7 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_records_year ON records(year);
             CREATE INDEX IF NOT EXISTS idx_records_product_code ON records(product_code);
             CREATE INDEX IF NOT EXISTS idx_records_edrpou ON records(edrpou);
+            CREATE INDEX IF NOT EXISTS idx_records_source_file ON records(source_file);
             CREATE INDEX IF NOT EXISTS idx_records_hash ON records(row_hash);",
             records = records_ddl()
         ))?;
