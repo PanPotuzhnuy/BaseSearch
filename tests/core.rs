@@ -1691,6 +1691,80 @@ fn import_generic_format_with_title_rows() {
     );
 }
 
+/// Universality: columns this build does not model are still imported verbatim
+/// into the `extra` store, shown on the record card, and reachable by search.
+#[test]
+fn import_captures_unmapped_columns_as_extra() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("extra.xlsx");
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    let headers = [
+        "Дата",
+        "Номер декларації",
+        "Відправник",
+        "Одержувач",
+        "Код товару",
+        "Опис товару",
+        "Контейнер",     // not in the schema -> captured as extra
+        "Номер інвойсу", // not in the schema -> captured as extra
+    ];
+    for (c, h) in headers.iter().enumerate() {
+        sheet.write_string(0, c as u16, *h).unwrap();
+    }
+    let row = [
+        "15.03.2024",
+        "UA100100/2024/77777",
+        "ACME LTD",
+        "ТОВ Тест",
+        "8504405500",
+        "Static converter",
+        "CONTAINERX9Z",
+        "INVOICEQ7W",
+    ];
+    for (c, v) in row.iter().enumerate() {
+        sheet.write_string(1, c as u16, *v).unwrap();
+    }
+    workbook.save(&xlsx).unwrap();
+
+    let db_path = dir.path().join("extra.db");
+    let mut db = Db::open(&db_path).unwrap();
+    let cancel = AtomicBool::new(false);
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 1);
+
+    let q = |text: &str| Query {
+        text: text.into(),
+        ..Default::default()
+    };
+    let (ids, _rows, _dups) = db.search_page(&q("converter"), 10, 0).unwrap();
+    assert_eq!(ids.len(), 1);
+
+    // Unmapped columns are preserved verbatim on the card, in file order.
+    let card = db.record_card(ids[0]).unwrap();
+    assert_eq!(
+        card.extra,
+        vec![
+            ("Контейнер".to_string(), "CONTAINERX9Z".to_string()),
+            ("Номер інвойсу".to_string(), "INVOICEQ7W".to_string()),
+        ]
+    );
+
+    // ...and they are reachable through full-text search.
+    assert_eq!(db.count(&q("CONTAINERX9Z")).unwrap(), 1);
+    assert_eq!(db.count(&q("INVOICEQ7W")).unwrap(), 1);
+
+    // A fully-mapped file produces no extra columns.
+    let full = dir.path().join("full.xlsx");
+    let full_db = dir.path().join("full.db");
+    write_test_xlsx(&full, &sample_rows());
+    let mut db2 = Db::open(&full_db).unwrap();
+    import::import_file(&mut db2, &full, &cancel, &mut |_, _, _| {});
+    let (ids2, _, _) = db2.search_page(&q("виноградне"), 10, 0).unwrap();
+    assert!(db2.record_card(ids2[0]).unwrap().extra.is_empty());
+}
+
 /// Reimporting the same file is skipped by content hash without parsing Excel.
 #[test]
 fn duplicate_file_skipped_by_content_hash() {

@@ -1,11 +1,13 @@
 //! Local browser interface for Base Search.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc::sync_channel;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -63,6 +65,8 @@ struct HttpRequest {
     method: String,
     path: String,
     params: HashMap<String, String>,
+    /// Bearer token from the `Authorization` header, if present.
+    auth_token: Option<String>,
 }
 
 struct HttpResponse {
@@ -97,7 +101,7 @@ impl HttpResponse {
     fn into_bytes(self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.body.len() + 512);
         let mut headers = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n",
             self.status_code,
             self.status_text,
             self.content_type,
@@ -137,13 +141,44 @@ pub fn run(config: WebConfig) -> Result<(), String> {
         token,
     });
 
+    // Bounded worker pool: a fixed number of long-lived threads, each caching
+    // its own SQLite connection (see `with_db`). This caps concurrency and
+    // memory, and avoids spawning an unbounded number of threads/connections
+    // under load. The bounded queue applies backpressure to the accept loop.
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, 8);
+    let (tx, rx) = sync_channel::<TcpStream>(64);
+    let rx = Arc::new(Mutex::new(rx));
+    for _ in 0..worker_count {
+        let rx = Arc::clone(&rx);
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            loop {
+                let stream = {
+                    let guard = match rx.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => break,
+                    };
+                    guard.recv()
+                };
+                match stream {
+                    Ok(stream) => {
+                        let _ = handle_connection(stream, &state);
+                    }
+                    Err(_) => break, // listener stopped, channel closed
+                }
+            }
+        });
+    }
+
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let state = Arc::clone(&state);
-                std::thread::spawn(move || {
-                    let _ = handle_connection(stream, state);
-                });
+                if tx.send(stream).is_err() {
+                    break; // all workers gone
+                }
             }
             Err(err) => eprintln!("HTTP accept error: {err}"),
         }
@@ -209,16 +244,20 @@ fn open_browser(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream, state: Arc<WebState>) -> std::io::Result<()> {
+fn handle_connection(mut stream: TcpStream, state: &WebState) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let raw = read_request(&mut stream)?;
     let response = match parse_request(&raw) {
-        Ok(request) => route_request(&state, &request),
+        Ok(request) => route_request(state, &request),
         Err(message) => json_error(400, "Bad Request", &message),
     };
     stream.write_all(&response.into_bytes())
 }
 
+/// Reads the request head (request line + headers) up to the blank line.
+/// Only newly read bytes are scanned for the terminator, so a large body or a
+/// flood cannot trigger a quadratic rescan. The body is intentionally not read:
+/// only GET is served and the connection is closed after the response.
 fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
     let mut buf = [0u8; 4096];
     let mut bytes = Vec::new();
@@ -227,8 +266,13 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
         if read == 0 {
             break;
         }
+        // Scan a small window straddling the previous tail and the new bytes,
+        // not the whole accumulated buffer.
+        let scan_from = bytes.len().saturating_sub(3);
         bytes.extend_from_slice(&buf[..read]);
-        if bytes.windows(4).any(|w| w == b"\r\n\r\n") || bytes.len() >= MAX_REQUEST_BYTES {
+        if bytes.len() >= MAX_REQUEST_BYTES
+            || bytes[scan_from..].windows(4).any(|w| w == b"\r\n\r\n")
+        {
             break;
         }
     }
@@ -236,10 +280,8 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
 }
 
 fn parse_request(raw: &str) -> Result<HttpRequest, String> {
-    let first_line = raw
-        .lines()
-        .next()
-        .ok_or_else(|| "Empty HTTP request".to_string())?;
+    let mut lines = raw.lines();
+    let first_line = lines.next().ok_or_else(|| "Empty HTTP request".to_string())?;
     let mut parts = first_line.split_whitespace();
     let method = parts
         .next()
@@ -249,25 +291,44 @@ fn parse_request(raw: &str) -> Result<HttpRequest, String> {
         .next()
         .ok_or_else(|| "Missing HTTP target".to_string())?;
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
+
+    // Header lines until the blank line; we only need the bearer token.
+    let mut auth_token = None;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("authorization")
+            && let Some(token) = value.trim().strip_prefix("Bearer ")
+        {
+            auth_token = Some(token.trim().to_string());
+        }
+    }
+
     Ok(HttpRequest {
         method,
         path: percent_decode(path),
         params: parse_query_string(query),
+        auth_token,
     })
 }
 
 fn route_request(state: &WebState, request: &HttpRequest) -> HttpResponse {
     if request.method != "GET" {
-        return json_error(
-            405,
-            "Method Not Allowed",
-            "Only GET requests are supported.",
-        );
+        return json_error(405, "Method Not Allowed", "Only GET requests are supported.")
+            .with_header("Allow", "GET");
     }
-    if request.path.starts_with("/api/")
-        && request.params.get("token").map(String::as_str) != Some(state.token.as_str())
-    {
-        return json_error(403, "Forbidden", "Invalid local session token.");
+    // Prefer the Authorization header (kept out of URLs and logs); fall back to
+    // a query token for plain navigations such as the CSV download link.
+    if request.path.starts_with("/api/") {
+        let provided = request
+            .auth_token
+            .as_deref()
+            .or_else(|| request.params.get("token").map(String::as_str));
+        if !provided.is_some_and(|token| constant_time_eq(token, &state.token)) {
+            return json_error(403, "Forbidden", "Invalid local session token.");
+        }
     }
 
     match request.path.as_str() {
@@ -311,9 +372,35 @@ fn json_error(status_code: u16, status_text: &'static str, message: &str) -> Htt
     )
 }
 
+thread_local! {
+    /// One SQLite connection per worker thread, opened lazily on first use and
+    /// reused for the life of the worker — instead of opening (and running the
+    /// full schema init) on every request.
+    static WORKER_DB: RefCell<Option<Db>> = const { RefCell::new(None) };
+}
+
 fn with_db<T>(state: &WebState, f: impl FnOnce(&Db) -> Result<T, String>) -> Result<T, String> {
-    let db = Db::open(&state.db_path)?;
-    f(&db)
+    WORKER_DB.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(Db::open(&state.db_path)?);
+        }
+        f(slot.as_ref().expect("worker db initialized"))
+    })
+}
+
+/// Length-checked, content-constant-time string comparison for the session
+/// token, so a network observer cannot recover it byte by byte via timing.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn api_stats(state: &WebState) -> HttpResponse {
@@ -410,11 +497,16 @@ fn api_card(state: &WebState, params: &HashMap<String, String>) -> HttpResponse 
     };
     match with_db(state, |db| {
         let card = db.record_card(id).map_err(|err| err.to_string())?;
-        let fields: Vec<Value> = card
+        let mut fields: Vec<Value> = card
             .fields
-            .into_iter()
+            .iter()
             .map(|(label, value)| json!({ "label": label, "value": value }))
             .collect();
+        // Extra (unmapped) columns from differently shaped files, shown after the
+        // known fields and flagged so the UI can mark them.
+        for (label, value) in &card.extra {
+            fields.push(json!({ "label": label, "value": value, "extra": true }));
+        }
         Ok(json!({
             "ok": true,
             "id": id,
@@ -433,7 +525,7 @@ fn api_analytics(state: &WebState, params: &HashMap<String, String>) -> HttpResp
         return json_response(json!({
             "ok": true,
             "needs_query": true,
-            "message": "Введите запрос или фильтр, чтобы построить аналитику.",
+            "message": "Enter a query or filter to build analytics.",
         }));
     }
 
@@ -489,7 +581,7 @@ fn api_pivot(state: &WebState, params: &HashMap<String, String>) -> HttpResponse
         return json_response(json!({
             "ok": true,
             "needs_query": true,
-            "message": "Введите запрос или фильтр, чтобы построить сводную таблицу.",
+            "message": "Enter a query or filter to build the pivot table.",
         }));
     }
     let row_dim = params
@@ -542,7 +634,7 @@ fn api_section(state: &WebState, params: &HashMap<String, String>) -> HttpRespon
         return json_response(json!({
             "ok": true,
             "needs_query": true,
-            "message": "Введите запрос или фильтр, чтобы построить список.",
+            "message": "Enter a query or filter to build the list.",
         }));
     }
     let Some(kind) = params
@@ -968,15 +1060,15 @@ fn parse_section_kind(value: &str) -> Option<AnalyticsSectionKind> {
 
 fn section_kind_title(kind: AnalyticsSectionKind) -> &'static str {
     match kind {
-        AnalyticsSectionKind::Recipients => "Получатели",
-        AnalyticsSectionKind::Senders => "Отправители",
-        AnalyticsSectionKind::Edrpou => "ЕДРПОУ",
-        AnalyticsSectionKind::ProductCodes => "Коды товара",
-        AnalyticsSectionKind::Trademarks => "Торговые марки",
-        AnalyticsSectionKind::ProductGroups => "Группы описаний",
-        AnalyticsSectionKind::OriginCountries => "Страны происхождения",
-        AnalyticsSectionKind::DispatchCountries => "Страны отправления",
-        AnalyticsSectionKind::TradeCountries => "Страны торговли",
+        AnalyticsSectionKind::Recipients => "Recipients",
+        AnalyticsSectionKind::Senders => "Senders",
+        AnalyticsSectionKind::Edrpou => "EDRPOU",
+        AnalyticsSectionKind::ProductCodes => "Product codes",
+        AnalyticsSectionKind::Trademarks => "Trademarks",
+        AnalyticsSectionKind::ProductGroups => "Description groups",
+        AnalyticsSectionKind::OriginCountries => "Origin countries",
+        AnalyticsSectionKind::DispatchCountries => "Dispatch countries",
+        AnalyticsSectionKind::TradeCountries => "Trade countries",
     }
 }
 
@@ -1007,12 +1099,12 @@ fn price_kind_id(kind: PriceMetricKind) -> &'static str {
 
 fn price_kind_title(kind: PriceMetricKind) -> &'static str {
     match kind {
-        PriceMetricKind::ValuePerNetKg => "Сумма / нетто кг",
-        PriceMetricKind::RfvUsdKg => "РФВ $/кг",
-        PriceMetricKind::RmvNetUsdKg => "РМВ нетто $/кг",
-        PriceMetricKind::RmvUsdExtraUnit => "РМВ за доп. единицу",
-        PriceMetricKind::RmvGrossUsdKg => "РМВ брутто $/кг",
-        PriceMetricKind::MinBaseUsdKg => "Мин. база $/кг",
+        PriceMetricKind::ValuePerNetKg => "Value / net kg",
+        PriceMetricKind::RfvUsdKg => "RFV $/kg",
+        PriceMetricKind::RmvNetUsdKg => "RMV net $/kg",
+        PriceMetricKind::RmvUsdExtraUnit => "RMV per extra unit",
+        PriceMetricKind::RmvGrossUsdKg => "RMV gross $/kg",
+        PriceMetricKind::MinBaseUsdKg => "Min. base $/kg",
     }
 }
 

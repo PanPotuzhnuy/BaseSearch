@@ -3447,14 +3447,19 @@ impl App {
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button(t.copy_all).clicked() {
-                                let text: String = card
+                                let mut lines: Vec<String> = card
                                     .fields
                                     .iter()
                                     .filter(|(_, v)| !v.is_empty())
                                     .map(|(h, v)| format!("{h}: {v}"))
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                ctx.copy_text(text);
+                                    .collect();
+                                lines.extend(
+                                    card.extra
+                                        .iter()
+                                        .filter(|(_, v)| !v.is_empty())
+                                        .map(|(h, v)| format!("{h}: {v}")),
+                                );
+                                ctx.copy_text(lines.join("\n"));
                             }
                         });
                     });
@@ -3467,6 +3472,17 @@ impl App {
                             .show(ui, |ui| {
                                 for (header, value) in &card.fields {
                                     ui.label(egui::RichText::new(*header).strong());
+                                    if value.is_empty() {
+                                        ui.label(egui::RichText::new("\u{2014}").weak());
+                                    } else {
+                                        ui.add(egui::Label::new(value).wrap());
+                                    }
+                                    ui.end_row();
+                                }
+                                // Extra columns preserved from differently shaped
+                                // source files, marked with an italic header.
+                                for (header, value) in &card.extra {
+                                    ui.label(egui::RichText::new(header.as_str()).strong().italics());
                                     if value.is_empty() {
                                         ui.label(egui::RichText::new("\u{2014}").weak());
                                     } else {

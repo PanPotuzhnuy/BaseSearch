@@ -671,6 +671,32 @@ fn detect_mapping(headers: &[String]) -> Option<Vec<ColSrc>> {
         .or_else(|| map_generic(headers))
 }
 
+/// Source columns the mapping does not consume, paired with their header names,
+/// in file order. These are preserved per row in the `extra` payload so the app
+/// keeps every column of differently shaped files, not only the known schema.
+fn unmapped_columns(headers: &[String], mapping: &[ColSrc]) -> Vec<(usize, String)> {
+    let mut consumed = std::collections::HashSet::new();
+    for src in mapping {
+        match src {
+            ColSrc::Cell(i) => {
+                consumed.insert(*i);
+            }
+            ColSrc::Join(parts, _) => {
+                for p in parts {
+                    consumed.insert(*p);
+                }
+            }
+            ColSrc::Missing => {}
+        }
+    }
+    headers
+        .iter()
+        .enumerate()
+        .filter(|(i, header)| !header.is_empty() && !consumed.contains(i))
+        .map(|(i, header)| (i, header.clone()))
+        .collect()
+}
+
 // ---------- import ----------
 
 /// File content hash, streamed without loading the whole file into memory.
@@ -798,6 +824,7 @@ fn import_file_inner(
         summary,
         total_rows_hint: 0,
         mapping: None,
+        extra_cols: Vec::new(),
         scanned: Vec::new(),
         first_row_headers: Vec::new(),
         batch: Vec::with_capacity(BATCH_SIZE),
@@ -905,6 +932,9 @@ struct RowSink<'a> {
     summary: &'a mut FileSummary,
     total_rows_hint: u64,
     mapping: Option<Vec<ColSrc>>,
+    /// Source columns not consumed by the mapping: (column index, header name).
+    /// Captured verbatim per row so no source data is lost on import.
+    extra_cols: Vec<(usize, String)>,
     scanned: Vec<Vec<Data>>,
     first_row_headers: Vec<String>,
     batch: Vec<ImportRecord>,
@@ -921,6 +951,7 @@ impl RowSink<'_> {
                 self.first_row_headers = headers.clone();
             }
             if let Some(mapping) = detect_mapping(&headers) {
+                self.extra_cols = unmapped_columns(&headers, &mapping);
                 self.mapping = Some(mapping);
                 self.scanned.clear(); // rows above the header are title noise
                 return Ok(true);
@@ -958,6 +989,7 @@ impl RowSink<'_> {
             return Ok(true);
         }
         values[DATE_COL] = normalize_date(&values[DATE_COL]);
+        let extra = self.collect_extra(&row);
         self.summary.total_rows += 1;
         self.batch.push(ImportRecord {
             // Hash the full source row so rows that differ only in unmapped
@@ -965,6 +997,7 @@ impl RowSink<'_> {
             hash: row_hash_cells(&row),
             year: extract_year(&values[DATE_COL]),
             values,
+            extra,
         });
         if self.batch.len() >= BATCH_SIZE {
             self.flush_batch()?;
@@ -974,6 +1007,26 @@ impl RowSink<'_> {
             }
         }
         Ok(true)
+    }
+
+    /// Builds the `extra` JSON payload (unmapped columns) for one source row.
+    fn collect_extra(&self, row: &[Data]) -> Option<String> {
+        if self.extra_cols.is_empty() {
+            return None;
+        }
+        let pairs: Vec<(&str, String)> = self
+            .extra_cols
+            .iter()
+            .filter_map(|(idx, name)| {
+                let value = row.get(*idx).map(normalize_value).unwrap_or_default();
+                (!value.is_empty()).then_some((name.as_str(), value))
+            })
+            .collect();
+        if pairs.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&pairs).ok()
+        }
     }
 
     fn flush_batch(&mut self) -> Result<(), String> {

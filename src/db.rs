@@ -64,11 +64,16 @@ pub struct ImportRecord {
     pub hash: [u8; 16],
     pub year: Option<i64>,
     pub values: Vec<String>,
+    /// Unmapped source columns, kept verbatim so the app stays universal across
+    /// differently shaped customs files. JSON array of [header, value] pairs.
+    pub extra: Option<String>,
 }
 
 pub struct RecordCard {
     pub fields: Vec<(&'static str, String)>,
     pub source_file: String,
+    /// Extra source columns this file had beyond the known schema, in file order.
+    pub extra: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -473,6 +478,7 @@ fn records_ddl_for(table_name: &str) -> String {
             source_file TEXT NOT NULL,
             year INTEGER,
             dup_first_file TEXT,
+            extra TEXT,
             imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             {}
         )",
@@ -485,11 +491,14 @@ fn records_ddl() -> String {
 }
 
 fn search_text_expr() -> String {
-    SEARCH_COLUMNS
+    // Known searchable columns plus the captured extra columns, so free-text
+    // search also reaches data from columns this build does not model.
+    let mut parts: Vec<String> = SEARCH_COLUMNS
         .iter()
         .map(|c| format!("COALESCE({c},'')"))
-        .collect::<Vec<_>>()
-        .join(" || ' ' || ")
+        .collect();
+    parts.push("COALESCE(extra,'')".to_string());
+    parts.join(" || ' ' || ")
 }
 
 impl Db {
@@ -601,7 +610,8 @@ impl Db {
         // Search index settings changed between versions. On mismatch, the
         // table is recreated and rebuilt from the watermark, with progress on
         // the next import or startup.
-        const FTS_SCHEMA_VERSION: &str = "3";
+        // Bumped when the indexed text changes (extra columns now contribute).
+        const FTS_SCHEMA_VERSION: &str = "4";
         if self.meta_get("fts_schema").as_deref() != Some(FTS_SCHEMA_VERSION) {
             self.conn
                 .execute_batch("DROP TABLE IF EXISTS records_fts;")?;
@@ -642,7 +652,7 @@ impl Db {
     }
 
     fn migrate_records_schema(&self) -> rusqlite::Result<()> {
-        const RECORDS_SCHEMA_VERSION: &str = "2";
+        const RECORDS_SCHEMA_VERSION: &str = "3";
         if self.meta_get("records_schema").as_deref() == Some(RECORDS_SCHEMA_VERSION) {
             return Ok(());
         }
@@ -760,9 +770,9 @@ impl Db {
         // stored is inserted with dup_first_file set to the file where it first
         // appeared, so the UI can flag it and analytics can skip it.
         let sql = format!(
-            "INSERT INTO records (row_hash, source_file, year, dup_first_file, {}) VALUES ({})",
+            "INSERT INTO records (row_hash, source_file, year, dup_first_file, extra, {}) VALUES ({})",
             col_names.join(", "),
-            std::iter::repeat_n("?", 4 + col_names.len())
+            std::iter::repeat_n("?", 5 + col_names.len())
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -795,8 +805,9 @@ impl Db {
                         first_seen += 1;
                     }
                 }
+                stmt.raw_bind_parameter(5, rec.extra.as_deref())?;
                 for (i, v) in rec.values.iter().enumerate() {
-                    stmt.raw_bind_parameter(5 + i, v.as_str())?;
+                    stmt.raw_bind_parameter(6 + i, v.as_str())?;
                 }
                 stmt.raw_execute()?;
             }
@@ -1064,7 +1075,7 @@ impl Db {
     pub fn record_card(&self, id: i64) -> rusqlite::Result<RecordCard> {
         let select: Vec<String> = COLUMNS.iter().map(|c| c.name.to_string()).collect();
         let sql = format!(
-            "SELECT {}, source_file FROM records WHERE id = ?1",
+            "SELECT {}, source_file, extra FROM records WHERE id = ?1",
             select.join(", ")
         );
         self.conn.query_row(&sql, [id], |row| {
@@ -1076,9 +1087,11 @@ impl Db {
                 ));
             }
             let source_file: String = row.get(COLUMNS.len())?;
+            let extra = parse_extra(row.get::<_, Option<String>>(COLUMNS.len() + 1)?.as_deref());
             Ok(RecordCard {
                 fields,
                 source_file,
+                extra,
             })
         })
     }
@@ -2082,6 +2095,13 @@ fn ratio(numerator: f64, denominator: f64) -> f64 {
     } else {
         numerator / denominator
     }
+}
+
+/// Parses the stored `extra` JSON (an array of [header, value] pairs) back into
+/// ordered key/value pairs for display. Returns empty on missing or bad data.
+fn parse_extra(raw: Option<&str>) -> Vec<(String, String)> {
+    raw.and_then(|text| serde_json::from_str::<Vec<(String, String)>>(text).ok())
+        .unwrap_or_default()
 }
 
 pub fn parse_number(value: &str) -> Option<f64> {

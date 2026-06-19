@@ -14,7 +14,7 @@ const state = {
   rows: [],
   activeTab: "results",
   analyticsGroup: "overview",
-  lang: localStorage.getItem("baseSearchLang") || "ua",
+  lang: localStorage.getItem("baseSearchLang") || "en",
   i18n: {},
   languages: [],
   langLabel: "Language",
@@ -120,10 +120,14 @@ function cleanParams(params) {
 
 async function api(path, params = {}) {
   if (!state.token) {
-    throw new Error("Немає локального токена сесії. Запустіть браузерний режим заново.");
+    throw new Error("No local session token. Restart browser mode.");
   }
-  const qs = new URLSearchParams(cleanParams({ ...params, token: state.token }));
-  const response = await fetch(`${path}?${qs.toString()}`, { cache: "no-store" });
+  const query = new URLSearchParams(cleanParams(params)).toString();
+  const url = query ? `${path}?${query}` : path;
+  const response = await fetch(url, {
+    cache: "no-store",
+    headers: { Authorization: `Bearer ${state.token}` },
+  });
   const data = await response.json();
   if (!response.ok || data.ok === false) {
     throw new Error(data.error || `HTTP ${response.status}`);
@@ -642,13 +646,33 @@ function activateTab(tab) {
   if (tab === "analytics") loadAnalytics();
 }
 
-function exportCurrentPage() {
+async function exportCurrentPage() {
   if (!state.token) {
-    toast("Немає локального токена сесії");
+    toast("No local session token");
     return;
   }
-  const params = new URLSearchParams(cleanParams({ ...queryWithPaging(), token: state.token }));
-  location.href = `/api/export-page.csv?${params.toString()}`;
+  const query = new URLSearchParams(cleanParams(queryWithPaging())).toString();
+  const url = query ? `/api/export-page.csv?${query}` : "/api/export-page.csv";
+  try {
+    const response = await fetch(url, {
+      cache: "no-store",
+      headers: { Authorization: `Bearer ${state.token}` },
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const blob = await response.blob();
+    const href = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = href;
+    link.download = "base-search-page.csv";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(href);
+  } catch (err) {
+    toast(String(err.message || err));
+  }
 }
 
 function clearFilters() {
@@ -721,7 +745,7 @@ function bindEvents() {
 async function boot() {
   bindEvents();
   if (!state.token) {
-    toast("Запустіть браузерний режим через BaseSearch.exe --web");
+    toast("Start browser mode via BaseSearch.exe --web");
     return;
   }
   try {
