@@ -5,13 +5,17 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use base_search::db::{
-    AnalyticsFilterField, AnalyticsScope, AnalyticsSectionKind, Db, Filters, PivotDim, PivotLimits,
-    PivotMetric, PriceMetricKind, Query, analytics_should_run, build_fts_query, extract_year,
-    fts_prefix_terms, parse_number, pivot_filter_action,
+    AnalyticsFilterField, AnalyticsScope, AnalyticsSectionKind, Db, Filters, ImportRecord,
+    PivotDim, PivotLimits, PivotMetric, PriceMetricKind, Query, analytics_should_run,
+    build_fts_query, canonical_record_hash, extract_year, fts_prefix_terms, parse_number,
+    pivot_filter_action,
 };
 use base_search::export;
 use base_search::import::{self, ImportPhase, collapse_ws, normalize_date, normalize_value};
 use base_search::schema::{COLUMNS, RESULT_COLUMNS, col_index, column_glossary};
+use base_search::search::{
+    ConditionOp, ConditionValue, FieldRef, LogicOp, QueryCondition, QueryExpr, QueryGroup,
+};
 use calamine::Reader;
 
 #[test]
@@ -160,6 +164,181 @@ fn sample_rows() -> Vec<Vec<(&'static str, &'static str)>> {
     ]
 }
 
+fn advanced_condition(field: &str, op: ConditionOp, value: ConditionValue) -> QueryExpr {
+    QueryExpr::Condition(QueryCondition {
+        field: FieldRef::Column(field.to_string()),
+        op,
+        value,
+        negated: false,
+    })
+}
+
+fn advanced_query(expr: QueryExpr) -> Query {
+    Query {
+        advanced: Some(expr),
+        ..Query::default()
+    }
+}
+
+#[test]
+fn v2_search_ast_empty_checks_ignore_blank_values() {
+    let blank = QueryExpr::Condition(QueryCondition {
+        field: FieldRef::Column("sender".into()),
+        op: ConditionOp::Contains,
+        value: ConditionValue::Single("  ".into()),
+        negated: false,
+    });
+    assert!(blank.is_empty());
+
+    let non_blank = QueryExpr::Group(QueryGroup {
+        op: LogicOp::And,
+        negated: false,
+        children: vec![QueryExpr::Condition(QueryCondition {
+            field: FieldRef::Column("year".into()),
+            op: ConditionOp::Equals,
+            value: ConditionValue::Single("2024".into()),
+            negated: false,
+        })],
+    });
+    assert!(!non_blank.is_empty());
+}
+
+#[test]
+fn v2_search_ast_supports_logic_ranges_empty_and_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("v2-search.xlsx");
+    let db_path = dir.path().join("v2-search.db");
+    write_test_xlsx(
+        &xlsx,
+        &[
+            vec![
+                ("declaration_number", "24UA0000001U1"),
+                ("declaration_date", "15.01.2024"),
+                ("sender", "ALPHA SUPPLY"),
+                ("recipient", "A IMPORT"),
+                ("product_code", "8504405500"),
+                ("description", "Power converter"),
+                ("origin_country", "CN"),
+                ("net_kg", "10"),
+            ],
+            vec![
+                ("declaration_number", "24UA0000002U2"),
+                ("declaration_date", "20.02.2024"),
+                ("sender", "BETA SUPPLY"),
+                ("recipient", "B IMPORT"),
+                ("product_code", "8504900000"),
+                ("description", "Static converter"),
+                ("origin_country", "PL"),
+                ("net_kg", "15"),
+            ],
+            vec![
+                ("declaration_number", "24UA0000003U3"),
+                ("declaration_date", "10.03.2024"),
+                ("sender", "GAMMA SUPPLY"),
+                ("recipient", "C IMPORT"),
+                ("product_code", "2204210000"),
+                ("description", ""),
+                ("origin_country", "DE"),
+                ("net_kg", "30"),
+            ],
+            vec![
+                ("declaration_number", "25UA0000004U4"),
+                ("declaration_date", "10.03.2025"),
+                ("sender", "ALPHA SUPPLY"),
+                ("recipient", "D IMPORT"),
+                ("product_code", "8708990000"),
+                ("description", "Vehicle part"),
+                ("origin_country", "CN"),
+                ("net_kg", "5"),
+            ],
+        ],
+    );
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+
+    let sender_or = QueryExpr::Group(QueryGroup {
+        op: LogicOp::Or,
+        negated: false,
+        children: vec![
+            advanced_condition(
+                "sender",
+                ConditionOp::Contains,
+                ConditionValue::Single("ALPHA".into()),
+            ),
+            advanced_condition(
+                "sender",
+                ConditionOp::Contains,
+                ConditionValue::Single("BETA".into()),
+            ),
+        ],
+    });
+    let year_2024 = advanced_condition(
+        "year",
+        ConditionOp::Equals,
+        ConditionValue::Single("2024".into()),
+    );
+    let query = advanced_query(QueryExpr::Group(QueryGroup {
+        op: LogicOp::And,
+        negated: false,
+        children: vec![sender_or, year_2024],
+    }));
+    assert_eq!(db.count(&query).unwrap(), 2);
+
+    let not_cn = advanced_query(QueryExpr::Condition(QueryCondition {
+        field: FieldRef::Column("origin_country".into()),
+        op: ConditionOp::Equals,
+        value: ConditionValue::Single("CN".into()),
+        negated: true,
+    }));
+    assert_eq!(db.count(&not_cn).unwrap(), 2);
+
+    let code_prefix = advanced_query(advanced_condition(
+        "product_code",
+        ConditionOp::StartsWith,
+        ConditionValue::Single("8504".into()),
+    ));
+    assert_eq!(db.count(&code_prefix).unwrap(), 2);
+
+    let numeric_range = advanced_query(advanced_condition(
+        "net_kg",
+        ConditionOp::Range,
+        ConditionValue::Range {
+            from: Some("5".into()),
+            to: Some("15".into()),
+        },
+    ));
+    assert_eq!(db.count(&numeric_range).unwrap(), 3);
+
+    let date_range = advanced_query(advanced_condition(
+        "declaration_date",
+        ConditionOp::Range,
+        ConditionValue::Range {
+            from: Some("2024-01-01".into()),
+            to: Some("2024-12-31".into()),
+        },
+    ));
+    assert_eq!(db.count(&date_range).unwrap(), 3);
+
+    let empty_description = advanced_query(advanced_condition(
+        "description",
+        ConditionOp::IsEmpty,
+        ConditionValue::None,
+    ));
+    assert_eq!(db.count(&empty_description).unwrap(), 1);
+
+    let invalid = advanced_query(advanced_condition(
+        "description",
+        ConditionOp::Range,
+        ConditionValue::Range {
+            from: Some("A".into()),
+            to: Some("Z".into()),
+        },
+    ));
+    assert!(db.count(&invalid).is_err());
+}
+
 #[test]
 fn import_search_filter_export() {
     let dir = tempfile::tempdir().unwrap();
@@ -228,6 +407,7 @@ fn import_search_filter_export() {
     let fq = Query {
         text: String::new(),
         filters: filters.clone(),
+        advanced: None,
     };
     assert_eq!(db.count(&fq).unwrap(), 7);
     let analytics = db.analytics(&fq, 10).unwrap();
@@ -241,7 +421,8 @@ fn import_search_filter_export() {
     assert_eq!(
         db.count(&Query {
             text: String::new(),
-            filters
+            filters,
+            advanced: None,
         })
         .unwrap(),
         2
@@ -255,7 +436,8 @@ fn import_search_filter_export() {
     assert_eq!(
         db.count(&Query {
             text: String::new(),
-            filters
+            filters,
+            advanced: None,
         })
         .unwrap(),
         2
@@ -269,7 +451,8 @@ fn import_search_filter_export() {
     assert_eq!(
         db.count(&Query {
             text: String::new(),
-            filters
+            filters,
+            advanced: None,
         })
         .unwrap(),
         2
@@ -283,7 +466,8 @@ fn import_search_filter_export() {
     assert_eq!(
         db.count(&Query {
             text: "вино".into(),
-            filters
+            filters,
+            advanced: None,
         })
         .unwrap(),
         2
@@ -296,7 +480,8 @@ fn import_search_filter_export() {
     assert_eq!(
         db.count(&Query {
             text: "вино".into(),
-            filters
+            filters,
+            advanced: None,
         })
         .unwrap(),
         0
@@ -330,6 +515,63 @@ fn import_search_filter_export() {
     let mut wb: calamine::Xlsx<_> = calamine::open_workbook(&xlsx_out).unwrap();
     let range = wb.worksheet_range_at(0).unwrap().unwrap();
     assert_eq!(range.height(), 8); // header + 7 rows
+}
+
+#[test]
+fn csv_export_neutralizes_formula_leading_cells() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("formula.xlsx");
+    let db_path = dir.path().join("formula.db");
+    write_test_xlsx(
+        &xlsx,
+        &[vec![
+            ("declaration_number", "24UA100110000001U1"),
+            ("declaration_date", "15.03.2024"),
+            ("sender", "=WEBSERVICE(\"https://example.invalid\")"),
+            ("edrpou", "12345678"),
+            ("recipient", "+SUM(1,1)"),
+            ("product_code", "8504405500"),
+            ("description", "@HYPERLINK(\"https://example.invalid\")"),
+        ]],
+    );
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+
+    let csv_path = dir.path().join("formula.csv");
+    export::export(&db, &Query::default(), &csv_path, &cancel, |_, _| {}).unwrap();
+    let bytes = std::fs::read(&csv_path).unwrap();
+    let text = String::from_utf8(bytes[3..].to_vec()).unwrap();
+    assert!(text.contains("'=WEBSERVICE"));
+    assert!(text.contains("'+SUM"));
+    assert!(text.contains("'@HYPERLINK"));
+}
+
+#[test]
+fn export_rejects_unsupported_extensions() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("data.xlsx");
+    let db_path = dir.path().join("data.db");
+    write_test_xlsx(&xlsx, &sample_rows());
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+
+    let result = export::export(
+        &db,
+        &Query::default(),
+        &dir.path().join("wrong.xls"),
+        &cancel,
+        |_, _| {},
+    );
+    assert!(matches!(
+        result,
+        Err(export::ExportError::UnsupportedExtension(_))
+    ));
 }
 
 #[test]
@@ -419,6 +661,7 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
             year: "2024".into(),
             ..Default::default()
         },
+        advanced: None,
     };
     let analytics = db.analytics(&q, 5).unwrap();
     assert_eq!(analytics.overview.row_count, 2);
@@ -663,6 +906,7 @@ fn analytics_section_can_load_all_group_rows_beyond_visible_top() {
             year: "2024".into(),
             ..Default::default()
         },
+        advanced: None,
     };
     let top = db
         .analytics_scoped(&q, 5, Some(AnalyticsScope::Companies), 10)
@@ -743,6 +987,7 @@ fn analytics_trademark_filter_is_field_specific() {
             year: "2024".into(),
             ..Default::default()
         },
+        advanced: None,
     };
     assert_eq!(db.count(&broad).unwrap(), 3);
 
@@ -753,6 +998,7 @@ fn analytics_trademark_filter_is_field_specific() {
             trademark: "Apple".into(),
             ..Default::default()
         },
+        advanced: None,
     };
     let analytics = db.analytics(&exact_brand, 10).unwrap();
     assert_eq!(analytics.overview.row_count, 1);
@@ -809,6 +1055,7 @@ fn analytics_country_sections_use_normalized_country_keys() {
             year: "2024".into(),
             ..Default::default()
         },
+        advanced: None,
     };
     let analytics = db.analytics(&q, 10).unwrap();
     assert_eq!(analytics.overview.distinct_origin_countries, 1);
@@ -870,6 +1117,7 @@ fn analytics_ignores_placeholder_labels_in_business_groups() {
             year: "2024".into(),
             ..Default::default()
         },
+        advanced: None,
     };
     let analytics = db.analytics(&q, 10).unwrap();
 
@@ -989,6 +1237,7 @@ fn analytics_builds_decision_sections_for_trade_questions() {
             year: "2024".into(),
             ..Default::default()
         },
+        advanced: None,
     };
     let analytics = db.analytics(&q, 10).unwrap();
     assert_eq!(analytics.overview.row_count, 3);
@@ -1193,7 +1442,8 @@ fn import_registry_format() {
     assert_eq!(
         db.count(&Query {
             text: String::new(),
-            filters
+            filters,
+            advanced: None,
         })
         .unwrap(),
         1
@@ -1755,6 +2005,23 @@ fn import_captures_unmapped_columns_as_extra() {
     assert_eq!(db.count(&q("CONTAINERX9Z")).unwrap(), 1);
     assert_eq!(db.count(&q("INVOICEQ7W")).unwrap(), 1);
 
+    let catalog = db.field_catalog().unwrap();
+    assert!(
+        catalog
+            .iter()
+            .any(|field| field.id == format!("extra:{}", headers[6]))
+    );
+    let extra_query = Query {
+        advanced: Some(QueryExpr::Condition(QueryCondition {
+            field: FieldRef::Extra(headers[6].to_string()),
+            op: ConditionOp::Equals,
+            value: ConditionValue::Single("CONTAINERX9Z".into()),
+            negated: false,
+        })),
+        ..Query::default()
+    };
+    assert_eq!(db.count(&extra_query).unwrap(), 1);
+
     // A fully-mapped file produces no extra columns.
     let full = dir.path().join("full.xlsx");
     let full_db = dir.path().join("full.db");
@@ -1795,6 +2062,37 @@ fn duplicate_file_skipped_by_content_hash() {
 }
 
 #[test]
+fn canonical_hash_marks_same_normalized_record_as_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("canonical.db");
+    let mut db = Db::open(&db_path).unwrap();
+
+    let mut values = vec![String::new(); COLUMNS.len()];
+    values[col_index("declaration_number").unwrap()] = "24UA100110000001U1".to_string();
+    values[col_index("declaration_date").unwrap()] = "2024-03-15".to_string();
+    values[col_index("sender").unwrap()] = "ACME LTD".to_string();
+    values[col_index("recipient").unwrap()] = "Demo Import LLC".to_string();
+    values[col_index("product_code").unwrap()] = "8504405500".to_string();
+    values[col_index("description").unwrap()] = "Static converter".to_string();
+
+    let first = ImportRecord {
+        hash: canonical_record_hash(&values, None),
+        year: Some(2024),
+        values: values.clone(),
+        extra: None,
+    };
+    let second = ImportRecord {
+        hash: canonical_record_hash(&values, None),
+        year: Some(2024),
+        values,
+        extra: None,
+    };
+
+    assert_eq!(db.insert_batch("layout-a.xlsx", &[first]).unwrap(), (1, 0));
+    assert_eq!(db.insert_batch("layout-b.xlsx", &[second]).unwrap(), (1, 1));
+}
+
+#[test]
 fn records_schema_migration_preserves_rows_and_invalidates_old_file_hashes() {
     let dir = tempfile::tempdir().unwrap();
     let xlsx = dir.path().join("legacy.xlsx");
@@ -1824,6 +2122,49 @@ fn records_schema_migration_preserves_rows_and_invalidates_old_file_hashes() {
         })
         .unwrap(),
         1
+    );
+}
+
+#[test]
+fn records_schema_migration_preserves_extra_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("extra-migration.db");
+    let mut db = Db::open(&db_path).unwrap();
+
+    let mut values = vec![String::new(); COLUMNS.len()];
+    values[col_index("declaration_number").unwrap()] = "24UA100110000001U1".to_string();
+    values[col_index("declaration_date").unwrap()] = "2024-03-15".to_string();
+    values[col_index("sender").unwrap()] = "ACME LTD".to_string();
+    values[col_index("recipient").unwrap()] = "Demo Import LLC".to_string();
+    values[col_index("product_code").unwrap()] = "8504405500".to_string();
+    values[col_index("description").unwrap()] = "Static converter".to_string();
+    let extra = serde_json::to_string(&vec![("Container", "CONT-42")]).unwrap();
+    let record = ImportRecord {
+        hash: canonical_record_hash(&values, Some(&extra)),
+        year: Some(2024),
+        values,
+        extra: Some(extra),
+    };
+
+    assert_eq!(db.insert_batch("generic.xlsx", &[record]).unwrap(), (1, 0));
+    db.meta_set("records_schema", "1");
+    drop(db);
+
+    let db = Db::open(&db_path).unwrap();
+    let (ids, _, _) = db
+        .search_page(
+            &Query {
+                text: "CONT-42".into(),
+                ..Default::default()
+            },
+            10,
+            0,
+        )
+        .unwrap();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(
+        db.record_card(ids[0]).unwrap().extra,
+        vec![("Container".to_string(), "CONT-42".to_string())]
     );
 }
 
@@ -1889,7 +2230,7 @@ fn missing_required_columns() {
     let mut db = Db::open(&db_path).unwrap();
     let cancel = AtomicBool::new(false);
     let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
-    let err = summary.error.expect("должна быть ошибка");
+    let err = summary.error.expect("expected an error");
     assert!(err.starts_with("__MISSING__"));
     assert!(err.contains("Дата"));
     assert!(err.contains("Опис товару"));
@@ -1966,6 +2307,7 @@ fn sender_filter_with_short_tokens_is_correct() {
     let q = Query {
         text: String::new(),
         filters,
+        advanced: None,
     };
     assert_eq!(db.count(&q).unwrap(), 1);
     let (_, rows, _dups) = db.search_page(&q, 10, 0).unwrap();
@@ -2044,6 +2386,13 @@ fn value_normalization() {
     assert_eq!(normalize_date("31.12.2024"), "2024-12-31");
     assert_eq!(normalize_date("1.3.2024"), "2024-03-01");
     assert_eq!(normalize_date("2024-12-31"), "2024-12-31");
+    // YYYY.MM.DD and single-digit month/day are canonicalized so the monthly
+    // analytics filter (which matches the "YYYY-MM" prefix) still sees them.
+    assert_eq!(normalize_date("2024.12.31"), "2024-12-31");
+    assert_eq!(normalize_date("2024/12/31"), "2024-12-31");
+    assert_eq!(normalize_date("2024-1-5"), "2024-01-05");
+    // A non-date with four leading digits and an out-of-range month is left as-is.
+    assert_eq!(normalize_date("1234-56-78"), "1234-56-78");
     assert_eq!(normalize_date("не дата"), "не дата");
     assert_eq!(extract_year("2024-03-15"), Some(2024));
     assert_eq!(extract_year("15.03.2024"), Some(2024));

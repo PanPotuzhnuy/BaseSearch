@@ -139,6 +139,157 @@ enum SearchCountReq {
     ClearCache,
 }
 
+/// Handles the analytics-family requests shared by the search and analytics
+/// workers, so the dispatch logic lives in exactly one place.
+///
+/// Returns `None` once the request has been handled (or skipped because the
+/// query is too broad to run). Requests that are not part of this family
+/// (`Search`, `Stats`) are returned unchanged as `Some(req)` so the calling
+/// worker can handle them itself.
+fn handle_analytics_req(
+    db: &Db,
+    req: WorkerReq,
+    tx: &Sender<Msg>,
+    ctx: &egui::Context,
+) -> Option<WorkerReq> {
+    match req {
+        WorkerReq::Analytics {
+            q,
+            limit,
+            scope,
+            hs_level,
+            generation,
+        } => {
+            if !analytics_should_run(&q) {
+                return None;
+            }
+            let msg = match db.analytics_scoped(&q, limit, scope, hs_level) {
+                Ok(analytics) => Msg::AnalyticsDone {
+                    generation,
+                    scope,
+                    analytics: Box::new(analytics),
+                },
+                Err(e) => Msg::SearchError {
+                    generation,
+                    message: e.to_string(),
+                },
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        }
+        WorkerReq::AnalyticsSection {
+            q,
+            kind,
+            limit,
+            hs_level,
+            generation,
+        } => {
+            if !analytics_should_run(&q) {
+                return None;
+            }
+            let msg = match db.analytics_section(&q, kind, hs_level, limit) {
+                Ok(section) => Msg::AnalyticsSectionDone {
+                    generation,
+                    section: Box::new(section),
+                },
+                Err(e) => Msg::SearchError {
+                    generation,
+                    message: e.to_string(),
+                },
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        }
+        WorkerReq::Profile { edrpou, generation } => {
+            let msg = match db.company_profile(&edrpou, 10) {
+                Ok(profile) => Msg::ProfileDone {
+                    generation,
+                    profile: Box::new(profile),
+                },
+                Err(e) => Msg::SearchError {
+                    generation,
+                    message: e.to_string(),
+                },
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        }
+        WorkerReq::Pivot {
+            q,
+            row_dim,
+            col_dim,
+            metric,
+            others_label,
+            generation,
+        } => {
+            if !analytics_should_run(&q) {
+                return None;
+            }
+            let msg = match db.pivot(
+                &q,
+                row_dim,
+                col_dim,
+                metric,
+                PivotLimits { rows: 25, cols: 18 },
+                &others_label,
+            ) {
+                Ok(pivot) => Msg::PivotDone {
+                    generation,
+                    pivot: Box::new(pivot),
+                },
+                Err(e) => Msg::SearchError {
+                    generation,
+                    message: e.to_string(),
+                },
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        }
+        WorkerReq::Compare { q, generation } => {
+            if !analytics_should_run(&q) {
+                return None;
+            }
+            let msg = match db.analytics(&q, 10) {
+                Ok(analytics) => Msg::CompareDone {
+                    generation,
+                    query: q,
+                    analytics: Box::new(analytics),
+                },
+                Err(e) => Msg::CompareError {
+                    generation,
+                    message: e.to_string(),
+                },
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        }
+        WorkerReq::Underpricing {
+            q,
+            threshold,
+            generation,
+        } => {
+            if !analytics_should_run(&q) {
+                return None;
+            }
+            let msg = match db.undervaluation(&q, threshold, 5, 200) {
+                Ok(result) => Msg::UnderpricingDone {
+                    generation,
+                    result: Box::new(result),
+                },
+                Err(e) => Msg::SearchError {
+                    generation,
+                    message: e.to_string(),
+                },
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        }
+        // Not an analytics-family request: hand it back to the caller.
+        other => return Some(other),
+    }
+    None
+}
+
 /// Persistent search thread with its own connection and COUNT cache.
 pub fn spawn_search_worker(
     db_path: PathBuf,
@@ -159,6 +310,13 @@ pub fn spawn_search_worker(
         spawn_search_count_worker(db_path.clone(), count_rx, tx.clone(), ctx.clone());
 
         while let Ok(req) = rx.recv() {
+            // Analytics-family requests are handled by the shared dispatcher;
+            // it returns Some(req) only for Search and Stats, which this worker
+            // owns.
+            let req = match handle_analytics_req(&db, req, &tx, &ctx) {
+                None => continue,
+                Some(req) => req,
+            };
             match req {
                 WorkerReq::Search {
                     q,
@@ -209,143 +367,41 @@ pub fn spawn_search_worker(
                         }
                     }
                 }
-                WorkerReq::Analytics {
-                    q,
-                    limit,
-                    scope,
-                    hs_level,
-                    generation,
-                } => {
-                    if !analytics_should_run(&q) {
-                        continue;
-                    }
-                    let msg = match db.analytics_scoped(&q, limit, scope, hs_level) {
-                        Ok(analytics) => Msg::AnalyticsDone {
-                            generation,
-                            scope,
-                            analytics: Box::new(analytics),
-                        },
-                        Err(e) => Msg::SearchError {
-                            generation,
-                            message: e.to_string(),
-                        },
-                    };
-                    let _ = tx.send(msg);
-                    ctx.request_repaint();
-                }
-                WorkerReq::AnalyticsSection {
-                    q,
-                    kind,
-                    limit,
-                    hs_level,
-                    generation,
-                } => {
-                    if !analytics_should_run(&q) {
-                        continue;
-                    }
-                    let msg = match db.analytics_section(&q, kind, hs_level, limit) {
-                        Ok(section) => Msg::AnalyticsSectionDone {
-                            generation,
-                            section: Box::new(section),
-                        },
-                        Err(e) => Msg::SearchError {
-                            generation,
-                            message: e.to_string(),
-                        },
-                    };
-                    let _ = tx.send(msg);
-                    ctx.request_repaint();
-                }
-                WorkerReq::Profile { edrpou, generation } => {
-                    let msg = match db.company_profile(&edrpou, 10) {
-                        Ok(profile) => Msg::ProfileDone {
-                            generation,
-                            profile: Box::new(profile),
-                        },
-                        Err(e) => Msg::SearchError {
-                            generation,
-                            message: e.to_string(),
-                        },
-                    };
-                    let _ = tx.send(msg);
-                    ctx.request_repaint();
-                }
-                WorkerReq::Pivot {
-                    q,
-                    row_dim,
-                    col_dim,
-                    metric,
-                    others_label,
-                    generation,
-                } => {
-                    if !analytics_should_run(&q) {
-                        continue;
-                    }
-                    let msg = match db.pivot(
-                        &q,
-                        row_dim,
-                        col_dim,
-                        metric,
-                        PivotLimits { rows: 25, cols: 18 },
-                        &others_label,
-                    ) {
-                        Ok(pivot) => Msg::PivotDone {
-                            generation,
-                            pivot: Box::new(pivot),
-                        },
-                        Err(e) => Msg::SearchError {
-                            generation,
-                            message: e.to_string(),
-                        },
-                    };
-                    let _ = tx.send(msg);
-                    ctx.request_repaint();
-                }
-                WorkerReq::Compare { q, generation } => {
-                    if !analytics_should_run(&q) {
-                        continue;
-                    }
-                    let msg = match db.analytics(&q, 10) {
-                        Ok(analytics) => Msg::CompareDone {
-                            generation,
-                            query: q,
-                            analytics: Box::new(analytics),
-                        },
-                        Err(e) => Msg::CompareError {
-                            generation,
-                            message: e.to_string(),
-                        },
-                    };
-                    let _ = tx.send(msg);
-                    ctx.request_repaint();
-                }
-                WorkerReq::Underpricing {
-                    q,
-                    threshold,
-                    generation,
-                } => {
-                    if !analytics_should_run(&q) {
-                        continue;
-                    }
-                    let msg = match db.undervaluation(&q, threshold, 5, 200) {
-                        Ok(result) => Msg::UnderpricingDone {
-                            generation,
-                            result: Box::new(result),
-                        },
-                        Err(e) => Msg::SearchError {
-                            generation,
-                            message: e.to_string(),
-                        },
-                    };
-                    let _ = tx.send(msg);
-                    ctx.request_repaint();
-                }
                 WorkerReq::Stats => {
                     let _ = count_tx.send(SearchCountReq::ClearCache);
                     let _ = tx.send(Msg::Stats(db.total_rows()));
                     ctx.request_repaint();
                 }
+                // Already handled by handle_analytics_req.
+                _ => {}
             }
+        }
+    });
+}
+
+/// Persistent analytics thread with its own connection, kept separate from
+/// search paging so expensive reports cannot block interactive results.
+pub fn spawn_analytics_worker(
+    db_path: PathBuf,
+    rx: Receiver<WorkerReq>,
+    tx: Sender<Msg>,
+    ctx: egui::Context,
+) {
+    std::thread::spawn(move || {
+        let db = match Db::open(&db_path) {
+            Ok(db) => db,
+            Err(e) => {
+                let _ = tx.send(Msg::Fatal(e));
+                ctx.request_repaint();
+                return;
+            }
+        };
+
+        while let Ok(req) = rx.recv() {
+            // This worker only serves analytics-family requests. Search and Stats
+            // are not routed here; if one arrives, the shared dispatcher returns
+            // it unchanged and we simply drop it.
+            let _ = handle_analytics_req(&db, req, &tx, &ctx);
         }
     });
 }

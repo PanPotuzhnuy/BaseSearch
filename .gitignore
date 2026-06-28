@@ -35,6 +35,10 @@
 *.tmp
 *.temp
 
+# Local planning drafts
+/docs/PRODUCT_REQUIREMENTS.md
+/docs/ROADMAP.md
+
 # Editor and OS files
 .claude/
 .vscode/

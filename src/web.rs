@@ -1,15 +1,24 @@
 //! Local browser interface for Base Search.
+//!
+//! A small dependency-free HTTP/1.1 server that exposes the same local database
+//! the desktop app uses, so the data can be searched and analysed from a regular
+//! browser. It is deliberately minimal and safe by default:
+//!
+//! - binds to loopback only (never a public interface);
+//! - every `/api/*` route requires a per-session token sent in the
+//!   `Authorization: Bearer` header (never in the URL), compared in constant time;
+//! - requests are bounded in size and time, and served by a fixed pool of worker
+//!   threads that each reuse one SQLite connection.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::AtomicBool;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -18,14 +27,18 @@ use crate::db::{
     AnalyticsPriceMetric, AnalyticsScope, AnalyticsSection, AnalyticsSectionKind, CompanyProfile,
     Db, Filters, PivotDim, PivotLimits, PivotMetric, PriceMetricKind, Query, analytics_should_run,
 };
+use crate::export::csv_safe_cell;
 use crate::i18n::{Lang, tr};
 use crate::schema::{RESULT_COLUMNS, column_glossary, header_for};
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 7832;
+
+/// Hard ceiling on a request head; bodies are never read (only GET is served).
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
-const MAX_SEARCH_LIMIT: u64 = 500;
+const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SEARCH_LIMIT: u64 = 100;
+const MAX_SEARCH_LIMIT: u64 = 500;
 const MAX_ANALYTICS_LIMIT: u64 = 50;
 const MAX_SECTION_LIMIT: u64 = 20_000;
 
@@ -33,13 +46,14 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
 const APP_JS: &str = include_str!("../web/app.js");
 
+/// Runtime configuration for the local web server.
 #[derive(Clone, Debug)]
 pub struct WebConfig {
     pub db_path: PathBuf,
     pub host: String,
     pub port: u16,
     pub open_browser: bool,
-    /// Fixed session token; when None a random one is generated per run.
+    /// Fixed session token; when `None` a fresh random one is generated per run.
     pub token: Option<String>,
 }
 
@@ -55,96 +69,40 @@ impl WebConfig {
     }
 }
 
-#[derive(Clone)]
+/// Shared, immutable state handed to every worker thread.
 struct WebState {
     db_path: PathBuf,
     token: String,
 }
 
-struct HttpRequest {
-    method: String,
-    path: String,
-    params: HashMap<String, String>,
-    /// Bearer token from the `Authorization` header, if present.
-    auth_token: Option<String>,
-}
-
-struct HttpResponse {
-    status_code: u16,
-    status_text: &'static str,
-    content_type: &'static str,
-    headers: Vec<(&'static str, String)>,
-    body: Vec<u8>,
-}
-
-impl HttpResponse {
-    fn new(
-        status_code: u16,
-        status_text: &'static str,
-        content_type: &'static str,
-        body: Vec<u8>,
-    ) -> Self {
-        Self {
-            status_code,
-            status_text,
-            content_type,
-            headers: Vec::new(),
-            body,
-        }
-    }
-
-    fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
-        self.headers.push((name, value.into()));
-        self
-    }
-
-    fn into_bytes(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.body.len() + 512);
-        let mut headers = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n",
-            self.status_code,
-            self.status_text,
-            self.content_type,
-            self.body.len()
-        );
-        for (name, value) in self.headers {
-            headers.push_str(name);
-            headers.push_str(": ");
-            headers.push_str(&value);
-            headers.push_str("\r\n");
-        }
-        headers.push_str("\r\n");
-        out.extend_from_slice(headers.as_bytes());
-        out.extend_from_slice(&self.body);
-        out
-    }
-}
+// ---------------------------------------------------------------------------
+// Server lifecycle
+// ---------------------------------------------------------------------------
 
 pub fn run(config: WebConfig) -> Result<(), String> {
     let (listener, url) = bind_local(&config.host, config.port)?;
     ensure_indexed(&config.db_path)?;
-    let token = config
-        .token
-        .clone()
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| make_token(&config.db_path));
-    let browser_url = format!("{url}/?token={token}");
+
+    let token = match config.token {
+        Some(token) if !token.trim().is_empty() => token,
+        _ => make_token()?,
+    };
 
     if config.open_browser {
-        let _ = open_browser(&browser_url);
+        let _ = open_browser(&url);
     }
 
-    eprintln!("Base Search web interface: {browser_url}");
-    eprintln!("Database: {}", config.db_path.display());
+    eprintln!("Base Search web interface: {url}");
+    eprintln!("Database file: {}", db_file_name(&config.db_path));
+
     let state = Arc::new(WebState {
         db_path: config.db_path,
         token,
     });
 
-    // Bounded worker pool: a fixed number of long-lived threads, each caching
-    // its own SQLite connection (see `with_db`). This caps concurrency and
-    // memory, and avoids spawning an unbounded number of threads/connections
-    // under load. The bounded queue applies backpressure to the accept loop.
+    // Bounded worker pool: a fixed number of long-lived threads, each caching its
+    // own SQLite connection (see `with_db`). This caps concurrency and memory and
+    // applies backpressure to the accept loop through the bounded queue.
     let worker_count = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -156,16 +114,13 @@ pub fn run(config: WebConfig) -> Result<(), String> {
         let state = Arc::clone(&state);
         std::thread::spawn(move || {
             loop {
-                let stream = {
-                    let guard = match rx.lock() {
-                        Ok(guard) => guard,
-                        Err(_) => break,
-                    };
-                    guard.recv()
+                let stream = match rx.lock() {
+                    Ok(guard) => guard.recv(),
+                    Err(_) => break,
                 };
                 match stream {
                     Ok(stream) => {
-                        let _ = handle_connection(stream, &state);
+                        let _ = serve_connection(stream, &state);
                     }
                     Err(_) => break, // listener stopped, channel closed
                 }
@@ -187,34 +142,62 @@ pub fn run(config: WebConfig) -> Result<(), String> {
 }
 
 fn bind_local(host: &str, preferred_port: u16) -> Result<(TcpListener, String), String> {
+    validate_loopback_host(host)?;
     for offset in 0..50u16 {
         let Some(port) = preferred_port.checked_add(offset) else {
             break;
         };
-        let addr = format!("{host}:{port}");
+        let addr = format!("{}:{port}", bracketed(host));
         if let Ok(listener) = TcpListener::bind(&addr) {
-            let url = format!("http://{host}:{port}");
-            return Ok((listener, url));
+            return Ok((listener, format!("http://{}:{port}", bracketed(host))));
         }
     }
     Err(format!(
-        "Could not bind local web server on {host}:{preferred_port}..{}",
+        "Could not bind the local web server on {host}:{preferred_port}..{}",
         preferred_port.saturating_add(49)
     ))
 }
 
-fn make_token(db_path: &Path) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    db_path.hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    now.hash(&mut hasher);
-    format!("{now:x}{:x}", hasher.finish())
+/// Refuses to bind anywhere that is not loopback, so the local database is never
+/// exposed to the network by accident.
+fn validate_loopback_host(host: &str) -> Result<(), String> {
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(());
+    }
+    let ip: IpAddr = host
+        .parse()
+        .map_err(|_| format!("Web host must be localhost or a loopback IP, got {host:?}"))?;
+    if ip.is_loopback() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Refusing to bind the local web interface to non-loopback host {host:?}"
+        ))
+    }
 }
 
+/// Wraps a bare IPv6 address in brackets for use in a socket address / URL.
+fn bracketed(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+fn make_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|err| format!("Could not create session token: {err}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn db_file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "base_search.db".to_string())
+}
+
+/// Finishes the full-text index up front so the first browser search is fast.
 fn ensure_indexed(db_path: &Path) -> Result<(), String> {
     let mut db = Db::open(db_path)?;
     if db.unindexed_rows() == 0 {
@@ -244,55 +227,154 @@ fn open_browser(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream, state: &WebState) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let raw = read_request(&mut stream)?;
-    let response = match parse_request(&raw) {
-        Ok(request) => route_request(state, &request),
-        Err(message) => json_error(400, "Bad Request", &message),
+// ---------------------------------------------------------------------------
+// One SQLite connection per worker thread
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Opened lazily on first use and reused for the life of the worker, so the
+    /// schema init does not run on every request.
+    static WORKER_DB: RefCell<Option<Db>> = const { RefCell::new(None) };
+}
+
+fn with_db<T>(state: &WebState, f: impl FnOnce(&Db) -> Result<T, String>) -> Result<T, String> {
+    WORKER_DB.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(Db::open(&state.db_path)?);
+        }
+        f(slot.as_ref().expect("worker db initialized"))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// HTTP request / response
+// ---------------------------------------------------------------------------
+
+struct HttpRequest {
+    method: String,
+    path: String,
+    params: HashMap<String, String>,
+    /// Bearer token from the `Authorization` header, if any.
+    auth_token: Option<String>,
+}
+
+struct HttpResponse {
+    status: u16,
+    status_text: &'static str,
+    content_type: &'static str,
+    extra_headers: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+}
+
+impl HttpResponse {
+    fn new(
+        status: u16,
+        status_text: &'static str,
+        content_type: &'static str,
+        body: Vec<u8>,
+    ) -> Self {
+        Self {
+            status,
+            status_text,
+            content_type,
+            extra_headers: Vec::new(),
+            body,
+        }
+    }
+
+    fn header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.extra_headers.push((name, value.into()));
+        self
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        let mut head = format!(
+            "HTTP/1.1 {} {}\r\n\
+             Content-Type: {}\r\n\
+             Content-Length: {}\r\n\
+             Cache-Control: no-store\r\n\
+             Connection: close\r\n\
+             X-Content-Type-Options: nosniff\r\n\
+             Referrer-Policy: no-referrer\r\n",
+            self.status,
+            self.status_text,
+            self.content_type,
+            self.body.len()
+        );
+        for (name, value) in self.extra_headers {
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(&value);
+            head.push_str("\r\n");
+        }
+        head.push_str("\r\n");
+        let mut out = Vec::with_capacity(head.len() + self.body.len());
+        out.extend_from_slice(head.as_bytes());
+        out.extend_from_slice(&self.body);
+        out
+    }
+}
+
+fn serve_connection(mut stream: TcpStream, state: &WebState) -> std::io::Result<()> {
+    let response = match read_head(&mut stream) {
+        Ok(raw) => match parse_request(&raw) {
+            Ok(request) => route(state, &request),
+            Err(message) => error_json(400, "Bad Request", &message),
+        },
+        Err(_) => error_json(400, "Bad Request", "Could not read the request."),
     };
     stream.write_all(&response.into_bytes())
 }
 
-/// Reads the request head (request line + headers) up to the blank line.
-/// Only newly read bytes are scanned for the terminator, so a large body or a
-/// flood cannot trigger a quadratic rescan. The body is intentionally not read:
-/// only GET is served and the connection is closed after the response.
-fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
+/// Reads the request head (request line + headers) up to the blank line. Only
+/// newly read bytes are scanned for the terminator, so a large body or a flood
+/// cannot trigger a quadratic rescan. The body is intentionally not read.
+fn read_head(stream: &mut TcpStream) -> std::io::Result<String> {
     let mut buf = [0u8; 4096];
-    let mut bytes = Vec::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    let started = Instant::now();
+    let mut complete = false;
     loop {
+        let elapsed = started.elapsed();
+        if elapsed >= REQUEST_HEADER_TIMEOUT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "HTTP request header timeout",
+            ));
+        }
+        stream.set_read_timeout(Some(REQUEST_HEADER_TIMEOUT - elapsed))?;
         let read = stream.read(&mut buf)?;
         if read == 0 {
             break;
         }
-        // Scan a small window straddling the previous tail and the new bytes,
-        // not the whole accumulated buffer.
         let scan_from = bytes.len().saturating_sub(3);
         bytes.extend_from_slice(&buf[..read]);
-        if bytes.len() >= MAX_REQUEST_BYTES
-            || bytes[scan_from..].windows(4).any(|w| w == b"\r\n\r\n")
-        {
+        if bytes[scan_from..].windows(4).any(|w| w == b"\r\n\r\n") {
+            complete = true;
+            break;
+        }
+        if bytes.len() >= MAX_REQUEST_BYTES {
             break;
         }
     }
-    Ok(String::from_utf8_lossy(&bytes).to_string())
+    if !complete {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Incomplete HTTP request head",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn parse_request(raw: &str) -> Result<HttpRequest, String> {
     let mut lines = raw.lines();
-    let first_line = lines.next().ok_or_else(|| "Empty HTTP request".to_string())?;
-    let mut parts = first_line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| "Missing HTTP method".to_string())?
-        .to_string();
-    let target = parts
-        .next()
-        .ok_or_else(|| "Missing HTTP target".to_string())?;
+    let request_line = lines.next().ok_or("Empty HTTP request")?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().ok_or("Missing HTTP method")?.to_string();
+    let target = parts.next().ok_or("Missing HTTP target")?;
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
 
-    // Header lines until the blank line; we only need the bearer token.
     let mut auth_token = None;
     for line in lines {
         if line.is_empty() {
@@ -309,88 +391,58 @@ fn parse_request(raw: &str) -> Result<HttpRequest, String> {
     Ok(HttpRequest {
         method,
         path: percent_decode(path),
-        params: parse_query_string(query),
+        params: parse_query(query),
         auth_token,
     })
 }
 
-fn route_request(state: &WebState, request: &HttpRequest) -> HttpResponse {
+// ---------------------------------------------------------------------------
+// Routing + auth
+// ---------------------------------------------------------------------------
+
+fn route(state: &WebState, request: &HttpRequest) -> HttpResponse {
     if request.method != "GET" {
-        return json_error(405, "Method Not Allowed", "Only GET requests are supported.")
-            .with_header("Allow", "GET");
+        return error_json(
+            405,
+            "Method Not Allowed",
+            "Only GET requests are supported.",
+        )
+        .header("Allow", "GET");
     }
-    // Prefer the Authorization header (kept out of URLs and logs); fall back to
-    // a query token for plain navigations such as the CSV download link.
+
+    // Every data route is gated by the per-session token in the Authorization
+    // header. Static assets are public (they contain no data).
     if request.path.starts_with("/api/") {
-        let provided = request
+        let ok = request
             .auth_token
             .as_deref()
-            .or_else(|| request.params.get("token").map(String::as_str));
-        if !provided.is_some_and(|token| constant_time_eq(token, &state.token)) {
-            return json_error(403, "Forbidden", "Invalid local session token.");
+            .is_some_and(|token| constant_time_eq(token, &state.token));
+        if !ok {
+            return error_json(403, "Forbidden", "Invalid local session token.");
         }
     }
 
     match request.path.as_str() {
-        "/" | "/index.html" => static_text("text/html; charset=utf-8", INDEX_HTML),
-        "/assets/app.css" => static_text("text/css; charset=utf-8", APP_CSS),
-        "/assets/app.js" => static_text("text/javascript; charset=utf-8", APP_JS),
+        "/" | "/index.html" => serve_index(&state.token),
+        "/assets/app.css" => serve_static("text/css; charset=utf-8", APP_CSS),
+        "/assets/app.js" => serve_static("text/javascript; charset=utf-8", APP_JS),
         "/api/stats" => api_stats(state),
         "/api/schema" => api_schema(),
+        "/api/i18n" => api_i18n(&request.params),
         "/api/search" => api_search(state, &request.params),
+        "/api/count" => api_count(state, &request.params),
         "/api/card" => api_card(state, &request.params),
         "/api/analytics" => api_analytics(state, &request.params),
         "/api/section" => api_section(state, &request.params),
         "/api/company" => api_company(state, &request.params),
         "/api/pivot" => api_pivot(state, &request.params),
-        "/api/i18n" => api_i18n(&request.params),
-        "/api/export-page.csv" => api_export_page_csv(state, &request.params),
-        _ => json_error(404, "Not Found", "Unknown route."),
+        "/api/export-page.csv" => api_export_csv(state, &request.params),
+        _ => error_json(404, "Not Found", "Unknown route."),
     }
 }
 
-fn static_text(content_type: &'static str, text: &str) -> HttpResponse {
-    HttpResponse::new(200, "OK", content_type, text.as_bytes().to_vec())
-}
-
-fn json_response(value: Value) -> HttpResponse {
-    let body = serde_json::to_vec(&value).unwrap_or_else(|_| b"{\"ok\":false}".to_vec());
-    HttpResponse::new(200, "OK", "application/json; charset=utf-8", body)
-}
-
-fn json_error(status_code: u16, status_text: &'static str, message: &str) -> HttpResponse {
-    let body = serde_json::to_vec(&json!({
-        "ok": false,
-        "error": message,
-    }))
-    .unwrap_or_default();
-    HttpResponse::new(
-        status_code,
-        status_text,
-        "application/json; charset=utf-8",
-        body,
-    )
-}
-
-thread_local! {
-    /// One SQLite connection per worker thread, opened lazily on first use and
-    /// reused for the life of the worker — instead of opening (and running the
-    /// full schema init) on every request.
-    static WORKER_DB: RefCell<Option<Db>> = const { RefCell::new(None) };
-}
-
-fn with_db<T>(state: &WebState, f: impl FnOnce(&Db) -> Result<T, String>) -> Result<T, String> {
-    WORKER_DB.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(Db::open(&state.db_path)?);
-        }
-        f(slot.as_ref().expect("worker db initialized"))
-    })
-}
-
-/// Length-checked, content-constant-time string comparison for the session
-/// token, so a network observer cannot recover it byte by byte via timing.
+/// Length-checked, content-constant-time comparison so a network observer cannot
+/// recover the token byte by byte through timing.
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
@@ -403,8 +455,47 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+// ---------------------------------------------------------------------------
+// Static responses
+// ---------------------------------------------------------------------------
+
+fn serve_index(token: &str) -> HttpResponse {
+    // Inject the session token as a small bootstrap script so the client can send
+    // it in the Authorization header. It is never placed in a URL or a cookie.
+    let token_json = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
+    let bootstrap = format!("<script>window.__BASE_SEARCH_TOKEN = {token_json};</script>");
+    let html = INDEX_HTML.replace("</head>", &format!("    {bootstrap}\n  </head>"));
+    serve_static("text/html; charset=utf-8", &html)
+}
+
+fn serve_static(content_type: &'static str, text: &str) -> HttpResponse {
+    HttpResponse::new(200, "OK", content_type, text.as_bytes().to_vec())
+}
+
+fn json_ok(value: Value) -> HttpResponse {
+    let body = serde_json::to_vec(&value).unwrap_or_else(|_| b"{\"ok\":false}".to_vec());
+    HttpResponse::new(200, "OK", "application/json; charset=utf-8", body)
+}
+
+fn error_json(status: u16, status_text: &'static str, message: &str) -> HttpResponse {
+    let body = serde_json::to_vec(&json!({ "ok": false, "error": message })).unwrap_or_default();
+    HttpResponse::new(status, status_text, "application/json; charset=utf-8", body)
+}
+
+/// Wraps a handler result, turning an error string into a 500 JSON response.
+fn respond(result: Result<Value, String>) -> HttpResponse {
+    match result {
+        Ok(value) => json_ok(value),
+        Err(err) => error_json(500, "Internal Server Error", &err),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// API handlers
+// ---------------------------------------------------------------------------
+
 fn api_stats(state: &WebState) -> HttpResponse {
-    match with_db(state, |db| {
+    respond(with_db(state, |db| {
         let imports: Vec<Value> = db
             .import_log(12)
             .into_iter()
@@ -421,15 +512,11 @@ fn api_stats(state: &WebState) -> HttpResponse {
             .collect();
         Ok(json!({
             "ok": true,
-            "db_path": state.db_path.display().to_string(),
             "total_rows": db.total_rows(),
             "unindexed_rows": db.unindexed_rows(),
             "imports": imports,
         }))
-    }) {
-        Ok(value) => json_response(value),
-        Err(err) => json_error(500, "Internal Server Error", &err),
-    }
+    }))
 }
 
 fn api_schema() -> HttpResponse {
@@ -443,22 +530,20 @@ fn api_schema() -> HttpResponse {
             })
         })
         .collect();
-    json_response(json!({
-        "ok": true,
-        "columns": columns,
-    }))
+    json_ok(json!({ "ok": true, "columns": columns }))
 }
 
 fn api_search(state: &WebState, params: &HashMap<String, String>) -> HttpResponse {
-    let q = query_from_params(params);
+    let query = query_from_params(params);
     let limit = parse_u64(params, "limit", DEFAULT_SEARCH_LIMIT).clamp(1, MAX_SEARCH_LIMIT);
     let page = parse_u64(params, "page", 0);
     let offset = page.saturating_mul(limit);
     let started = Instant::now();
 
-    match with_db(state, |db| {
+    respond(with_db(state, |db| {
+        // Fetch one extra row to learn whether a next page exists.
         let (mut ids, mut rows, mut dups) = db
-            .search_page(&q, limit.saturating_add(1), offset)
+            .search_page(&query, limit.saturating_add(1), offset)
             .map_err(|err| err.to_string())?;
         let has_next = rows.len() as u64 > limit;
         if has_next {
@@ -469,10 +554,10 @@ fn api_search(state: &WebState, params: &HashMap<String, String>) -> HttpRespons
         let row_values: Vec<Value> = rows
             .into_iter()
             .enumerate()
-            .map(|(idx, cells)| {
+            .map(|(i, cells)| {
                 json!({
-                    "id": ids.get(idx).copied().unwrap_or_default(),
-                    "duplicate_of": dups.get(idx).cloned().unwrap_or(None),
+                    "id": ids.get(i).copied().unwrap_or_default(),
+                    "duplicate_of": dups.get(i).cloned().unwrap_or(None),
                     "cells": cells,
                 })
             })
@@ -485,25 +570,32 @@ fn api_search(state: &WebState, params: &HashMap<String, String>) -> HttpRespons
             "rows": row_values,
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }))
-    }) {
-        Ok(value) => json_response(value),
-        Err(err) => json_error(500, "Internal Server Error", &err),
-    }
+    }))
+}
+
+/// Total number of rows matching the query. Called separately from `/api/search`
+/// so paging a result page stays fast while the exact total fills in afterwards.
+fn api_count(state: &WebState, params: &HashMap<String, String>) -> HttpResponse {
+    let query = query_from_params(params);
+    respond(with_db(state, |db| {
+        let total = db.count(&query).map_err(|err| err.to_string())?;
+        Ok(json!({ "ok": true, "total": total }))
+    }))
 }
 
 fn api_card(state: &WebState, params: &HashMap<String, String>) -> HttpResponse {
     let Some(id) = params.get("id").and_then(|value| value.parse::<i64>().ok()) else {
-        return json_error(400, "Bad Request", "Missing or invalid row id.");
+        return error_json(400, "Bad Request", "Missing or invalid row id.");
     };
-    match with_db(state, |db| {
+    respond(with_db(state, |db| {
         let card = db.record_card(id).map_err(|err| err.to_string())?;
         let mut fields: Vec<Value> = card
             .fields
             .iter()
             .map(|(label, value)| json!({ "label": label, "value": value }))
             .collect();
-        // Extra (unmapped) columns from differently shaped files, shown after the
-        // known fields and flagged so the UI can mark them.
+        // Extra (unmapped) columns from differently shaped files, flagged so the
+        // UI can mark them.
         for (label, value) in &card.extra {
             fields.push(json!({ "label": label, "value": value, "extra": true }));
         }
@@ -513,30 +605,28 @@ fn api_card(state: &WebState, params: &HashMap<String, String>) -> HttpResponse 
             "source_file": card.source_file,
             "fields": fields,
         }))
-    }) {
-        Ok(value) => json_response(value),
-        Err(err) => json_error(500, "Internal Server Error", &err),
-    }
+    }))
 }
 
 fn api_analytics(state: &WebState, params: &HashMap<String, String>) -> HttpResponse {
-    let q = query_from_params(params);
-    if !analytics_should_run(&q) {
-        return json_response(json!({
-            "ok": true,
-            "needs_query": true,
-            "message": "Enter a query or filter to build analytics.",
-        }));
+    let query = query_from_params(params);
+    if !analytics_should_run(&query) {
+        return json_ok(needs_query("Enter a query or filter to build analytics."));
     }
-
     let limit = parse_u64(params, "limit", 10).clamp(1, MAX_ANALYTICS_LIMIT);
     let hs_level = parse_u64(params, "hs_level", 10).clamp(2, 10) as u8;
-    let scope = params.get("scope").and_then(|value| parse_scope(value));
+    let scope_param = params.get("scope").map(String::as_str);
     let started = Instant::now();
-    match with_db(state, |db| {
-        let analytics = match scope {
-            Some(scope) => db.analytics_scoped(&q, limit, Some(scope), hs_level),
-            None => db.analytics(&q, limit),
+    respond(with_db(state, |db| {
+        // `scope=overview` computes only the overview + monthly dynamics (cheap);
+        // a concrete scope computes that one category; no scope computes them all.
+        let analytics = match scope_param {
+            Some("overview") => db.analytics_scoped(&query, limit, None, hs_level),
+            Some(other) => match parse_scope(other) {
+                Some(scope) => db.analytics_scoped(&query, limit, Some(scope), hs_level),
+                None => db.analytics(&query, limit),
+            },
+            None => db.analytics(&query, limit),
         }
         .map_err(|err| err.to_string())?;
         Ok(json!({
@@ -545,110 +635,23 @@ fn api_analytics(state: &WebState, params: &HashMap<String, String>) -> HttpResp
             "elapsed_ms": started.elapsed().as_millis() as u64,
             "analytics": analytics_json(&analytics),
         }))
-    }) {
-        Ok(value) => json_response(value),
-        Err(err) => json_error(500, "Internal Server Error", &err),
-    }
+    }))
 }
 
-fn api_company(state: &WebState, params: &HashMap<String, String>) -> HttpResponse {
-    let edrpou = params
-        .get("edrpou")
-        .map(String::as_str)
-        .unwrap_or("")
-        .trim();
-    if edrpou.is_empty() {
-        return json_error(400, "Bad Request", "Missing EDRPOU.");
-    }
-    let limit = parse_u64(params, "limit", 10).clamp(1, MAX_ANALYTICS_LIMIT);
-    match with_db(state, |db| {
-        let profile = db
-            .company_profile(edrpou, limit)
-            .map_err(|err| err.to_string())?;
-        Ok(json!({
-            "ok": true,
-            "profile": company_profile_json(&profile),
-        }))
-    }) {
-        Ok(value) => json_response(value),
-        Err(err) => json_error(500, "Internal Server Error", &err),
-    }
-}
-
-fn api_pivot(state: &WebState, params: &HashMap<String, String>) -> HttpResponse {
-    let q = query_from_params(params);
-    if !analytics_should_run(&q) {
-        return json_response(json!({
-            "ok": true,
-            "needs_query": true,
-            "message": "Enter a query or filter to build the pivot table.",
-        }));
-    }
-    let row_dim = params
-        .get("row")
-        .and_then(|value| parse_pivot_dim(value))
-        .unwrap_or(PivotDim::Recipient);
-    let col_dim = params
-        .get("col")
-        .and_then(|value| parse_pivot_dim(value))
-        .unwrap_or(PivotDim::Month);
-    let metric = params
-        .get("metric")
-        .and_then(|value| parse_pivot_metric(value))
-        .unwrap_or(PivotMetric::Value);
-    match with_db(state, |db| {
-        let pivot = db
-            .pivot(
-                &q,
-                row_dim,
-                col_dim,
-                metric,
-                PivotLimits { rows: 25, cols: 18 },
-                "Other",
-            )
-            .map_err(|err| err.to_string())?;
-        Ok(json!({
-            "ok": true,
-            "pivot": {
-                "row_labels": pivot.row_labels,
-                "col_labels": pivot.col_labels,
-                "cells": pivot.cells,
-                "row_totals": pivot.row_totals,
-                "col_totals": pivot.col_totals,
-                "grand_total": pivot.grand_total,
-                "rows_truncated": pivot.rows_truncated,
-                "cols_truncated": pivot.cols_truncated,
-            }
-        }))
-    }) {
-        Ok(value) => json_response(value),
-        Err(err) => json_error(500, "Internal Server Error", &err),
-    }
-}
-
-/// Full grouped list for one analytics section — the "show all" drill-down,
-/// not just the top N. Sorting/filtering happens client-side.
 fn api_section(state: &WebState, params: &HashMap<String, String>) -> HttpResponse {
-    let q = query_from_params(params);
-    if !analytics_should_run(&q) {
-        return json_response(json!({
-            "ok": true,
-            "needs_query": true,
-            "message": "Enter a query or filter to build the list.",
-        }));
+    let query = query_from_params(params);
+    if !analytics_should_run(&query) {
+        return json_ok(needs_query("Enter a query or filter to build the list."));
     }
-    let Some(kind) = params
-        .get("kind")
-        .and_then(|value| parse_section_kind(value))
-    else {
-        return json_error(400, "Bad Request", "Unknown section kind.");
+    let Some(kind) = params.get("kind").and_then(|v| parse_section_kind(v)) else {
+        return error_json(400, "Bad Request", "Unknown section kind.");
     };
     let hs_level = parse_u64(params, "hs_level", 10).clamp(2, 10) as u8;
     let limit = parse_u64(params, "limit", MAX_SECTION_LIMIT).clamp(1, MAX_SECTION_LIMIT);
     let started = Instant::now();
-    match with_db(state, |db| {
+    respond(with_db(state, |db| {
         let section = db
-            .analytics_section(&q, kind, hs_level, limit)
+            .analytics_section(&query, kind, hs_level, limit)
             .map_err(|err| err.to_string())?;
         let limited = section.rows.len() as u64 >= limit;
         Ok(json!({
@@ -661,14 +664,114 @@ fn api_section(state: &WebState, params: &HashMap<String, String>) -> HttpRespon
             "elapsed_ms": started.elapsed().as_millis() as u64,
             "rows": section.rows.iter().map(group_row_json).collect::<Vec<_>>(),
         }))
+    }))
+}
+
+fn api_company(state: &WebState, params: &HashMap<String, String>) -> HttpResponse {
+    let edrpou = params
+        .get("edrpou")
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim();
+    if edrpou.is_empty() {
+        return error_json(400, "Bad Request", "Missing EDRPOU.");
+    }
+    let limit = parse_u64(params, "limit", 10).clamp(1, MAX_ANALYTICS_LIMIT);
+    respond(with_db(state, |db| {
+        let profile = db
+            .company_profile(edrpou, limit)
+            .map_err(|err| err.to_string())?;
+        Ok(json!({ "ok": true, "profile": company_profile_json(&profile) }))
+    }))
+}
+
+fn api_pivot(state: &WebState, params: &HashMap<String, String>) -> HttpResponse {
+    let query = query_from_params(params);
+    if !analytics_should_run(&query) {
+        return json_ok(needs_query(
+            "Enter a query or filter to build the pivot table.",
+        ));
+    }
+    let row_dim = params
+        .get("row")
+        .and_then(|v| parse_pivot_dim(v))
+        .unwrap_or(PivotDim::Recipient);
+    let col_dim = params
+        .get("col")
+        .and_then(|v| parse_pivot_dim(v))
+        .unwrap_or(PivotDim::Month);
+    let metric = params
+        .get("metric")
+        .and_then(|v| parse_pivot_metric(v))
+        .unwrap_or(PivotMetric::Value);
+    respond(with_db(state, |db| {
+        let pivot = db
+            .pivot(
+                &query,
+                row_dim,
+                col_dim,
+                metric,
+                PivotLimits { rows: 25, cols: 18 },
+                "Other",
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(json!({
+            "ok": true,
+            "needs_query": false,
+            "pivot": {
+                "row_labels": pivot.row_labels,
+                "col_labels": pivot.col_labels,
+                "cells": pivot.cells,
+                "row_totals": pivot.row_totals,
+                "col_totals": pivot.col_totals,
+                "grand_total": pivot.grand_total,
+                "rows_truncated": pivot.rows_truncated,
+                "cols_truncated": pivot.cols_truncated,
+            }
+        }))
+    }))
+}
+
+fn api_export_csv(state: &WebState, params: &HashMap<String, String>) -> HttpResponse {
+    let query = query_from_params(params);
+    let limit = parse_u64(params, "limit", DEFAULT_SEARCH_LIMIT).clamp(1, MAX_SEARCH_LIMIT);
+    let page = parse_u64(params, "page", 0);
+    let offset = page.saturating_mul(limit);
+    match with_db(state, |db| {
+        let (_ids, rows, _dups) = db
+            .search_page(&query, limit, offset)
+            .map_err(|err| err.to_string())?;
+        let mut csv = String::from('\u{feff}');
+        csv.push_str(
+            &RESULT_COLUMNS
+                .iter()
+                .map(|name| csv_cell(header_for(name)))
+                .collect::<Vec<_>>()
+                .join(";"),
+        );
+        csv.push_str("\r\n");
+        for row in rows {
+            csv.push_str(
+                &row.iter()
+                    .map(|v| csv_cell(v))
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            );
+            csv.push_str("\r\n");
+        }
+        Ok(csv)
     }) {
-        Ok(value) => json_response(value),
-        Err(err) => json_error(500, "Internal Server Error", &err),
+        Ok(csv) => HttpResponse::new(200, "OK", "text/csv; charset=utf-8", csv.into_bytes())
+            .header(
+                "Content-Disposition",
+                "attachment; filename=\"base-search-page.csv\"",
+            ),
+        Err(err) => error_json(500, "Internal Server Error", &err),
     }
 }
 
-/// Translated UI strings and the language list, so the browser interface can
-/// switch language using the same translations as the desktop app.
+/// Translated UI strings and the language list, so the browser interface uses the
+/// same translations as the desktop app.
 fn api_i18n(params: &HashMap<String, String>) -> HttpResponse {
     let lang = Lang::from_code(params.get("lang").map(String::as_str).unwrap_or("en"));
     let t = tr(lang);
@@ -749,7 +852,7 @@ fn api_i18n(params: &HashMap<String, String>) -> HttpResponse {
         .iter()
         .map(|(k, v)| ((*k).to_string(), Value::from(*v)))
         .collect();
-    json_response(json!({
+    json_ok(json!({
         "ok": true,
         "lang": lang.code(),
         "languages": languages,
@@ -758,54 +861,18 @@ fn api_i18n(params: &HashMap<String, String>) -> HttpResponse {
     }))
 }
 
-fn api_export_page_csv(state: &WebState, params: &HashMap<String, String>) -> HttpResponse {
-    let q = query_from_params(params);
-    let limit = parse_u64(params, "limit", DEFAULT_SEARCH_LIMIT).clamp(1, MAX_SEARCH_LIMIT);
-    let page = parse_u64(params, "page", 0);
-    let offset = page.saturating_mul(limit);
-    match with_db(state, |db| {
-        let (_ids, rows, _dups) = db
-            .search_page(&q, limit, offset)
-            .map_err(|err| err.to_string())?;
-        let mut csv = String::from('\u{feff}');
-        csv.push_str(
-            &RESULT_COLUMNS
-                .iter()
-                .map(|name| csv_cell(header_for(name)))
-                .collect::<Vec<_>>()
-                .join(";"),
-        );
-        csv.push_str("\r\n");
-        for row in rows {
-            csv.push_str(
-                &row.iter()
-                    .map(|value| csv_cell(value))
-                    .collect::<Vec<_>>()
-                    .join(";"),
-            );
-            csv.push_str("\r\n");
-        }
-        Ok(csv)
-    }) {
-        Ok(csv) => HttpResponse::new(200, "OK", "text/csv; charset=utf-8", csv.into_bytes())
-            .with_header(
-                "Content-Disposition",
-                "attachment; filename=\"base-search-page.csv\"",
-            ),
-        Err(err) => json_error(500, "Internal Server Error", &err),
-    }
+// ---------------------------------------------------------------------------
+// JSON serialization of analytics structures
+// ---------------------------------------------------------------------------
+
+fn needs_query(message: &str) -> Value {
+    json!({ "ok": true, "needs_query": true, "message": message })
 }
 
 fn analytics_json(analytics: &Analytics) -> Value {
     json!({
         "overview": overview_json(&analytics.overview),
-        "months": analytics.months.iter().map(|row| json!({
-            "month": &row.month,
-            "rows": row.rows,
-            "declarations": row.declarations,
-            "total_value_usd": row.total_value_usd,
-            "total_net_kg": row.total_net_kg,
-        })).collect::<Vec<_>>(),
+        "months": analytics.months.iter().map(month_json).collect::<Vec<_>>(),
         "company_sections": sections_json(&analytics.company_sections),
         "product_sections": sections_json(&analytics.product_sections),
         "country_sections": sections_json(&analytics.country_sections),
@@ -818,17 +885,21 @@ fn company_profile_json(profile: &CompanyProfile) -> Value {
         "edrpou": &profile.edrpou,
         "names": &profile.names,
         "overview": overview_json(&profile.overview),
-        "months": profile.months.iter().map(|row| json!({
-            "month": &row.month,
-            "rows": row.rows,
-            "declarations": row.declarations,
-            "total_value_usd": row.total_value_usd,
-            "total_net_kg": row.total_net_kg,
-        })).collect::<Vec<_>>(),
+        "months": profile.months.iter().map(month_json).collect::<Vec<_>>(),
         "product_sections": sections_json(&profile.product_sections),
         "country_sections": sections_json(&profile.country_sections),
         "price_sections": price_metrics_json(&profile.price_sections),
         "top_senders": profile.top_senders.iter().map(group_row_json).collect::<Vec<_>>(),
+    })
+}
+
+fn month_json(row: &crate::db::AnalyticsMonthRow) -> Value {
+    json!({
+        "month": &row.month,
+        "rows": row.rows,
+        "declarations": row.declarations,
+        "total_value_usd": row.total_value_usd,
+        "total_net_kg": row.total_net_kg,
     })
 }
 
@@ -882,10 +953,7 @@ fn group_row_json(row: &AnalyticsGroupRow) -> Value {
 }
 
 fn filter_action_json(action: &AnalyticsFilterAction) -> Value {
-    json!({
-        "field": filter_field_id(action.field),
-        "value": &action.value,
-    })
+    json!({ "field": filter_field_id(action.field), "value": &action.value })
 }
 
 fn price_metrics_json(metrics: &[AnalyticsPriceMetric]) -> Vec<Value> {
@@ -908,6 +976,10 @@ fn price_metrics_json(metrics: &[AnalyticsPriceMetric]) -> Vec<Value> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Query + parameter parsing
+// ---------------------------------------------------------------------------
+
 fn query_from_params(params: &HashMap<String, String>) -> Query {
     Query {
         text: first_param(params, &["text", "q"]),
@@ -923,6 +995,7 @@ fn query_from_params(params: &HashMap<String, String>) -> Query {
             dispatch_country: first_param(params, &["dispatch_country", "dispatch"]),
             origin_country: first_param(params, &["origin_country", "origin"]),
         },
+        advanced: None,
     }
 }
 
@@ -940,7 +1013,7 @@ fn parse_u64(params: &HashMap<String, String>, key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn parse_query_string(query: &str) -> HashMap<String, String> {
+fn parse_query(query: &str) -> HashMap<String, String> {
     let mut params = HashMap::new();
     for pair in query.split('&').filter(|part| !part.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
@@ -950,8 +1023,8 @@ fn parse_query_string(query: &str) -> HashMap<String, String> {
 }
 
 fn percent_decode(value: &str) -> String {
-    let mut out = Vec::with_capacity(value.len());
     let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
@@ -960,12 +1033,15 @@ fn percent_decode(value: &str) -> String {
                 i += 1;
             }
             b'%' if i + 2 < bytes.len() => {
-                if let (Some(a), Some(b)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
-                    out.push((a << 4) | b);
-                    i += 3;
-                } else {
-                    out.push(bytes[i]);
-                    i += 1;
+                match (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                    (Some(a), Some(b)) => {
+                        out.push((a << 4) | b);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
                 }
             }
             b => {
@@ -974,7 +1050,7 @@ fn percent_decode(value: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).to_string()
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -986,13 +1062,20 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// Escapes a cell for `;`-separated CSV, neutralizing spreadsheet formula cells.
 fn csv_cell(value: &str) -> String {
+    let safe = csv_safe_cell(value);
+    let value = safe.as_ref();
     if value.contains(';') || value.contains('"') || value.contains('\n') || value.contains('\r') {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_string()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Enum <-> string mapping for query parameters and JSON
+// ---------------------------------------------------------------------------
 
 fn parse_scope(value: &str) -> Option<AnalyticsScope> {
     match value {
@@ -1121,13 +1204,13 @@ mod tests {
 
     #[test]
     fn query_params_map_to_search_query() {
-        let params = parse_query_string("q=Apple&year=2024&code=8517&origin=CN&recipient=Demo");
-        let q = query_from_params(&params);
-        assert_eq!(q.text, "Apple");
-        assert_eq!(q.filters.year, "2024");
-        assert_eq!(q.filters.product_code, "8517");
-        assert_eq!(q.filters.origin_country, "CN");
-        assert_eq!(q.filters.recipient, "Demo");
+        let params = parse_query("q=Apple&year=2024&code=8517&origin=CN&recipient=Demo");
+        let query = query_from_params(&params);
+        assert_eq!(query.text, "Apple");
+        assert_eq!(query.filters.year, "2024");
+        assert_eq!(query.filters.product_code, "8517");
+        assert_eq!(query.filters.origin_country, "CN");
+        assert_eq!(query.filters.recipient, "Demo");
     }
 
     #[test]
@@ -1135,5 +1218,49 @@ mod tests {
         assert_eq!(csv_cell("plain"), "plain");
         assert_eq!(csv_cell("a;b"), "\"a;b\"");
         assert_eq!(csv_cell("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn csv_export_neutralizes_formula_cells() {
+        assert_eq!(
+            csv_cell("=WEBSERVICE(\"x\")"),
+            "\"'=WEBSERVICE(\"\"x\"\")\""
+        );
+        assert_eq!(csv_cell("+SUM(1,1)"), "'+SUM(1,1)");
+    }
+
+    #[test]
+    fn loopback_host_validation_rejects_public_binds() {
+        assert!(validate_loopback_host("127.0.0.1").is_ok());
+        assert!(validate_loopback_host("::1").is_ok());
+        assert!(validate_loopback_host("localhost").is_ok());
+        assert!(validate_loopback_host("0.0.0.0").is_err());
+        assert!(validate_loopback_host("192.168.1.10").is_err());
+        assert!(validate_loopback_host("example.com").is_err());
+    }
+
+    #[test]
+    fn api_routes_require_the_session_token() {
+        let state = WebState {
+            db_path: PathBuf::from("unused.db"),
+            token: "secret".to_string(),
+        };
+        // Token in the query string is not accepted.
+        let request = parse_request("GET /api/schema?token=secret HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(route(&state, &request).status, 403);
+        // Token in the Authorization header is accepted.
+        let request =
+            parse_request("GET /api/schema HTTP/1.1\r\nAuthorization: Bearer secret\r\n\r\n")
+                .unwrap();
+        assert_eq!(route(&state, &request).status, 200);
+    }
+
+    #[test]
+    fn generated_tokens_are_random_hex() {
+        let first = make_token().unwrap();
+        let second = make_token().unwrap();
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_ne!(first, second);
     }
 }

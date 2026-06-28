@@ -1,761 +1,926 @@
-const tokenFromUrl = new URLSearchParams(location.search).get("token");
-if (tokenFromUrl) {
-  sessionStorage.setItem("baseSearchToken", tokenFromUrl);
-  history.replaceState(null, "", location.pathname);
-}
+// Base Search — local web client.
+// Vanilla JS, no dependencies. Talks to the local server over /api/*, sending
+// the per-session token (injected as window.__BASE_SEARCH_TOKEN) in the
+// Authorization header. Renders the monochrome glass UI defined in app.css.
+"use strict";
+(() => {
+  const TOKEN = window.__BASE_SEARCH_TOKEN || "";
+  const SVGNS = "http://www.w3.org/2000/svg";
 
-const state = {
-  token: sessionStorage.getItem("baseSearchToken") || "",
-  page: 0,
-  limit: 100,
-  hasNext: false,
-  columns: [],
-  columnIndex: new Map(),
-  rows: [],
-  activeTab: "results",
-  analyticsGroup: "overview",
-  lang: localStorage.getItem("baseSearchLang") || "en",
-  i18n: {},
-  languages: [],
-  langLabel: "Language",
-  section: null,
-};
+  // --------------------------------------------------------------- helpers
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
-const visibleColumns = [
-  "declaration_date",
-  "declaration_number",
-  "recipient",
-  "edrpou",
-  "sender",
-  "product_code",
-  "description",
-  "origin_country",
-  "dispatch_country",
-  "trade_country",
-  "currency_control_value",
-  "net_kg",
-  "rfv_usd_kg",
-  "trademark",
-  "source_file",
-];
-
-const numericColumns = new Set([
-  "quantity",
-  "gross_kg",
-  "net_kg",
-  "declaration_weight",
-  "currency_control_value",
-  "rfv_usd_kg",
-  "unit_weight",
-  "weight_difference",
-  "rmv_net_usd_kg",
-  "rmv_usd_extra_unit",
-  "rmv_gross_usd_kg",
-  "min_base_usd_kg",
-]);
-
-const fieldIds = [
-  "text",
-  "year",
-  "product_code",
-  "edrpou",
-  "trademark",
-  "recipient",
-  "sender",
-  "description",
-  "origin_country",
-  "dispatch_country",
-  "trade_country",
-];
-
-const PRICE_KEY = {
-  value_per_net_kg: "pm_value_per_net_kg",
-  rfv_usd_kg: "pm_rfv",
-  rmv_net_usd_kg: "pm_rmv_net",
-  rmv_usd_extra_unit: "pm_rmv_extra_unit",
-  rmv_gross_usd_kg: "pm_rmv_gross",
-  min_base_usd_kg: "pm_min_base",
-};
-
-const $ = (id) => document.getElementById(id);
-const fmtInt = new Intl.NumberFormat("uk-UA", { maximumFractionDigits: 0 });
-const fmtNum = new Intl.NumberFormat("uk-UA", { maximumFractionDigits: 2 });
-const fmtKg = new Intl.NumberFormat("uk-UA", { maximumFractionDigits: 3 });
-
-function esc(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
-
-/** Replaces sequential "{}" placeholders, like the Rust fmt helper. */
-function fmt(pattern, ...args) {
-  let i = 0;
-  return String(pattern ?? "").replace(/\{\}/g, () => (args[i++] ?? ""));
-}
-
-function t(key, fallback) {
-  return (state.i18n && state.i18n[key]) || fallback || key;
-}
-
-function toast(message) {
-  const node = $("toast");
-  node.textContent = message;
-  node.classList.add("show");
-  clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => node.classList.remove("show"), 3400);
-}
-
-function cleanParams(params) {
-  const out = {};
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== null && String(value).trim() !== "") {
-      out[key] = String(value).trim();
+  function el(tag, attrs = {}, children = []) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (v == null || v === false) continue;
+      if (k === "class") node.className = v;
+      else if (k === "text") node.textContent = v;
+      else if (k === "html") node.innerHTML = v;
+      else if (k === "dataset") Object.assign(node.dataset, v);
+      else if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2), v);
+      else node.setAttribute(k, v);
     }
-  }
-  return out;
-}
-
-async function api(path, params = {}) {
-  if (!state.token) {
-    throw new Error("No local session token. Restart browser mode.");
-  }
-  const query = new URLSearchParams(cleanParams(params)).toString();
-  const url = query ? `${path}?${query}` : path;
-  const response = await fetch(url, {
-    cache: "no-store",
-    headers: { Authorization: `Bearer ${state.token}` },
-  });
-  const data = await response.json();
-  if (!response.ok || data.ok === false) {
-    throw new Error(data.error || `HTTP ${response.status}`);
-  }
-  return data;
-}
-
-function collectQuery() {
-  const query = {};
-  for (const id of fieldIds) {
-    query[id] = $(id).value.trim();
-  }
-  return query;
-}
-
-function queryIsEmpty(query = collectQuery()) {
-  return Object.values(query).every((value) => !value);
-}
-
-function queryWithPaging(extra = {}) {
-  return { ...collectQuery(), page: state.page, limit: state.limit, ...extra };
-}
-
-function cell(row, columnName) {
-  const index = state.columnIndex.get(columnName);
-  return index === undefined ? "" : row.cells[index] || "";
-}
-
-function columnLabel(name) {
-  return state.columns.find((col) => col.name === name)?.label || name;
-}
-
-function sectionTitle(kind, fallback) {
-  return t(`sec_${kind}`, fallback);
-}
-
-function priceTitle(kind, fallback) {
-  return t(PRICE_KEY[kind] || "", fallback);
-}
-
-/* ---------- i18n ---------- */
-async function loadI18n() {
-  const data = await api("/api/i18n", { lang: state.lang });
-  state.lang = data.lang || state.lang;
-  localStorage.setItem("baseSearchLang", state.lang);
-  state.i18n = data.strings || {};
-  state.languages = data.languages || [];
-  state.langLabel = data.language_label || "Language";
-  applyI18n();
-  buildLangSelect();
-}
-
-function applyI18n() {
-  document.documentElement.lang = state.lang === "ua" ? "uk" : state.lang;
-  for (const el of document.querySelectorAll("[data-i18n]")) {
-    const value = state.i18n[el.dataset.i18n];
-    if (value) el.textContent = value;
-  }
-  for (const el of document.querySelectorAll("[data-i18n-ph]")) {
-    const value = state.i18n[el.dataset.i18nPh];
-    if (value) el.placeholder = value;
-  }
-}
-
-function buildLangSelect() {
-  const select = $("lang-select");
-  select.title = state.langLabel;
-  select.innerHTML = state.languages
-    .map(
-      (l) => `<option value="${esc(l.code)}"${l.code === state.lang ? " selected" : ""}>${esc(l.label)}</option>`,
-    )
-    .join("");
-}
-
-async function onLangChange() {
-  state.lang = $("lang-select").value;
-  localStorage.setItem("baseSearchLang", state.lang);
-  await loadI18n();
-  await loadStats();
-  renderTable();
-  if (!queryIsEmpty()) {
-    $("results-meta").textContent = "";
-  }
-  if (state.activeTab === "analytics") loadAnalytics();
-}
-
-/* ---------- schema / stats ---------- */
-async function loadSchema() {
-  const data = await api("/api/schema");
-  state.columns = data.columns;
-  state.columnIndex = new Map(data.columns.map((column, index) => [column.name, index]));
-  renderTable();
-}
-
-async function loadStats() {
-  const data = await api("/api/stats");
-  let label = fmt(t("db_rows", "Database: {} rows"), fmtInt.format(data.total_rows));
-  if (data.unindexed_rows > 0) label += ` · +${fmtInt.format(data.unindexed_rows)}`;
-  $("db-status").textContent = label;
-}
-
-/* ---------- search / results ---------- */
-async function search(resetPage = true) {
-  if (resetPage) state.page = 0;
-  $("results-meta").textContent = t("searching", "…");
-  try {
-    const data = await api("/api/search", queryWithPaging());
-    state.rows = data.rows || [];
-    state.hasNext = Boolean(data.has_next);
-    $("results-meta").textContent =
-      `${fmtInt.format(state.rows.length)} · ${fmt(t("search_ms", "in {} ms"), fmtInt.format(data.elapsed_ms))}`;
-    $("page-label").textContent = String(state.page + 1);
-    $("prev-page").disabled = state.page === 0;
-    $("next-page").disabled = !state.hasNext;
-    renderTable();
-    if (state.activeTab === "analytics") loadAnalytics();
-  } catch (err) {
-    $("results-meta").textContent = err.message;
-    toast(err.message);
-  }
-}
-
-function renderTable() {
-  const table = $("results-table");
-  const head = table.querySelector("thead");
-  const body = table.querySelector("tbody");
-  const columns = visibleColumns.filter((name) => state.columnIndex.has(name));
-  head.innerHTML = `<tr>${columns
-    .map((name) => {
-      const cls = numericColumns.has(name) ? ' class="num"' : "";
-      return `<th${cls} title="${esc(columnLabel(name))}">${esc(columnLabel(name))}</th>`;
-    })
-    .join("")}</tr>`;
-
-  if (!state.rows.length) {
-    body.innerHTML = `<tr><td class="empty" colspan="${columns.length || 1}">${esc(t("nothing_found", "—"))}</td></tr>`;
-    return;
-  }
-
-  body.innerHTML = "";
-  for (const row of state.rows) {
-    const tr = document.createElement("tr");
-    if (row.duplicate_of) {
-      tr.classList.add("duplicate");
-      tr.title = fmt(t("dup_first_seen", "First seen in: {}"), row.duplicate_of);
+    for (const c of [].concat(children)) {
+      if (c == null || c === false) continue;
+      node.appendChild(typeof c === "object" ? c : document.createTextNode(String(c)));
     }
-    tr.addEventListener("click", () => openCard(row.id));
-    for (const name of columns) {
-      const td = document.createElement("td");
-      td.textContent = cell(row, name);
-      if (!tr.classList.contains("duplicate")) td.title = td.textContent;
-      if (numericColumns.has(name)) td.classList.add("num");
-      if (name === "product_code" || name === "edrpou") td.classList.add("code");
-      tr.appendChild(td);
-    }
-    body.appendChild(tr);
+    return node;
   }
-}
 
-/* ---------- drawer (record card / company) ---------- */
-function openDrawer() {
-  $("drawer").classList.add("open");
-  $("drawer").setAttribute("aria-hidden", "false");
-  $("backdrop").classList.add("show");
-}
+  function icon(id, cls = "ic") {
+    const svg = document.createElementNS(SVGNS, "svg");
+    svg.setAttribute("class", cls);
+    const use = document.createElementNS(SVGNS, "use");
+    use.setAttribute("href", "#" + id);
+    svg.appendChild(use);
+    return svg;
+  }
 
-function closeDrawer() {
-  $("drawer").classList.remove("open");
-  $("drawer").setAttribute("aria-hidden", "true");
-  if (!$("modal").classList.contains("show")) $("backdrop").classList.remove("show");
-}
+  const enUS = "en-US";
+  const fmtInt = (n) => Math.round(Number(n) || 0).toLocaleString(enUS);
+  function fmtCompact(n) {
+    n = Number(n) || 0;
+    const a = Math.abs(n);
+    if (a >= 1e9) return (n / 1e9).toFixed(2) + "B";
+    if (a >= 1e6) return (n / 1e6).toFixed(2) + "M";
+    if (a >= 1e3) return (n / 1e3).toFixed(1) + "k";
+    return Math.round(n).toLocaleString(enUS);
+  }
+  const fmtMoney = (n) => "$" + fmtCompact(n);
+  function fmtPrice(n) {
+    n = Number(n) || 0;
+    return n >= 100 ? n.toFixed(0) : n.toFixed(2);
+  }
+  const t = (key, fallback) => state.strings[key] || fallback || key;
 
-async function openCard(id) {
-  try {
-    const data = await api("/api/card", { id });
-    $("drawer-title").textContent = `${t("details", "Картка")} #${id}`;
-    $("drawer-subtitle").textContent = data.source_file || "";
-    $("drawer-body").innerHTML = data.fields
-      .map((field) => {
-        const value = esc(field.value || "");
-        const profile =
-          field.label.includes("ЕДРПОУ") && field.value
-            ? `<button class="profile-button" data-edrpou="${esc(field.value)}" type="button">${esc(t("company_profile", "Профіль"))}</button>`
-            : "";
-        return `<div class="field"><div class="field-label">${esc(field.label)}</div><div class="field-value">${value || "&nbsp;"}</div>${profile}</div>`;
-      })
-      .join("");
-    openDrawer();
-    for (const button of document.querySelectorAll(".profile-button")) {
-      button.addEventListener("click", (event) => {
-        event.stopPropagation();
-        openCompany(button.dataset.edrpou);
+  function debounce(fn, ms) {
+    let h;
+    return (...a) => { clearTimeout(h); h = setTimeout(() => fn(...a), ms); };
+  }
+
+  async function api(path, params = {}) {
+    const url = new URL(path, location.origin);
+    for (const [k, v] of Object.entries(params)) {
+      if (v != null && v !== "") url.searchParams.set(k, v);
+    }
+    const res = await fetch(url, { headers: { Authorization: "Bearer " + TOKEN } });
+    if (!res.ok) {
+      let msg = res.status + " " + res.statusText;
+      try { const j = await res.json(); if (j && j.error) msg = j.error; } catch (e) { /* ignore */ }
+      throw new Error(msg);
+    }
+    return res.json();
+  }
+
+  // --------------------------------------------------------------- state
+  const FILTER_FIELDS = [
+    ["year", "2024"], ["product_code", "8517"], ["edrpou", "12345678"],
+    ["trademark", "Apple"], ["recipient", "—"], ["sender", "—"],
+    ["description", "iPhone…"], ["origin_country", "CN"],
+    ["dispatch_country", "PL"], ["trade_country", "IE"],
+  ];
+
+  // Column display order in the results grid (sensible first; the rest follow).
+  const PREFERRED_COLS = [
+    "declaration_date", "declaration_number", "recipient", "edrpou", "sender",
+    "product_code", "description", "trademark", "currency_control_value",
+    "net_kg", "gross_kg", "quantity", "unit", "origin_country",
+    "dispatch_country", "trade_country", "rfv_usd_kg", "source_file",
+  ];
+  const NUM_COLS = new Set([
+    "item_number", "quantity", "gross_kg", "net_kg", "declaration_weight",
+    "currency_control_value", "field_43", "field_43_01", "rfv_usd_kg",
+    "unit_weight", "weight_difference", "field_3001", "field_3002", "field_9610",
+    "rmv_net_usd_kg", "rmv_usd_extra_unit", "rmv_gross_usd_kg", "min_base_usd_kg",
+    "min_base_difference", "preferential", "full_rate",
+  ]);
+  const MONO_COLS = new Set(["declaration_number", "product_code", "edrpou"]);
+  const COUNTRY_COLS = new Set(["origin_country", "dispatch_country", "trade_country"]);
+
+  const state = {
+    schema: [], colOrder: [], colIndex: {}, strings: {}, lang: "en",
+    query: { text: "", filters: {} },
+    page: 0, hasNext: false, shown: 0, total: null, searchGen: 0,
+    tab: "results", group: "overview", anLimit: 10,
+    an: null, anLoaded: new Set(), anGen: 0,
+    pivot: { row: "recipient", col: "month", metric: "value" },
+    busyCount: 0,
+  };
+
+  // --------------------------------------------------------------- busy + toast
+  function busy(on) {
+    state.busyCount = Math.max(0, state.busyCount + (on ? 1 : -1));
+    $("#busy-bar").hidden = state.busyCount === 0;
+  }
+  let toastTimer;
+  function toast(msg, isError) {
+    const node = $("#toast");
+    node.textContent = msg;
+    node.classList.toggle("error", !!isError);
+    node.hidden = false;
+    requestAnimationFrame(() => node.classList.add("show"));
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+      node.classList.remove("show");
+      setTimeout(() => { node.hidden = true; }, 260);
+    }, isError ? 5200 : 2600);
+  }
+
+  // --------------------------------------------------------------- i18n + theme
+  function applyStrings() {
+    $$("[data-i18n]").forEach((n) => {
+      const v = state.strings[n.dataset.i18n];
+      if (v) n.textContent = v;
+    });
+    $$("[data-i18n-ph]").forEach((n) => {
+      const v = state.strings[n.dataset.i18nPh];
+      if (v) n.setAttribute("placeholder", v);
+    });
+  }
+
+  async function loadI18n(lang) {
+    const data = await api("/api/i18n", { lang });
+    state.lang = data.lang;
+    state.strings = data.strings || {};
+    document.documentElement.lang = data.lang;
+    const sel = $("#lang-select");
+    if (!sel.options.length) {
+      (data.languages || []).forEach((l) => sel.appendChild(el("option", { value: l.code, text: l.label })));
+    }
+    sel.value = data.lang;
+    applyStrings();
+    buildFilters();
+  }
+
+  function applyTheme(theme) {
+    document.documentElement.dataset.theme = theme;
+    try { localStorage.setItem("bs-theme", theme); } catch (e) { /* ignore */ }
+    const use = $("#theme-toggle use");
+    if (use) use.setAttribute("href", theme === "dark" ? "#i-moon" : "#i-sun");
+  }
+
+  // --------------------------------------------------------------- filters
+  function buildFilters() {
+    const wrap = $("#filter-fields");
+    wrap.textContent = "";
+    for (const [name, ph] of FILTER_FIELDS) {
+      const input = el("input", {
+        id: "f-" + name, value: state.query.filters[name] || "",
+        placeholder: ph, autocomplete: "off", spellcheck: "false",
+        oninput: onFilterInput, onchange: () => runSearch(true),
       });
+      input.dataset.field = name;
+      wrap.appendChild(el("label", { class: "field" }, [
+        el("span", { text: t(name, name) }), input,
+      ]));
     }
-  } catch (err) {
-    toast(err.message);
+    syncFilterChrome();
   }
-}
 
-async function openCompany(edrpou) {
-  if (!edrpou) return;
-  try {
-    const data = await api("/api/company", { edrpou, limit: 10 });
-    const profile = data.profile;
-    $("drawer-title").textContent = `${t("company_profile", "Компанія")} ${profile.edrpou}`;
-    $("drawer-subtitle").textContent = (profile.names || []).join(" · ");
-    $("drawer-body").innerHTML = `
-      <div class="kpi-grid drawer-kpis">${kpiHtml(profile.overview)}</div>
-      ${sectionsHtml(profile.product_sections || [], false)}
-      ${sectionsHtml(profile.country_sections || [], false)}
-      ${pricesHtml(profile.price_sections || [])}`;
-    openDrawer();
-  } catch (err) {
-    toast(err.message);
-  }
-}
+  const onFilterInput = debounce((e) => {
+    state.query.filters[e.target.dataset.field] = e.target.value.trim();
+    syncFilterChrome();
+    runSearch(true);
+  }, 350);
 
-/* ---------- analytics ---------- */
-async function loadAnalytics() {
-  const query = collectQuery();
-  const scroll = $("analytics-scroll");
-  if (queryIsEmpty(query)) {
-    $("analytics-meta").textContent = t("analytics_hint", "—");
-    scroll.innerHTML = `<div class="empty">${esc(t("analytics_hint", "—"))}</div>`;
-    return;
+  function syncFilterChrome() {
+    let count = 0;
+    for (const [name] of FILTER_FIELDS) {
+      const input = $("#f-" + name);
+      const filled = !!(state.query.filters[name] || "").trim();
+      if (input) input.parentElement.classList.toggle("filled", filled);
+      if (filled) count++;
+    }
+    const badge = $("#filters-count");
+    badge.textContent = count;
+    badge.hidden = count === 0;
   }
-  $("analytics-meta").textContent = t("searching", "…");
-  try {
-    const data = await api("/api/analytics", {
-      ...query,
-      limit: $("analytics-limit").value,
-      hs_level: 10,
+
+  function clearFilters() {
+    state.query.filters = {};
+    for (const [name] of FILTER_FIELDS) { const i = $("#f-" + name); if (i) i.value = ""; }
+    syncFilterChrome();
+    runSearch(true);
+  }
+
+  function applyFilterAction(action) {
+    if (!action) return;
+    state.query.filters[action.field] = action.value;
+    const input = $("#f-" + action.field);
+    if (input) input.value = action.value;
+    syncFilterChrome();
+    switchTab("results");
+    runSearch(true);
+  }
+
+  // --------------------------------------------------------------- search
+  function currentParams(extra = {}) {
+    return Object.assign({ text: state.query.text }, state.query.filters, extra);
+  }
+
+  const runSearchDebounced = debounce(() => runSearch(true), 380);
+
+  async function runSearch(resetPage) {
+    if (resetPage) state.page = 0;
+    state.an = null;
+    state.anLoaded.clear();
+    state.anGen++;
+    const gen = ++state.searchGen;
+    state.total = null;
+    renderActiveFilters();
+    if (state.tab === "analytics") loadAnalytics();
+    busy(true);
+    try {
+      const data = await api("/api/search", currentParams({ page: state.page, limit: 100 }));
+      if (gen !== state.searchGen) return;
+      state.hasNext = data.has_next;
+      state.shown = data.rows.length;
+      renderResults(data);
+      $("#tab-meta").textContent = `${data.elapsed_ms} ms`;
+      updateResultsMeta();
+      updatePager();
+      fetchCount(gen);
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      busy(false);
+    }
+  }
+
+  // The exact total is fetched separately so paging stays instant; it fills in
+  // a moment later and is ignored if the query has already changed.
+  async function fetchCount(gen) {
+    try {
+      const data = await api("/api/count", currentParams());
+      if (gen !== state.searchGen) return;
+      state.total = data.total;
+      updateResultsMeta();
+      updatePager();
+    } catch (e) { /* count is a non-critical enhancement */ }
+  }
+
+  function updateResultsMeta() {
+    const meta = $("#results-meta");
+    if (!state.shown) { meta.textContent = state.total === 0 ? t("nothing_found", "Nothing found.") : ""; return; }
+    const start = state.page * 100 + 1;
+    const end = state.page * 100 + state.shown;
+    const range = `${fmtInt(start)}–${fmtInt(end)}`;
+    meta.textContent = state.total != null
+      ? `${range} ${t("of_label", "of")} ${fmtInt(state.total)} ${t("rows_label", "rows")}`
+      : `${range}${state.hasNext ? "+" : ""} ${t("rows_label", "rows")}`;
+  }
+
+  function renderActiveFilters() {
+    const bar = $("#active-filters");
+    bar.textContent = "";
+    const chips = [];
+    if (state.query.text.trim()) chips.push(["__text", state.query.text.trim()]);
+    for (const [name] of FILTER_FIELDS) {
+      const v = (state.query.filters[name] || "").trim();
+      if (v) chips.push([name, v]);
+    }
+    if (!chips.length) { bar.hidden = true; return; }
+    bar.hidden = false;
+    chips.forEach(([key, val]) => {
+      const isText = key === "__text";
+      const chip = el("span", { class: "fchip" }, [
+        isText ? icon("i-search", "ic fchip-ic") : el("span", { class: "fchip-k", text: t(key, key) }),
+        el("span", { class: "fchip-v", text: val, title: val }),
+        el("button", { class: "fchip-x", type: "button", "aria-label": "Remove", onclick: () => removeFilter(key) }, [icon("i-x")]),
+      ]);
+      bar.appendChild(chip);
     });
-    if (data.needs_query) {
-      $("analytics-meta").textContent = data.message;
-      scroll.innerHTML = `<div class="empty">${esc(data.message)}</div>`;
+    bar.appendChild(el("button", { class: "fchip-clear", type: "button", onclick: clearAllQuery }, [t("clear_filters", "Clear all")]));
+  }
+
+  function removeFilter(key) {
+    if (key === "__text") {
+      state.query.text = ""; $("#q").value = ""; $("#clear-q").hidden = true;
+    } else {
+      state.query.filters[key] = ""; const i = $("#f-" + key); if (i) i.value = "";
+    }
+    syncFilterChrome();
+    runSearch(true);
+  }
+
+  function clearAllQuery() {
+    state.query.text = ""; $("#q").value = ""; $("#clear-q").hidden = true;
+    state.query.filters = {};
+    for (const [name] of FILTER_FIELDS) { const i = $("#f-" + name); if (i) i.value = ""; }
+    syncFilterChrome();
+    runSearch(true);
+  }
+
+  function orderedColumns() {
+    if (state.colOrder.length) return state.colOrder;
+    const byName = {};
+    state.schema.forEach((c, i) => { byName[c.name] = i; state.colIndex[c.name] = i; });
+    const seen = new Set();
+    const order = [];
+    for (const name of PREFERRED_COLS) {
+      if (name in byName) { order.push(byName[name]); seen.add(name); }
+    }
+    state.schema.forEach((c, i) => { if (!seen.has(c.name)) order.push(i); });
+    state.colOrder = order;
+    return order;
+  }
+
+  function renderResults(data) {
+    const table = $("#results-table");
+    const thead = table.tHead, tbody = table.tBodies[0];
+    const ph = $("#results-placeholder");
+    thead.textContent = ""; tbody.textContent = "";
+
+    if (!data.rows.length) {
+      ph.textContent = t("nothing_found", "Nothing found.");
+      ph.classList.add("center");
+      updatePager();
       return;
     }
-    const a = data.analytics;
-    $("analytics-meta").textContent = fmt(t("search_ms", "in {} ms"), fmtInt.format(data.elapsed_ms));
-    const grid = (label, inner) =>
-      inner.trim()
-        ? `<div class="analytics-grid">${inner}</div>`
-        : `<div class="empty">${esc(label)}</div>`;
-    scroll.innerHTML = `
-      <div class="analytics-group" data-group="overview">
-        <div class="kpi-grid">${kpiHtml(a.overview)}</div>
-        <div class="block-title">${esc(t("months_section", "Динаміка за місяцями"))}</div>
-        <div class="month-chart">${monthsHtml(a.months || [])}</div>
-      </div>
-      <div class="analytics-group" data-group="companies">${grid(t("nothing_found", "—"), sectionsHtml(a.company_sections || []))}</div>
-      <div class="analytics-group" data-group="goods">${grid(t("nothing_found", "—"), sectionsHtml(a.product_sections || []))}</div>
-      <div class="analytics-group" data-group="countries">${grid(t("nothing_found", "—"), sectionsHtml(a.country_sections || []))}</div>
-      <div class="analytics-group" data-group="prices">${grid(t("nothing_found", "—"), pricesHtml(a.price_sections || []))}</div>`;
-    applyAnalyticsGroup();
-    bindAnalyticsClicks();
-  } catch (err) {
-    $("analytics-meta").textContent = err.message;
-    scroll.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
-    toast(err.message);
-  }
-}
+    ph.classList.remove("center"); ph.textContent = "";
 
-function applyAnalyticsGroup() {
-  for (const node of document.querySelectorAll(".analytics-group")) {
-    node.classList.toggle("active", node.dataset.group === state.analyticsGroup);
-  }
-  for (const chip of document.querySelectorAll("#analytics-subtabs .chip")) {
-    chip.classList.toggle("active", chip.dataset.group === state.analyticsGroup);
-  }
-}
-
-function kpiHtml(overview) {
-  if (!overview) return "";
-  const items = [
-    [t("rows_label", "Рядки"), fmtInt.format(overview.row_count)],
-    [t("declarations_label", "Декларації"), fmtInt.format(overview.declaration_count)],
-    [t("recipients_label", "Одержувачі"), fmtInt.format(overview.distinct_recipients)],
-    [t("unique_senders", "Відправники"), fmtInt.format(overview.distinct_senders)],
-    [t("total_value", "Сума"), `${fmtNum.format(overview.total_value_usd)} $`],
-    [t("net_weight", "Нетто"), `${fmtKg.format(overview.total_net_kg)}`],
-    [t("gross_weight", "Брутто"), `${fmtKg.format(overview.total_gross_kg)}`],
-    [t("avg_value_kg", "$/кг"), fmtNum.format(overview.avg_value_per_net_kg)],
-  ];
-  return items
-    .map(
-      ([label, value]) =>
-        `<div class="kpi"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`,
-    )
-    .join("");
-}
-
-function monthsHtml(months) {
-  if (!months.length) return `<div class="empty">${esc(t("nothing_found", "—"))}</div>`;
-  const max = Math.max(...months.map((m) => Number(m.total_value_usd) || Number(m.rows) || 0), 1);
-  return months
-    .map((month) => {
-      const value = Number(month.total_value_usd) || Number(month.rows) || 0;
-      const height = Math.max(3, Math.round((value / max) * 100));
-      return `<div class="month-bar" title="${esc(month.month)}: ${fmtNum.format(value)} $">
-        <i style="height:${height}%"></i><small>${esc(month.month.slice(2))}</small>
-      </div>`;
-    })
-    .join("");
-}
-
-function sectionsHtml(sections, allowAll = true) {
-  return sections
-    .filter((section) => section.rows && section.rows.length)
-    .map((section) => {
-      const title = sectionTitle(section.kind, section.title);
-      const allButton =
-        allowAll && section.kind
-          ? `<button class="all-btn" type="button" data-kind="${esc(section.kind)}" data-title="${esc(title)}">${esc(t("all_label", "Усі"))}</button>`
-          : "";
-      const rows = section.rows
-        .map((row) => {
-          const width = Math.max(2, Math.min(100, Number(row.share_percent) || 0));
-          const action = row.filter_action
-            ? ` data-field="${esc(row.filter_action.field)}" data-value="${esc(row.filter_action.value)}"`
-            : "";
-          return `<div class="rank-row"${action}>
-            <div>
-              <div class="rank-name">${esc(row.label || "—")}</div>
-              <div class="bar-track"><div class="bar" style="width:${width}%"></div></div>
-            </div>
-            <div class="rank-stats">
-              <b>${fmtNum.format(row.total_value_usd)} $</b><br />
-              ${fmtKg.format(row.total_net_kg)} · ${fmtInt.format(row.rows)}
-            </div>
-          </div>`;
-        })
-        .join("");
-      return `<section class="section"><div class="section-head"><h3>${esc(title)}</h3>${allButton}</div>${rows}</section>`;
-    })
-    .join("");
-}
-
-function pricesHtml(metrics) {
-  const rows = (metrics || [])
-    .filter((metric) => metric.count > 0)
-    .map(
-      (metric) => `<div class="rank-row static">
-        <div class="rank-name">${esc(priceTitle(metric.kind, metric.title))}</div>
-        <div class="rank-stats">
-          ${esc(t("median", "медіана"))} <b>${fmtNum.format(metric.median)}</b><br />
-          ${fmtNum.format(metric.average)} · ${fmtInt.format(metric.count)}
-        </div>
-      </div>`,
-    )
-    .join("");
-  return rows ? `<section class="section"><div class="section-head"><h3>${esc(t("prices_section", "Ціни"))}</h3></div>${rows}</section>` : "";
-}
-
-function applyFilterAction(field, value) {
-  if (!field || !$(field)) return;
-  $(field).value = value;
-  activateTab("results");
-  search(true);
-}
-
-function bindAnalyticsClicks() {
-  for (const row of document.querySelectorAll(".rank-row[data-field]")) {
-    row.addEventListener("click", () => applyFilterAction(row.dataset.field, row.dataset.value));
-  }
-  for (const button of document.querySelectorAll(".all-btn[data-kind]")) {
-    button.addEventListener("click", () => openSection(button.dataset.kind, button.dataset.title));
-  }
-}
-
-/* ---------- drill-down modal (show all groups) ---------- */
-function sectionColumns() {
-  return [
-    { key: "label", label: t("col_label", "Назва"), text: true },
-    { key: "rows", label: t("rows_label", "Рядків"), fmt: (v) => fmtInt.format(v) },
-    { key: "declarations", label: t("declarations_label", "Декларацій"), fmt: (v) => fmtInt.format(v) },
-    { key: "companies", label: t("col_companies", "Компаній"), fmt: (v) => fmtInt.format(v) },
-    { key: "total_value_usd", label: t("total_value", "Сума"), fmt: (v) => fmtNum.format(v) },
-    { key: "total_net_kg", label: t("net_weight", "Нетто"), fmt: (v) => fmtKg.format(v) },
-    { key: "share_percent", label: t("col_share", "Частка"), fmt: (v) => `${fmtNum.format(v)}%` },
-    { key: "avg_value_kg", label: t("avg_value_kg", "$/кг"), src: "avg_value_per_net_kg", fmt: (v) => fmtNum.format(v) },
-  ];
-}
-
-function visibleSectionRows() {
-  const s = state.section;
-  const needle = s.filter.trim().toLowerCase();
-  let rows = needle
-    ? s.rows.filter((r) => String(r.label).toLowerCase().includes(needle))
-    : s.rows.slice();
-  const key = s.sort === "avg_value_kg" ? "avg_value_per_net_kg" : s.sort;
-  rows.sort((a, b) => {
-    if (s.sort === "label") {
-      const av = String(a.label).toLowerCase();
-      const bv = String(b.label).toLowerCase();
-      return s.desc ? bv.localeCompare(av) : av.localeCompare(bv);
+    const order = orderedColumns();
+    const htr = el("tr");
+    for (const ci of order) {
+      const col = state.schema[ci];
+      const th = el("th", { title: col.glossary || "", text: col.label || col.name });
+      if (NUM_COLS.has(col.name)) th.classList.add("num");
+      htr.appendChild(th);
     }
-    const av = Number(a[key]) || 0;
-    const bv = Number(b[key]) || 0;
-    return s.desc ? bv - av : av - bv;
-  });
-  return rows;
-}
+    thead.appendChild(htr);
 
-function renderSection() {
-  const s = state.section;
-  if (!s) return;
-  const cols = sectionColumns();
-  const rows = visibleSectionRows();
-  const head = document.querySelector("#modal-table thead");
-  head.innerHTML =
-    "<tr>" +
-    cols
-      .map((c) => {
-        const arrow = c.key === s.sort ? ` <span class="arrow">${s.desc ? "▼" : "▲"}</span>` : "";
-        return `<th${c.text ? "" : ' class="num"'} data-key="${c.key}">${esc(c.label)}${arrow}</th>`;
-      })
-      .join("") +
-    "</tr>";
-  const body = document.querySelector("#modal-table tbody");
-  body.innerHTML = rows
-    .map((r) => {
-      const action = r.filter_action
-        ? ` data-field="${esc(r.filter_action.field)}" data-value="${esc(r.filter_action.value)}"`
-        : "";
-      const cells = cols
-        .map((c) => {
-          if (c.text) return `<td title="${esc(r.label)}">${esc(r.label)}</td>`;
-          const raw = r[c.src || c.key];
-          return `<td class="num">${c.fmt(raw)}</td>`;
-        })
-        .join("");
-      return `<tr${action}>${cells}</tr>`;
-    })
-    .join("");
-  $("modal-meta").textContent =
-    fmt(t("showing", "{} / {}"), fmtInt.format(rows.length), fmtInt.format(s.rows.length)) +
-    (s.limited ? " · max" : "");
-  for (const th of head.querySelectorAll("th")) {
-    th.addEventListener("click", () => {
-      const key = th.dataset.key;
-      if (s.sort === key) s.desc = !s.desc;
-      else {
-        s.sort = key;
-        s.desc = key !== "label";
+    const frag = document.createDocumentFragment();
+    data.rows.forEach((row, ri) => {
+      const tr = el("tr", { class: "in", style: `animation-delay:${Math.min(ri, 24) * 9}ms` });
+      if (row.duplicate_of) {
+        tr.classList.add("dup");
+        tr.title = `${t("dup_first_seen", "First seen in")} ${row.duplicate_of}`;
       }
-      renderSection();
-    });
-  }
-  for (const tr of body.querySelectorAll("tr[data-field]")) {
-    tr.addEventListener("click", () => {
-      applyFilterAction(tr.dataset.field, tr.dataset.value);
-      closeModal();
-    });
-  }
-}
+      order.forEach((ci, k) => {
+        const col = state.schema[ci];
+        const val = row.cells[ci] || "";
+        const td = el("td");
+        if (NUM_COLS.has(col.name)) td.classList.add("num");
+        else if (MONO_COLS.has(col.name)) td.classList.add("mono");
+        else if (col.name === "description") td.classList.add("muted");
 
-async function openSection(kind, title) {
-  state.section = { kind, title, rows: [], sort: "total_value_usd", desc: true, filter: "", limited: false };
-  $("modal-title").textContent = title || t("all_label", "Усі");
-  $("modal-search").value = "";
-  $("modal-search").placeholder = t("group_search_hint", "Пошук у списку");
-  $("modal-meta").textContent = t("searching", "…");
-  document.querySelector("#modal-table thead").innerHTML = "";
-  document.querySelector("#modal-table tbody").innerHTML = "";
-  openModal();
-  try {
-    const data = await api("/api/section", { ...collectQuery(), kind, hs_level: 10, limit: 20000 });
-    if (data.needs_query) {
-      $("modal-meta").textContent = data.message;
+        if (col.name === "edrpou" && val) {
+          td.appendChild(el("span", {
+            class: "col-link", text: val,
+            onclick: (e) => { e.stopPropagation(); openCompany(val); },
+          }));
+        } else if (COUNTRY_COLS.has(col.name) && val) {
+          td.appendChild(el("span", { class: "cc", text: val }));
+        } else {
+          td.textContent = val;
+          if (k === 0 && row.duplicate_of) td.appendChild(el("span", { class: "dup-tag", text: "dup" }));
+        }
+        tr.appendChild(td);
+      });
+      tr.addEventListener("click", () => openCard(row.id));
+      frag.appendChild(tr);
+    });
+    tbody.appendChild(frag);
+    updatePager();
+  }
+
+  function updatePager() {
+    const pages = state.total != null ? Math.max(1, Math.ceil(state.total / 100)) : null;
+    $("#page-label").textContent = pages ? `${state.page + 1} / ${pages}` : `${state.page + 1}`;
+    $("#prev-page").disabled = state.page === 0;
+    $("#next-page").disabled = !state.hasNext;
+    $("#prev-page").style.opacity = state.page === 0 ? ".4" : "";
+    $("#next-page").style.opacity = state.hasNext ? "" : ".4";
+  }
+
+  // --------------------------------------------------------------- analytics
+  function switchTab(tab) {
+    state.tab = tab;
+    $$(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+    $("#results-panel").classList.toggle("active", tab === "results");
+    $("#analytics-panel").classList.toggle("active", tab === "analytics");
+    if (tab === "analytics") loadAnalytics();
+  }
+
+  function switchGroup(group) {
+    state.group = group;
+    $$("#analytics-subtabs .chip").forEach((c) => c.classList.toggle("active", c.dataset.group === group));
+    loadAnalytics();
+  }
+
+  const SCOPE_OF = { overview: "overview", companies: "companies", goods: "products", countries: "countries", prices: "prices" };
+
+  async function loadAnalytics() {
+    const scroll = $("#analytics-scroll");
+    const queryEmpty = !state.query.text.trim() && !Object.values(state.query.filters).some((v) => (v || "").trim());
+    if (queryEmpty) {
+      scroll.textContent = "";
+      scroll.appendChild(el("div", { class: "placeholder", text: t("analytics_hint", "Enter a query or filter to build analytics.") }));
       return;
     }
-    state.section.rows = data.rows || [];
-    state.section.limited = Boolean(data.limited);
-    renderSection();
-  } catch (err) {
-    $("modal-meta").textContent = err.message;
-    toast(err.message);
-  }
-}
+    if (state.group === "pivot") return loadPivot();
 
-function copySectionVisible() {
-  if (!state.section) return;
-  const cols = sectionColumns();
-  const rows = visibleSectionRows();
-  const header = cols.map((c) => c.label).join("\t");
-  const lines = rows.map((r) =>
-    cols
-      .map((c) => (c.text ? r.label : r[c.src || c.key]))
-      .join("\t"),
-  );
-  navigator.clipboard
-    .writeText([header, ...lines].join("\n"))
-    .then(() => toast("OK"))
-    .catch(() => toast("clipboard error"));
-}
-
-function openModal() {
-  $("modal").classList.add("show");
-  $("modal").setAttribute("aria-hidden", "false");
-}
-
-function closeModal() {
-  $("modal").classList.remove("show");
-  $("modal").setAttribute("aria-hidden", "true");
-}
-
-/* ---------- tabs / actions ---------- */
-function activateTab(tab) {
-  state.activeTab = tab;
-  for (const button of document.querySelectorAll(".tab")) {
-    button.classList.toggle("active", button.dataset.tab === tab);
-  }
-  $("results-panel").classList.toggle("active", tab === "results");
-  $("analytics-panel").classList.toggle("active", tab === "analytics");
-  if (tab === "analytics") loadAnalytics();
-}
-
-async function exportCurrentPage() {
-  if (!state.token) {
-    toast("No local session token");
-    return;
-  }
-  const query = new URLSearchParams(cleanParams(queryWithPaging())).toString();
-  const url = query ? `/api/export-page.csv?${query}` : "/api/export-page.csv";
-  try {
-    const response = await fetch(url, {
-      cache: "no-store",
-      headers: { Authorization: `Bearer ${state.token}` },
-    });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+    const scope = SCOPE_OF[state.group];
+    if (!state.anLoaded.has(state.group)) {
+      const gen = state.anGen;
+      busy(true);
+      scroll.textContent = "";
+      scroll.appendChild(el("div", { class: "placeholder", text: t("searching", "Searching…") }));
+      try {
+        const data = await api("/api/analytics", currentParams({ scope, limit: state.anLimit, hs_level: 10 }));
+        if (gen !== state.anGen) return;
+        if (data.needs_query) {
+          scroll.textContent = "";
+          scroll.appendChild(el("div", { class: "placeholder", text: data.message || "" }));
+          return;
+        }
+        const a = data.analytics;
+        if (!state.an) state.an = a;
+        state.an.overview = a.overview;
+        state.an.months = a.months;
+        if (scope === "companies") state.an.company_sections = a.company_sections;
+        if (scope === "products") state.an.product_sections = a.product_sections;
+        if (scope === "countries") state.an.country_sections = a.country_sections;
+        if (scope === "prices") state.an.price_sections = a.price_sections;
+        state.anLoaded.add(state.group);
+      } catch (e) {
+        toast(e.message, true);
+        scroll.textContent = "";
+        scroll.appendChild(el("div", { class: "placeholder", text: e.message }));
+        return;
+      } finally {
+        busy(false);
+      }
     }
-    const blob = await response.blob();
-    const href = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = href;
-    link.download = "base-search-page.csv";
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(href);
-  } catch (err) {
-    toast(String(err.message || err));
+    renderAnalytics();
   }
-}
 
-function clearFilters() {
-  for (const id of fieldIds) {
-    if (id !== "text") $(id).value = "";
+  function summaryBar() {
+    const o = state.an.overview;
+    return el("div", { class: "an-summary" }, [
+      kvInline(t("rows_label", "rows"), fmtInt(o.row_count)),
+      kvInline(t("declarations_label", "declarations"), fmtInt(o.declaration_count)),
+      kvInline(t("total_value", "value"), fmtMoney(o.total_value_usd)),
+      kvInline(t("net_weight", "net kg"), fmtCompact(o.total_net_kg)),
+      kvInline(t("avg_value_kg", "avg $/kg"), fmtPrice(o.avg_value_per_net_kg)),
+    ]);
   }
-  search(true);
-}
+  function kvInline(k, v) {
+    return el("span", {}, [k + " ", el("b", { text: v })]);
+  }
 
-function bindEvents() {
-  $("search-form").addEventListener("submit", (event) => {
-    event.preventDefault();
-    search(true);
-  });
-  for (const id of fieldIds) {
-    if (id === "text") continue;
-    $(id).addEventListener("keydown", (event) => {
-      if (event.key === "Enter") search(true);
+  function renderAnalytics() {
+    const scroll = $("#analytics-scroll");
+    scroll.textContent = "";
+    scroll.appendChild(summaryBar());
+    const a = state.an;
+    if (state.group === "overview") {
+      scroll.appendChild(renderOverview(a));
+    } else if (state.group === "companies") {
+      scroll.appendChild(sectionGrid(a.company_sections));
+    } else if (state.group === "goods") {
+      scroll.appendChild(sectionGrid(a.product_sections));
+    } else if (state.group === "countries") {
+      scroll.appendChild(sectionGrid(a.country_sections));
+    } else if (state.group === "prices") {
+      scroll.appendChild(priceCard(a.price_sections));
+    }
+  }
+
+  function renderOverview(a) {
+    const o = a.overview;
+    const tiles = el("div", { class: "tiles" }, [
+      tile(t("rows_label", "Rows"), fmtInt(o.row_count), `${fmtInt(o.declaration_count)} ${t("declarations_label", "declarations")}`),
+      tile(t("total_value", "Value"), fmtMoney(o.total_value_usd), `${fmtPrice(o.avg_value_per_net_kg)} ${t("avg_value_kg", "$/kg")}`),
+      tile(t("net_weight", "Net weight"), fmtCompact(o.total_net_kg) + " kg", `${fmtCompact(o.total_gross_kg)} kg ${t("gross_weight", "gross")}`),
+      tile(t("recipients_label", "Recipients"), fmtInt(o.distinct_recipients), `${fmtInt(o.distinct_edrpou)} EDRPOU`),
+      tile(t("unique_senders", "Senders"), fmtInt(o.distinct_senders), `${fmtInt(o.distinct_trademarks)} ${t("trademark", "brands")}`),
+      tile(t("product_code", "Codes"), fmtInt(o.distinct_product_codes), `${fmtInt(o.distinct_origin_countries)} ${t("origin_country", "origins")}`),
+    ]);
+    const card = el("div", { class: "an-card" }, [
+      cardHead("i-info", t("tab_overview", "Overview")), tiles,
+    ]);
+    const chart = monthsChart(a.months);
+    return el("div", {}, [card, chart]);
+  }
+
+  function tile(k, v, s) {
+    return el("div", { class: "tile" }, [
+      el("div", { class: "k", text: k }),
+      el("div", { class: "v", text: v }),
+      s ? el("div", { class: "s", text: s }) : null,
+    ]);
+  }
+
+  function cardHead(iconId, title, allBtn) {
+    return el("div", { class: "an-card-head" }, [
+      icon(iconId), el("div", { class: "an-card-title", text: title }), allBtn || null,
+    ]);
+  }
+
+  function monthsChart(months) {
+    if (!months || !months.length) return el("div");
+    const max = Math.max(...months.map((m) => m.total_value_usd), 1);
+    const cols = months.map((m) => {
+      const h = Math.max(3, Math.round((m.total_value_usd / max) * 112));
+      const stem = el("div", { class: "stem", style: `height:${h}px` });
+      const col = el("div", {
+        class: "col",
+        title: `${m.month} · ${fmtMoney(m.total_value_usd)} · ${fmtInt(m.declarations)} ${t("declarations_label", "declarations")} · ${fmtCompact(m.total_net_kg)} kg`,
+      }, [stem, el("div", { class: "cap", text: m.month.slice(2) })]);
+      return col;
+    });
+    return el("div", { class: "an-card", style: "margin-top:12px" }, [
+      cardHead("i-info", t("months_section", "Monthly dynamics")),
+      el("div", { class: "chart" }, cols),
+    ]);
+  }
+
+  function sectionGrid(sections) {
+    const grid = el("div", { class: "an-grid" });
+    (sections || []).forEach((s, i) => grid.appendChild(sectionCard(s, i)));
+    if (!grid.children.length) grid.appendChild(el("div", { class: "placeholder", text: t("nothing_found", "Nothing found.") }));
+    return grid;
+  }
+
+  const SECTION_ICON = {
+    edrpou: "i-company", recipients: "i-company", senders: "i-company",
+    product_codes: "i-filter", trademarks: "i-filter", product_groups: "i-filter",
+    origin_countries: "i-globe", dispatch_countries: "i-globe", trade_countries: "i-globe",
+  };
+
+  function sectionCard(section, idx) {
+    const max = Math.max(...section.rows.map((r) => r.total_value_usd), 1);
+    const bars = el("div", { class: "bars" });
+    section.rows.slice(0, 8).forEach((r) => {
+      const fill = el("div", { class: "bar-fill", style: `width:${Math.max(2, (r.total_value_usd / max) * 100)}%` });
+      const row = el("div", {
+        class: "bar-row",
+        title: `${fmtInt(r.rows)} ${t("rows_label", "rows")} · ${fmtInt(r.declarations)} ${t("declarations_label", "decl")} · ${fmtCompact(r.total_net_kg)} kg · ${fmtPrice(r.avg_value_per_net_kg)} $/kg`,
+        onclick: () => applyFilterAction(r.filter_action),
+      }, [
+        fill,
+        el("div", { class: "bar-label", text: r.label || "—" }),
+        el("div", { class: "bar-val", text: fmtMoney(r.total_value_usd) }),
+      ]);
+      bars.appendChild(row);
+    });
+    const allBtn = el("button", {
+      class: "btn ghost sm", onclick: () => openSection(section.kind, section.title),
+    }, [t("all_label", "All")]);
+    const card = el("div", { class: "an-card", style: `animation-delay:${idx * 40}ms` }, [
+      cardHead(SECTION_ICON[section.kind] || "i-filter", section.title, allBtn), bars,
+    ]);
+    return card;
+  }
+
+  function priceCard(metrics) {
+    const grid = el("div", { class: "an-grid" });
+    const card = el("div", { class: "an-card", style: "grid-column:1/-1" }, [cardHead("i-info", t("prices_section", "Prices"))]);
+    const table = el("table", { class: "ptable" });
+    table.appendChild(el("thead", {}, el("tr", {}, [
+      th(t("col_label", "Metric"), true), th(t("median", "Median")), th(t("weighted_avg", "Wtd avg")),
+      th("P25"), th("P75"), th("Avg"), th("n"),
+    ])));
+    const tb = el("tbody");
+    (metrics || []).forEach((m) => {
+      tb.appendChild(el("tr", {}, [
+        td(m.title, "left"), td(fmtPrice(m.median), "mono"), td(fmtPrice(m.weighted_average), "mono"),
+        td(fmtPrice(m.p25), "mono"), td(fmtPrice(m.p75), "mono"), td(fmtPrice(m.average), "mono"), td(fmtInt(m.count), "mono"),
+      ]));
+    });
+    table.appendChild(tb);
+    card.appendChild(table);
+    grid.appendChild(card);
+    return grid;
+  }
+  function th(text, left) { const n = el("th", { text }); if (left) n.style.textAlign = "left"; return n; }
+  function td(text, cls) {
+    const n = el("td", { text });
+    if (cls === "left") n.style.textAlign = "left";
+    else if (cls === "mono") n.classList.add("mono");
+    return n;
+  }
+
+  // --------------------------------------------------------------- pivot
+  const PIVOT_DIMS = [
+    ["recipient", "Recipient"], ["sender", "Sender"], ["edrpou", "EDRPOU"],
+    ["product_code", "Product code"], ["trademark", "Trademark"],
+    ["origin_country", "Origin"], ["dispatch_country", "Dispatch"], ["trade_country", "Trade"],
+    ["month", "Month"], ["year", "Year"],
+  ];
+  const PIVOT_METRICS = [["value", "Value $"], ["rows", "Rows"], ["net_kg", "Net kg"]];
+
+  async function loadPivot() {
+    const scroll = $("#analytics-scroll");
+    scroll.textContent = "";
+    scroll.appendChild(summaryBar ? (state.an ? summaryBar() : el("div")) : el("div"));
+    const controls = el("div", { class: "pivot-controls" }, [
+      pivotSelect("row", PIVOT_DIMS, state.pivot.row),
+      pivotSelect("col", PIVOT_DIMS, state.pivot.col),
+      pivotSelect("metric", PIVOT_METRICS, state.pivot.metric),
+    ]);
+    scroll.appendChild(controls);
+    const holder = el("div", { id: "pivot-holder" });
+    scroll.appendChild(holder);
+    busy(true);
+    try {
+      const data = await api("/api/pivot", currentParams(state.pivot));
+      if (data.needs_query) {
+        holder.appendChild(el("div", { class: "placeholder", text: data.message || "" }));
+        return;
+      }
+      holder.appendChild(pivotTable(data.pivot));
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      busy(false);
+    }
+  }
+
+  function pivotSelect(key, options, value) {
+    const sel = el("select", {
+      class: "mini-select",
+      onchange: (e) => { state.pivot[key] = e.target.value; loadPivot(); },
+    });
+    options.forEach(([v, label]) => {
+      const opt = el("option", { value: v, text: label });
+      if (v === value) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    return el("label", {}, [el("span", { text: key }), sel]);
+  }
+
+  function pivotTable(p) {
+    const wrap = el("div", { class: "pivot-wrap" });
+    const table = el("table", { class: "pivot" });
+    const head = el("tr", {}, [el("th", { text: "" })]);
+    p.col_labels.forEach((c) => head.appendChild(el("th", { text: c })));
+    head.appendChild(el("th", { class: "tot", text: "Σ" }));
+    table.appendChild(el("thead", {}, head));
+    const tb = el("tbody");
+    const max = Math.max(...p.cells.flat(), 1);
+    p.row_labels.forEach((rl, ri) => {
+      const tr = el("tr", {}, [el("th", { text: rl })]);
+      p.cells[ri].forEach((v) => {
+        const cell = el("td", { text: v ? fmtCompact(v) : "" });
+        if (v) cell.style.background = `color-mix(in srgb, var(--acc) ${Math.round((v / max) * 55)}%, transparent)`;
+        tr.appendChild(cell);
+      });
+      tr.appendChild(el("td", { class: "tot", text: fmtCompact(p.row_totals[ri]) }));
+      tb.appendChild(tr);
+    });
+    const foot = el("tr", {}, [el("th", { class: "tot", text: "Σ" })]);
+    p.col_totals.forEach((v) => foot.appendChild(el("td", { class: "tot", text: fmtCompact(v) })));
+    foot.appendChild(el("td", { class: "tot", text: fmtCompact(p.grand_total) }));
+    tb.appendChild(foot);
+    table.appendChild(tb);
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  // --------------------------------------------------------------- drawer
+  function openDrawer() {
+    $("#scrim").hidden = false;
+    const d = $("#drawer");
+    d.classList.add("open");
+    d.setAttribute("aria-hidden", "false");
+  }
+  function closeDrawer() {
+    $("#scrim").hidden = true;
+    const d = $("#drawer");
+    d.classList.remove("open");
+    d.setAttribute("aria-hidden", "true");
+  }
+
+  async function openCard(id) {
+    openDrawer();
+    $("#drawer-title").textContent = t("details", "Details");
+    $("#drawer-sub").textContent = "#" + id;
+    const body = $("#drawer-body");
+    body.textContent = t("searching", "Searching…");
+    try {
+      const data = await api("/api/card", { id });
+      body.textContent = "";
+      $("#drawer-sub").textContent = data.source_file || ("#" + id);
+      const kv = el("div", { class: "kv" });
+      data.fields.forEach((f) => {
+        if (!f.value) return;
+        kv.appendChild(el("div", { class: "kv-row" + (f.extra ? " extra" : "") }, [
+          el("div", { class: "k", text: f.label }),
+          el("div", { class: "v", text: f.value }),
+        ]));
+      });
+      body.appendChild(kv);
+    } catch (e) {
+      body.textContent = e.message;
+    }
+  }
+
+  async function openCompany(edrpou) {
+    openDrawer();
+    $("#drawer-title").textContent = t("company_profile", "Company profile");
+    $("#drawer-sub").textContent = edrpou;
+    const body = $("#drawer-body");
+    body.textContent = t("searching", "Searching…");
+    try {
+      const data = await api("/api/company", { edrpou, limit: 10 });
+      const p = data.profile, o = p.overview;
+      body.textContent = "";
+      if (p.names && p.names.length) {
+        body.appendChild(el("div", { class: "kv-section", text: "Names" }));
+        body.appendChild(el("div", { class: "v", text: p.names.join(" · ") }));
+      }
+      body.appendChild(el("div", { class: "tiles", style: "margin-top:12px" }, [
+        tile(t("rows_label", "Rows"), fmtInt(o.row_count), `${fmtInt(o.declaration_count)} decl`),
+        tile(t("total_value", "Value"), fmtMoney(o.total_value_usd), `${fmtPrice(o.avg_value_per_net_kg)} $/kg`),
+        tile(t("net_weight", "Net kg"), fmtCompact(o.total_net_kg), `${fmtInt(o.distinct_product_codes)} codes`),
+      ]));
+      body.appendChild(monthsChart(p.months));
+      (p.product_sections || []).forEach((s) => body.appendChild(sectionCard(s, 0)));
+      (p.country_sections || []).slice(0, 1).forEach((s) => body.appendChild(sectionCard(s, 0)));
+    } catch (e) {
+      body.textContent = e.message;
+    }
+  }
+
+  // --------------------------------------------------------------- section modal
+  let modalRows = [], modalSort = { key: "total_value_usd", dir: -1 };
+
+  function openModalUI() { $("#modal-scrim").hidden = false; }
+  function closeModal() { $("#modal-scrim").hidden = true; }
+
+  async function openSection(kind, title) {
+    openModalUI();
+    $("#modal-title").textContent = title;
+    $("#modal-search").value = "";
+    $("#modal-meta").textContent = t("searching", "Searching…");
+    $("#modal-body").textContent = "";
+    try {
+      const data = await api("/api/section", currentParams({ kind, hs_level: 10, limit: 20000 }));
+      if (data.needs_query) { $("#modal-meta").textContent = data.message || ""; return; }
+      modalRows = data.rows;
+      $("#modal-meta").textContent =
+        `${fmtInt(data.count)} ${t("showing", "shown")}${data.limited ? " · 20000 max" : ""}`;
+      renderModalTable("");
+    } catch (e) {
+      $("#modal-meta").textContent = e.message;
+    }
+  }
+
+  function renderModalTable(filter) {
+    const body = $("#modal-body");
+    body.textContent = "";
+    const f = filter.trim().toLowerCase();
+    let rows = f ? modalRows.filter((r) => (r.label || "").toLowerCase().includes(f)) : modalRows.slice();
+    rows.sort((a, b) => (a[modalSort.key] < b[modalSort.key] ? 1 : -1) * modalSort.dir);
+    rows = rows.slice(0, 500);
+
+    const table = el("table", { class: "grid" });
+    const cols = [
+      ["label", t("col_label", "Name"), false], ["rows", t("rows_label", "Rows"), true],
+      ["declarations", t("declarations_label", "Decl"), true], ["companies", t("col_companies", "Cos"), true],
+      ["total_value_usd", t("total_value", "Value"), true], ["total_net_kg", t("net_weight", "Net kg"), true],
+      ["share_percent", t("col_share", "Share"), true], ["avg_value_per_net_kg", t("avg_value_kg", "$/kg"), true],
+    ];
+    const htr = el("tr");
+    cols.forEach(([key, label, num]) => {
+      const th = el("th", { text: label });
+      if (num) th.classList.add("num");
+      th.style.cursor = "pointer";
+      th.addEventListener("click", () => {
+        modalSort.dir = modalSort.key === key ? -modalSort.dir : -1;
+        modalSort.key = key;
+        renderModalTable($("#modal-search").value);
+      });
+      htr.appendChild(th);
+    });
+    table.appendChild(el("thead", {}, htr));
+    const tb = el("tbody");
+    rows.forEach((r) => {
+      const tr = el("tr", { onclick: () => { closeModal(); applyFilterAction(r.filter_action); } }, [
+        cell(r.label || "—"), cellN(fmtInt(r.rows)), cellN(fmtInt(r.declarations)), cellN(fmtInt(r.companies)),
+        cellN(fmtMoney(r.total_value_usd)), cellN(fmtCompact(r.total_net_kg)),
+        cellN(r.share_percent.toFixed(1) + "%"), cellN(fmtPrice(r.avg_value_per_net_kg)),
+      ]);
+      tb.appendChild(tr);
+    });
+    table.appendChild(tb);
+    body.appendChild(table);
+  }
+  function cell(text) { return el("td", { text }); }
+  function cellN(text) { const n = el("td", { text }); n.classList.add("num"); return n; }
+
+  function copyModal() {
+    const f = $("#modal-search").value.trim().toLowerCase();
+    let rows = f ? modalRows.filter((r) => (r.label || "").toLowerCase().includes(f)) : modalRows;
+    const header = ["Name", "Rows", "Declarations", "Companies", "Value", "Net kg", "Share %", "$/kg"].join("\t");
+    const lines = rows.slice(0, 5000).map((r) =>
+      [r.label, r.rows, r.declarations, r.companies, Math.round(r.total_value_usd), Math.round(r.total_net_kg), r.share_percent.toFixed(1), r.avg_value_per_net_kg.toFixed(2)].join("\t"));
+    navigator.clipboard.writeText([header, ...lines].join("\n"))
+      .then(() => toast(t("copy_visible", "Copied")))
+      .catch(() => toast("Clipboard blocked", true));
+  }
+
+  // --------------------------------------------------------------- export
+  async function exportCsv() {
+    busy(true);
+    try {
+      const url = new URL("/api/export-page.csv", location.origin);
+      for (const [k, v] of Object.entries(currentParams({ page: state.page, limit: 100 }))) {
+        if (v != null && v !== "") url.searchParams.set(k, v);
+      }
+      const res = await fetch(url, { headers: { Authorization: "Bearer " + TOKEN } });
+      if (!res.ok) throw new Error(res.statusText);
+      const blob = await res.blob();
+      const a = el("a", { href: URL.createObjectURL(blob), download: "base-search-page.csv" });
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    } catch (e) {
+      toast(e.message, true);
+    } finally {
+      busy(false);
+    }
+  }
+
+  // --------------------------------------------------------------- stats
+  async function loadStats() {
+    try {
+      const data = await api("/api/stats");
+      $("#live-dot").classList.add("on");
+      const status = data.total_rows
+        ? `${fmtInt(data.total_rows)} ${t("rows_label", "rows")}`
+        : t("db_rows", "Local database");
+      $("#db-status").textContent = status;
+    } catch (e) {
+      $("#db-status").textContent = e.message;
+    }
+  }
+
+  // --------------------------------------------------------------- events
+  function wire() {
+    $("#search-form").addEventListener("submit", (e) => { e.preventDefault(); runSearch(true); });
+    const q = $("#q");
+    q.addEventListener("input", () => {
+      state.query.text = q.value;
+      $("#clear-q").hidden = !q.value;
+      runSearchDebounced();
+    });
+    $("#clear-q").addEventListener("click", () => {
+      q.value = ""; state.query.text = ""; $("#clear-q").hidden = true; runSearch(true); q.focus();
+    });
+    $("#clear-filters").addEventListener("click", clearFilters);
+    $("#prev-page").addEventListener("click", () => { if (state.page > 0) { state.page--; runSearch(false); } });
+    $("#next-page").addEventListener("click", () => { if (state.hasNext) { state.page++; runSearch(false); } });
+    $$(".tab").forEach((b) => b.addEventListener("click", () => switchTab(b.dataset.tab)));
+    $$("#analytics-subtabs .chip").forEach((c) => c.addEventListener("click", () => switchGroup(c.dataset.group)));
+    $("#analytics-limit").addEventListener("change", (e) => {
+      state.anLimit = parseInt(e.target.value, 10) || 10;
+      state.anLoaded.clear();
+      loadAnalytics();
+    });
+    $("#export-btn").addEventListener("click", exportCsv);
+    $("#refresh-btn").addEventListener("click", () => { loadStats(); runSearch(false); });
+    $("#theme-toggle").addEventListener("click", () => {
+      applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+    });
+    $("#lang-select").addEventListener("change", (e) => loadI18n(e.target.value));
+    $("#drawer-close").addEventListener("click", closeDrawer);
+    $("#scrim").addEventListener("click", closeDrawer);
+    $("#modal-close").addEventListener("click", closeModal);
+    $("#modal-copy").addEventListener("click", copyModal);
+    $("#modal-scrim").addEventListener("click", (e) => { if (e.target.id === "modal-scrim") closeModal(); });
+    $("#modal-search").addEventListener("input", (e) => renderModalTable(e.target.value));
+    // mobile filters
+    $("#filters-toggle").addEventListener("click", () => $("#filters").classList.toggle("open"));
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { closeModal(); closeDrawer(); }
+      if (e.key === "/" && document.activeElement !== q && document.activeElement.tagName !== "INPUT") {
+        e.preventDefault(); q.focus();
+      }
     });
   }
-  $("refresh").addEventListener("click", () => {
+
+  // --------------------------------------------------------------- init
+  async function init() {
+    let theme = "dark";
+    try { theme = localStorage.getItem("bs-theme") || "dark"; } catch (e) { /* ignore */ }
+    applyTheme(theme);
+    wire();
+    try {
+      const schema = await api("/api/schema");
+      state.schema = schema.columns || [];
+    } catch (e) { toast(e.message, true); }
+    await loadI18n("en").catch((e) => toast(e.message, true));
     loadStats();
-    search(false);
-  });
-  $("export-page").addEventListener("click", exportCurrentPage);
-  $("clear-filters").addEventListener("click", clearFilters);
-  $("lang-select").addEventListener("change", onLangChange);
-  $("prev-page").addEventListener("click", () => {
-    if (state.page > 0) {
-      state.page -= 1;
-      search(false);
-    }
-  });
-  $("next-page").addEventListener("click", () => {
-    if (state.hasNext) {
-      state.page += 1;
-      search(false);
-    }
-  });
-  $("drawer-close").addEventListener("click", closeDrawer);
-  $("backdrop").addEventListener("click", closeDrawer);
-  $("modal-close").addEventListener("click", closeModal);
-  $("modal").addEventListener("click", (event) => {
-    if (event.target === $("modal")) closeModal();
-  });
-  $("modal-copy").addEventListener("click", copySectionVisible);
-  $("modal-search").addEventListener("input", (event) => {
-    if (state.section) {
-      state.section.filter = event.target.value;
-      renderSection();
-    }
-  });
-  document.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape") return;
-    if ($("modal").classList.contains("show")) closeModal();
-    else closeDrawer();
-  });
-  $("analytics-limit").addEventListener("change", loadAnalytics);
-  for (const button of document.querySelectorAll(".tab")) {
-    button.addEventListener("click", () => activateTab(button.dataset.tab));
+    // Show the latest rows immediately instead of an empty screen.
+    runSearch(true);
+    $("#q").focus();
   }
-  for (const chip of document.querySelectorAll("#analytics-subtabs .chip")) {
-    chip.addEventListener("click", () => {
-      state.analyticsGroup = chip.dataset.group;
-      applyAnalyticsGroup();
-    });
-  }
-}
 
-async function boot() {
-  bindEvents();
-  if (!state.token) {
-    toast("Start browser mode via BaseSearch.exe --web");
-    return;
-  }
-  try {
-    await loadI18n();
-    await loadSchema();
-    await loadStats();
-    await search(true);
-  } catch (err) {
-    toast(err.message);
-  }
-}
-
-boot();
+  init();
+})();

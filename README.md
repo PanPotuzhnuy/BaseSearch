@@ -1,4 +1,4 @@
-# Base Search 1.3.0
+# Base Search 1.4.0
 
 [![CI](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml)
 
@@ -22,6 +22,9 @@ on the user's computer.
 - Search across product descriptions, companies, product codes, declaration
   numbers, trademarks, countries, and dates.
 - Filter by year, product code, company, organization code, and country fields.
+- Build flexible advanced searches with editable rules, all/any rule groups,
+  exclusion rules, nested groups, range filters, empty/not-empty checks, and
+  preserved extra columns from imported spreadsheets.
 - View all imported source columns in the result table, including value, price,
   weight, rate, and technical customs fields when they exist in the source data.
 - Hover abbreviated customs headers to see what fields such as `43`,
@@ -142,14 +145,17 @@ file does not exist, it is created automatically.
 3. Type a query: product description, company name, product code, declaration
    number, trademark, or country.
 4. Narrow results with filters when needed.
-5. Use **Questions** for guided shortcuts when you know the business question
+5. Use **+ Filter** and **Advanced** when a search needs several rules, such as
+   "sender contains A or B", "exclude origin country CN", a year/date range, or
+   a condition on an extra imported column.
+6. Use **Questions** for guided shortcuts when you know the business question
    but do not want to choose the tab manually.
-6. Open **Analytics** to understand the current query: who moved the goods,
+7. Open **Analytics** to understand the current query: who moved the goods,
    what goods dominate, where they came from, and what the value/weight picture
    looks like.
-7. Double-click a row to open its full details.
-8. Right-click a row for quick copy and quick filter actions.
-9. Export the current result set to CSV or XLSX.
+8. Double-click a row to open its full details.
+9. Right-click a row for quick copy and quick filter actions.
+10. Export the current result set to CSV or XLSX.
 
 ## Guided Questions
 
@@ -275,6 +281,9 @@ interface language.
 - Text filters are case-insensitive and support Cyrillic text.
 - Use field filters when the meaning matters: **Trademark = Apple** is narrower
   than searching for `Apple` everywhere.
+- Use **Advanced** for structured logic instead of SQL syntax: combine rules
+  with **All rules** or **Any rule**, mark a rule or group as excluded, create
+  nested groups, and search imported extra columns with the same rule builder.
 
 ## Supported Data
 
@@ -391,6 +400,23 @@ selected local spreadsheets and writes a local SQLite database beside the
 application executable.
 
 ## Changelog
+
+### 1.4.0
+
+- **Advanced Search 1.4.** Added a flexible query builder for the desktop app:
+  editable rule chips, all/any groups, exclusion rules and groups, nested
+  groups, range filters, empty/not-empty checks, and extra-column conditions.
+- **Universal query model.** Search rules are stored as a structured AST and
+  compiled to parameterized SQLite queries, while the existing flat filters and
+  full-text search behavior remain compatible.
+- **Saved and recent advanced searches.** Advanced queries are serialized as V2
+  saved/recent search data while legacy saved searches still decode.
+- **Field catalog.** The app now builds a searchable field catalog from known
+  record fields, the virtual year field, and extra headers discovered during
+  import.
+- **Localized advanced-search interface.** New search-builder labels, menus,
+  operators, hints, and rule summaries are translated across all 11 supported
+  interface languages.
 
 ### 1.3.0
 

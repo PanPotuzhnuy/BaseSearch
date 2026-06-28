@@ -2,12 +2,13 @@
 //! import/export progress, and settings.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use egui_extras::{Column, TableBuilder};
+use serde::{Deserialize, Serialize};
 
 use crate::db::{
     Analytics, AnalyticsFilterAction, AnalyticsFilterField, AnalyticsGroupRow, AnalyticsMonthRow,
@@ -19,6 +20,11 @@ use crate::export::ExportError;
 use crate::i18n::{Lang, Tr, fmt, group_digits, help_sections, tr};
 use crate::import::{FileSummary, ImportPhase};
 use crate::schema::{RESULT_COLUMNS, column_glossary, header_for};
+use crate::search::{
+    ConditionOp, ConditionValue, FieldInfo, LogicOp, QueryCondition, QueryExpr, QueryGroup,
+    default_condition_for_field, default_field_catalog, default_value_for_op,
+    ensure_value_matches_operator, field_label,
+};
 use crate::workers::{self, ImportEvent, Msg, PAGE_SIZE, WorkerReq};
 
 /// Interface accent color.
@@ -27,6 +33,8 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const FULL_SECTION_LIMIT: u64 = 20_000;
 const RECENT_QUERIES_META: &str = "recent_queries_v1";
 const SAVED_QUERIES_META: &str = "saved_queries_v1";
+const RECENT_QUERIES_V2_META: &str = "recent_queries_v2";
+const SAVED_QUERIES_V2_META: &str = "saved_queries_v2";
 const RECENT_QUERY_LIMIT: usize = 12;
 
 /// Action from the table row context menu.
@@ -277,6 +285,77 @@ fn trunc_label(s: &str, max: usize) -> String {
     out
 }
 
+fn condition_op_label(op: ConditionOp, t: &Tr) -> &'static str {
+    match op {
+        ConditionOp::Contains => t.op_contains,
+        ConditionOp::Equals => t.op_equals,
+        ConditionOp::StartsWith => t.op_starts_with,
+        ConditionOp::IsAnyOf => t.op_is_any_of,
+        ConditionOp::Range => t.op_range,
+        ConditionOp::IsEmpty => t.op_is_empty,
+        ConditionOp::IsNotEmpty => t.op_is_not_empty,
+    }
+}
+
+fn condition_value_label(value: &ConditionValue) -> String {
+    match value {
+        ConditionValue::None => String::new(),
+        ConditionValue::Single(value) => value.clone(),
+        ConditionValue::List(values) => values.join(", "),
+        ConditionValue::Range { from, to } => {
+            format!(
+                "{}..{}",
+                from.as_deref().unwrap_or_default(),
+                to.as_deref().unwrap_or_default()
+            )
+        }
+    }
+}
+
+fn logic_op_label(op: LogicOp, t: &Tr) -> &'static str {
+    match op {
+        LogicOp::And => t.v2_match_all,
+        LogicOp::Or => t.v2_match_any,
+    }
+}
+
+fn group_label_for_ui(op: LogicOp, t: &Tr) -> String {
+    format!("{}: {}", t.v2_group, logic_op_label(op, t))
+}
+
+fn expr_label_for_ui(expr: &QueryExpr, catalog: &[FieldInfo], t: &Tr) -> String {
+    match expr {
+        QueryExpr::Group(group) => {
+            let mut text = group_label_for_ui(group.op, t);
+            if group.negated {
+                text = format!("{}: {text}", t.v2_excluding);
+            }
+            text
+        }
+        QueryExpr::Condition(condition) => {
+            let value = condition_value_label(&condition.value);
+            let mut text = if value.trim().is_empty() {
+                format!(
+                    "{} {}",
+                    field_label(&condition.field, catalog),
+                    condition_op_label(condition.op, t)
+                )
+            } else {
+                format!(
+                    "{} {} {}",
+                    field_label(&condition.field, catalog),
+                    condition_op_label(condition.op, t),
+                    value
+                )
+            };
+            if condition.negated {
+                text = format!("{}: {text}", t.v2_excluding);
+            }
+            text
+        }
+    }
+}
+
 fn query_summary(query: &Query, t: &Tr) -> String {
     if query.is_empty() {
         return t.enter_query_hint.to_string();
@@ -303,9 +382,16 @@ fn query_summary(query: &Query, t: &Tr) -> String {
             parts.push(format!("{label}: {value}"));
         }
     }
+    if let Some(advanced) = &query.advanced
+        && !advanced.is_empty()
+    {
+        let label = expr_label_for_ui(advanced, &default_field_catalog(), t);
+        parts.push(fmt(t.v2_query_summary, &[&label]));
+    }
     parts.join(" · ")
 }
 
+#[cfg(test)]
 fn encode_stored_queries(items: &[StoredQuery]) -> String {
     items
         .iter()
@@ -358,6 +444,7 @@ fn decode_stored_queries(raw: &str) -> Vec<StoredQuery> {
                     dispatch_country: fields[10].clone(),
                     origin_country: fields[11].clone(),
                 },
+                advanced: None,
             };
             if query.is_empty() {
                 return None;
@@ -372,6 +459,37 @@ fn decode_stored_queries(raw: &str) -> Vec<StoredQuery> {
         .collect()
 }
 
+fn encode_stored_queries_v2(items: &[StoredQuery]) -> String {
+    serde_json::to_string(items).unwrap_or_default()
+}
+
+fn decode_stored_queries_v2(raw: &str) -> Vec<StoredQuery> {
+    serde_json::from_str::<Vec<StoredQuery>>(raw)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| !item.query.is_empty())
+        .collect()
+}
+
+fn decode_stored_queries_with_fallback(
+    v2_raw: Option<String>,
+    v1_raw: Option<String>,
+) -> Vec<StoredQuery> {
+    if let Some(raw) = v2_raw
+        && !raw.trim().is_empty()
+    {
+        let decoded = decode_stored_queries_v2(&raw);
+        if !decoded.is_empty() {
+            return decoded;
+        }
+    }
+    v1_raw
+        .as_deref()
+        .map(decode_stored_queries)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
 fn encode_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -1011,7 +1129,7 @@ pub fn default_db_path() -> PathBuf {
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
     let portable = exe_dir.join("data");
-    if std::fs::create_dir_all(&portable).is_ok() {
+    if dir_is_writable(&portable) {
         return portable.join("base_search.db");
     }
     let home = std::env::var_os("HOME")
@@ -1019,6 +1137,22 @@ pub fn default_db_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".base-search").join("base_search.db")
+}
+
+fn dir_is_writable(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    let probe = dir.join(format!(
+        ".base-search-write-test-{}-{stamp}.tmp",
+        std::process::id()
+    ));
+    let result = std::fs::write(&probe, b"ok").and_then(|_| std::fs::remove_file(&probe));
+    result.is_ok()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1041,7 +1175,7 @@ struct StatusLine {
     is_error: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct StoredQuery {
     name: String,
     query: Query,
@@ -1059,9 +1193,12 @@ pub struct App {
 
     query_text: String,
     filters: Filters,
+    advanced_query: Option<QueryExpr>,
+    search_fields: Vec<FieldInfo>,
     recent_queries: Vec<StoredQuery>,
     saved_queries: Vec<StoredQuery>,
     show_filters: bool,
+    show_advanced_search: bool,
     active_query: Query,
     page: u64,
     total: Option<u64>,
@@ -1127,6 +1264,7 @@ pub struct App {
     msg_rx: Receiver<Msg>,
     msg_tx: Sender<Msg>,
     search_tx: Sender<WorkerReq>,
+    analytics_tx: Sender<WorkerReq>,
 }
 
 impl App {
@@ -1168,22 +1306,39 @@ impl App {
             .iter()
             .map(|name| !hidden.contains(*name))
             .collect();
-        let recent_queries = lite_db
+        let recent_queries = decode_stored_queries_with_fallback(
+            lite_db
+                .as_ref()
+                .and_then(|db| db.meta_get(RECENT_QUERIES_V2_META)),
+            lite_db
+                .as_ref()
+                .and_then(|db| db.meta_get(RECENT_QUERIES_META)),
+        );
+        let saved_queries = decode_stored_queries_with_fallback(
+            lite_db
+                .as_ref()
+                .and_then(|db| db.meta_get(SAVED_QUERIES_V2_META)),
+            lite_db
+                .as_ref()
+                .and_then(|db| db.meta_get(SAVED_QUERIES_META)),
+        );
+        let search_fields = lite_db
             .as_ref()
-            .and_then(|db| db.meta_get(RECENT_QUERIES_META))
-            .map(|raw| decode_stored_queries(&raw))
-            .unwrap_or_default();
-        let saved_queries = lite_db
-            .as_ref()
-            .and_then(|db| db.meta_get(SAVED_QUERIES_META))
-            .map(|raw| decode_stored_queries(&raw))
-            .unwrap_or_default();
+            .and_then(|db| db.field_catalog().ok())
+            .unwrap_or_else(default_field_catalog);
 
         let (msg_tx, msg_rx) = channel::<Msg>();
         let (search_tx, search_rx) = channel::<WorkerReq>();
+        let (analytics_tx, analytics_rx) = channel::<WorkerReq>();
         workers::spawn_search_worker(
             db_path.clone(),
             search_rx,
+            msg_tx.clone(),
+            cc.egui_ctx.clone(),
+        );
+        workers::spawn_analytics_worker(
+            db_path.clone(),
+            analytics_rx,
             msg_tx.clone(),
             cc.egui_ctx.clone(),
         );
@@ -1194,9 +1349,12 @@ impl App {
             lite_db,
             query_text: String::new(),
             filters: Filters::default(),
+            advanced_query: None,
+            search_fields,
             recent_queries,
             saved_queries,
             show_filters: false,
+            show_advanced_search: false,
             active_query: Query::default(),
             page: 0,
             total: None,
@@ -1249,6 +1407,7 @@ impl App {
             msg_rx,
             msg_tx,
             search_tx,
+            analytics_tx,
         };
         let _ = app.search_tx.send(WorkerReq::Stats);
         app.start_search(true);
@@ -1294,17 +1453,25 @@ impl App {
         self.persist("hidden_cols", &hidden.join(","));
     }
 
+    fn refresh_search_fields(&mut self) {
+        self.search_fields = self
+            .lite_db
+            .as_ref()
+            .and_then(|db| db.field_catalog().ok())
+            .unwrap_or_else(default_field_catalog);
+    }
+
     fn persist_recent_queries(&self) {
         self.persist(
-            RECENT_QUERIES_META,
-            &encode_stored_queries(&self.recent_queries),
+            RECENT_QUERIES_V2_META,
+            &encode_stored_queries_v2(&self.recent_queries),
         );
     }
 
     fn persist_saved_queries(&self) {
         self.persist(
-            SAVED_QUERIES_META,
-            &encode_stored_queries(&self.saved_queries),
+            SAVED_QUERIES_V2_META,
+            &encode_stored_queries_v2(&self.saved_queries),
         );
     }
 
@@ -1328,6 +1495,7 @@ impl App {
         let query = Query {
             text: self.query_text.clone(),
             filters: self.filters.clone(),
+            advanced: self.advanced_query.clone(),
         };
         if query.is_empty() {
             return;
@@ -1358,6 +1526,7 @@ impl App {
     fn apply_stored_query(&mut self, query: Query) {
         self.query_text = query.text;
         self.filters = query.filters;
+        self.advanced_query = query.advanced;
         self.show_filters = !self.filters.is_empty();
         self.active_tab = AppTab::Results;
         self.start_search(true);
@@ -1370,6 +1539,7 @@ impl App {
         self.active_query = Query {
             text: self.query_text.clone(),
             filters: self.filters.clone(),
+            advanced: self.advanced_query.clone(),
         };
         let query_to_remember = self.active_query.clone();
         if reset_page {
@@ -1430,7 +1600,7 @@ impl App {
         if self.analytics_view == AnalyticsView::Compare {
             if self.analytics.is_none() || self.analytics_gen != self.search_gen {
                 self.analytics_loading = true;
-                let _ = self.search_tx.send(WorkerReq::Analytics {
+                let _ = self.analytics_tx.send(WorkerReq::Analytics {
                     q: Box::new(self.active_query.clone()),
                     limit: self.analytics_limit,
                     scope: None,
@@ -1445,7 +1615,7 @@ impl App {
             // load it once if it is missing for this query.
             if self.analytics.is_none() || self.analytics_gen != self.search_gen {
                 self.analytics_loading = true;
-                let _ = self.search_tx.send(WorkerReq::Analytics {
+                let _ = self.analytics_tx.send(WorkerReq::Analytics {
                     q: Box::new(self.active_query.clone()),
                     limit: self.analytics_limit,
                     scope: None,
@@ -1462,7 +1632,7 @@ impl App {
             return;
         }
         self.analytics_loading = true;
-        let _ = self.search_tx.send(WorkerReq::Analytics {
+        let _ = self.analytics_tx.send(WorkerReq::Analytics {
             q: Box::new(self.active_query.clone()),
             limit: self.analytics_limit,
             scope: self.analytics_view.scope(),
@@ -1475,7 +1645,7 @@ impl App {
         let base_needed = self.analytics.is_none() || self.analytics_gen != self.search_gen;
         if base_needed {
             self.analytics_loading = true;
-            let _ = self.search_tx.send(WorkerReq::Analytics {
+            let _ = self.analytics_tx.send(WorkerReq::Analytics {
                 q: Box::new(self.active_query.clone()),
                 limit: self.analytics_limit,
                 scope: None,
@@ -1489,7 +1659,7 @@ impl App {
                 continue;
             }
             self.analytics_loading = true;
-            let _ = self.search_tx.send(WorkerReq::Analytics {
+            let _ = self.analytics_tx.send(WorkerReq::Analytics {
                 q: Box::new(self.active_query.clone()),
                 limit: self.analytics_limit,
                 scope: Some(scope),
@@ -1530,7 +1700,7 @@ impl App {
         self.compare_loading = true;
         self.compare_query = Some(q.clone());
         self.compare_analytics = None;
-        let _ = self.search_tx.send(WorkerReq::Compare {
+        let _ = self.analytics_tx.send(WorkerReq::Compare {
             q: Box::new(q),
             generation: self.compare_gen,
         });
@@ -1549,7 +1719,7 @@ impl App {
             sort: GroupSort::Value,
             descending: true,
         });
-        let _ = self.search_tx.send(WorkerReq::AnalyticsSection {
+        let _ = self.analytics_tx.send(WorkerReq::AnalyticsSection {
             q: Box::new(self.active_query.clone()),
             kind,
             limit: FULL_SECTION_LIMIT,
@@ -1567,7 +1737,7 @@ impl App {
         self.underpricing = None;
         self.underpricing_loading = true;
         invalidate_underpricing_generation(&mut self.underpricing_gen);
-        let _ = self.search_tx.send(WorkerReq::Underpricing {
+        let _ = self.analytics_tx.send(WorkerReq::Underpricing {
             q: Box::new(self.active_query.clone()),
             threshold: 0.5,
             generation: self.underpricing_gen,
@@ -1583,7 +1753,7 @@ impl App {
         self.analytics_loaded[AnalyticsView::Pivot.index()] = false;
         self.analytics_loading = true;
         let others = self.t().others;
-        let _ = self.search_tx.send(WorkerReq::Pivot {
+        let _ = self.analytics_tx.send(WorkerReq::Pivot {
             q: Box::new(self.active_query.clone()),
             row_dim: self.pivot_row_dim,
             col_dim: self.pivot_col_dim,
@@ -1758,6 +1928,7 @@ impl App {
                 Msg::ImportDone(summaries, total_rows) => {
                     self.op = None;
                     self.db_total_rows = Some(total_rows);
+                    self.refresh_search_fields();
                     if !summaries.is_empty() {
                         let imported: u64 = summaries.iter().map(|s| s.imported).sum();
                         let dups: u64 = summaries.iter().map(|s| s.duplicates).sum();
@@ -1802,6 +1973,14 @@ impl App {
                             text: self.t().cancelled.to_string(),
                             is_error: false,
                         },
+                        Err(ExportError::UnsupportedExtension(ext)) => StatusLine {
+                            text: if ext.is_empty() {
+                                "Unsupported export extension. Use .csv or .xlsx.".to_string()
+                            } else {
+                                format!("Unsupported export extension: .{ext}. Use .csv or .xlsx.")
+                            },
+                            is_error: true,
+                        },
                         Err(ExportError::Other(e)) => StatusLine {
                             text: format!("{}: {e}", self.t().error),
                             is_error: true,
@@ -1810,6 +1989,9 @@ impl App {
                 }
                 Msg::DbCleared(result) => {
                     self.op = None;
+                    if result.is_ok() {
+                        self.refresh_search_fields();
+                    }
                     self.status = match result {
                         Ok(()) => StatusLine {
                             text: self.t().db_cleared.to_string(),
@@ -1957,7 +2139,7 @@ impl App {
         self.profile = None;
         self.profile_loading = true;
         self.profile_gen += 1;
-        let _ = self.search_tx.send(WorkerReq::Profile {
+        let _ = self.analytics_tx.send(WorkerReq::Profile {
             edrpou,
             generation: self.profile_gen,
         });
@@ -1973,6 +2155,7 @@ impl App {
         let current = Query {
             text: self.query_text.clone(),
             filters: self.filters.clone(),
+            advanced: self.advanced_query.clone(),
         };
         if current.is_empty() && !matches!(action, GuidedQuestionAction::Profile(_)) {
             self.status = StatusLine {
@@ -2125,6 +2308,7 @@ impl App {
         let guided_query = Query {
             text: guided_text.clone(),
             filters: guided_filters.clone(),
+            advanced: self.advanced_query.clone(),
         };
         let guided_items = guided_questions_for(&guided_text, &guided_filters);
         let frame = egui::Frame::side_top_panel(&ctx.global_style()).inner_margin(egui::Margin {
@@ -2338,6 +2522,10 @@ impl App {
                         do_search = true;
                     }
                 }
+                ui.add_space(6.0);
+                if self.ui_v2_search(ui) {
+                    do_search = true;
+                }
                 ui.add_space(2.0);
             });
         if save_current_query {
@@ -2431,6 +2619,137 @@ impl App {
                 }
             });
         });
+        search
+    }
+
+    fn ui_v2_search(&mut self, ui: &mut egui::Ui) -> bool {
+        let t = self.t();
+        let mut search = false;
+        let catalog = self.search_fields.clone();
+        ui.horizontal_wrapped(|ui| {
+            ui.menu_button(t.v2_add_filter, |ui| {
+                ui.set_min_width(260.0);
+                for field in &catalog {
+                    if ui.button(&field.label).clicked() {
+                        add_advanced_condition(
+                            &mut self.advanced_query,
+                            default_condition_for_field(field),
+                        );
+                        self.show_advanced_search = true;
+                        search = true;
+                        ui.close();
+                    }
+                }
+            });
+            let advanced = self
+                .advanced_query
+                .as_ref()
+                .is_some_and(|expr| !expr.is_empty());
+            let advanced_btn = ui.selectable_label(self.show_advanced_search, t.v2_advanced);
+            if advanced_btn.clicked() {
+                self.show_advanced_search = !self.show_advanced_search;
+                if self.show_advanced_search && self.advanced_query.is_none() {
+                    self.advanced_query = Some(QueryExpr::Group(QueryGroup::default()));
+                }
+            }
+            if advanced && ui.small_button(t.v2_clear_advanced).clicked() {
+                self.advanced_query = None;
+                search = true;
+            }
+            search |= self.ui_filter_chips(ui, &catalog, t);
+        });
+
+        if self.show_advanced_search {
+            ui.add_space(6.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.strong(t.v2_advanced_search);
+                ui.label(egui::RichText::new(t.v2_logic_hint).weak());
+            });
+            ui.add_space(4.0);
+            ensure_advanced_root(&mut self.advanced_query);
+            if let Some(QueryExpr::Group(group)) = &mut self.advanced_query {
+                search |= ui_query_group(ui, group, &catalog, "root", true, t);
+            }
+            ui.add_space(6.0);
+            ui.separator();
+        }
+
+        if self
+            .advanced_query
+            .as_ref()
+            .is_some_and(QueryExpr::is_empty)
+            && !self.show_advanced_search
+        {
+            self.advanced_query = None;
+        }
+        search
+    }
+
+    fn ui_filter_chips(&mut self, ui: &mut egui::Ui, catalog: &[FieldInfo], t: &Tr) -> bool {
+        let mut search = false;
+        for (label, value, clear) in flat_filter_chips(&self.filters, t) {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    if ui.small_button("×").clicked() {
+                        clear(&mut self.filters);
+                        search = true;
+                    }
+                    let response = ui.button(format!("{label}: {value}"));
+                    if response.clicked() {
+                        self.show_filters = true;
+                    }
+                    response.on_hover_text(t.v2_edit_in_filters);
+                });
+            });
+        }
+        let mut action = None;
+        if let Some(QueryExpr::Group(group)) = &self.advanced_query {
+            for (idx, child) in group.children.iter().enumerate() {
+                if child.is_empty() {
+                    continue;
+                }
+                let label = expr_label_for_ui(child, catalog, t);
+                ui.menu_button(label, |ui| {
+                    if ui.button(t.v2_edit).clicked() {
+                        self.show_advanced_search = true;
+                        ui.close();
+                    }
+                    if ui.button(t.v2_duplicate).clicked() {
+                        action = Some(AdvancedChipAction::Duplicate(idx));
+                        ui.close();
+                    }
+                    if ui.button(t.v2_toggle_not).clicked() {
+                        action = Some(AdvancedChipAction::ToggleNot(idx));
+                        ui.close();
+                    }
+                    if ui.button(t.v2_remove).clicked() {
+                        action = Some(AdvancedChipAction::Remove(idx));
+                        ui.close();
+                    }
+                });
+            }
+        } else if let Some(expr) = &self.advanced_query {
+            let label = expr_label_for_ui(expr, catalog, t);
+            ui.menu_button(label, |ui| {
+                if ui.button(t.v2_edit).clicked() {
+                    self.show_advanced_search = true;
+                    ui.close();
+                }
+                if ui.button(t.v2_toggle_not).clicked() {
+                    action = Some(AdvancedChipAction::ToggleNot(0));
+                    ui.close();
+                }
+                if ui.button(t.v2_remove).clicked() {
+                    action = Some(AdvancedChipAction::Remove(0));
+                    ui.close();
+                }
+            });
+        }
+        if let Some(action) = action {
+            apply_advanced_chip_action(&mut self.advanced_query, action);
+            search = true;
+        }
         search
     }
 
@@ -3482,7 +3801,9 @@ impl App {
                                 // Extra columns preserved from differently shaped
                                 // source files, marked with an italic header.
                                 for (header, value) in &card.extra {
-                                    ui.label(egui::RichText::new(header.as_str()).strong().italics());
+                                    ui.label(
+                                        egui::RichText::new(header.as_str()).strong().italics(),
+                                    );
                                     if value.is_empty() {
                                         ui.label(egui::RichText::new("\u{2014}").weak());
                                     } else {
@@ -4126,7 +4447,7 @@ fn months_chart(ui: &mut egui::Ui, months: &[AnalyticsMonthRow], metric: MonthMe
         ui.painter().hline(
             plot.x_range(),
             y,
-            egui::Stroke::new(0.5, grid_color.gamma_multiply(0.6)),
+            egui::Stroke::new(0.5_f32, grid_color.gamma_multiply(0.6)),
         );
         ui.painter().text(
             egui::pos2(plot.left(), y - 1.0),
@@ -4231,7 +4552,7 @@ fn draw_month_popup(
         egui::Color32::from_rgb(255, 255, 255)
     };
     let stroke = egui::Stroke::new(
-        1.0,
+        1.0_f32,
         if visuals.dark_mode {
             egui::Color32::from_rgb(84, 112, 160)
         } else {
@@ -6684,6 +7005,416 @@ fn result_col_index(name: &str) -> Option<usize> {
     RESULT_COLUMNS.iter().position(|column| *column == name)
 }
 
+enum AdvancedChipAction {
+    Duplicate(usize),
+    ToggleNot(usize),
+    Remove(usize),
+}
+
+enum AdvancedTreeAction {
+    Duplicate,
+    Remove,
+}
+
+type FilterClear = fn(&mut Filters);
+
+fn flat_filter_chips(filters: &Filters, t: &Tr) -> Vec<(&'static str, String, FilterClear)> {
+    let mut chips = Vec::new();
+    push_filter_chip(&mut chips, t.year, &filters.year, clear_filter_year);
+    push_filter_chip(
+        &mut chips,
+        t.product_code,
+        &filters.product_code,
+        clear_filter_product_code,
+    );
+    push_filter_chip(&mut chips, t.edrpou, &filters.edrpou, clear_filter_edrpou);
+    push_filter_chip(
+        &mut chips,
+        t.trademark,
+        &filters.trademark,
+        clear_filter_trademark,
+    );
+    push_filter_chip(&mut chips, t.sender, &filters.sender, clear_filter_sender);
+    push_filter_chip(
+        &mut chips,
+        t.recipient,
+        &filters.recipient,
+        clear_filter_recipient,
+    );
+    push_filter_chip(
+        &mut chips,
+        t.description,
+        &filters.description,
+        clear_filter_description,
+    );
+    push_filter_chip(
+        &mut chips,
+        t.trade_country,
+        &filters.trade_country,
+        clear_filter_trade_country,
+    );
+    push_filter_chip(
+        &mut chips,
+        t.dispatch_country,
+        &filters.dispatch_country,
+        clear_filter_dispatch_country,
+    );
+    push_filter_chip(
+        &mut chips,
+        t.origin_country,
+        &filters.origin_country,
+        clear_filter_origin_country,
+    );
+    chips
+}
+
+fn push_filter_chip(
+    chips: &mut Vec<(&'static str, String, FilterClear)>,
+    label: &'static str,
+    value: &str,
+    clear: FilterClear,
+) {
+    let value = value.trim();
+    if !value.is_empty() {
+        chips.push((label, value.to_string(), clear));
+    }
+}
+
+fn clear_filter_year(filters: &mut Filters) {
+    filters.year.clear();
+}
+
+fn clear_filter_product_code(filters: &mut Filters) {
+    filters.product_code.clear();
+}
+
+fn clear_filter_edrpou(filters: &mut Filters) {
+    filters.edrpou.clear();
+}
+
+fn clear_filter_trademark(filters: &mut Filters) {
+    filters.trademark.clear();
+}
+
+fn clear_filter_sender(filters: &mut Filters) {
+    filters.sender.clear();
+}
+
+fn clear_filter_recipient(filters: &mut Filters) {
+    filters.recipient.clear();
+}
+
+fn clear_filter_description(filters: &mut Filters) {
+    filters.description.clear();
+}
+
+fn clear_filter_trade_country(filters: &mut Filters) {
+    filters.trade_country.clear();
+}
+
+fn clear_filter_dispatch_country(filters: &mut Filters) {
+    filters.dispatch_country.clear();
+}
+
+fn clear_filter_origin_country(filters: &mut Filters) {
+    filters.origin_country.clear();
+}
+
+fn add_advanced_condition(query: &mut Option<QueryExpr>, condition: QueryCondition) {
+    ensure_advanced_root(query);
+    if let Some(QueryExpr::Group(group)) = query {
+        group.children.push(QueryExpr::Condition(condition));
+    }
+}
+
+fn ensure_advanced_root(query: &mut Option<QueryExpr>) {
+    let next = match query.take() {
+        Some(QueryExpr::Group(group)) => QueryExpr::Group(group),
+        Some(expr) => QueryExpr::Group(QueryGroup {
+            op: LogicOp::And,
+            negated: false,
+            children: vec![expr],
+        }),
+        None => QueryExpr::Group(QueryGroup::default()),
+    };
+    *query = Some(next);
+}
+
+fn apply_advanced_chip_action(query: &mut Option<QueryExpr>, action: AdvancedChipAction) {
+    ensure_advanced_root(query);
+    let Some(QueryExpr::Group(group)) = query else {
+        return;
+    };
+    match action {
+        AdvancedChipAction::Duplicate(index) => {
+            if let Some(expr) = group.children.get(index).cloned() {
+                group.children.insert(index + 1, expr);
+            }
+        }
+        AdvancedChipAction::ToggleNot(index) => {
+            if let Some(expr) = group.children.get_mut(index) {
+                toggle_expr_not(expr);
+            }
+        }
+        AdvancedChipAction::Remove(index) => {
+            if index < group.children.len() {
+                group.children.remove(index);
+            }
+        }
+    }
+}
+
+fn toggle_expr_not(expr: &mut QueryExpr) {
+    match expr {
+        QueryExpr::Group(group) => group.negated = !group.negated,
+        QueryExpr::Condition(condition) => condition.negated = !condition.negated,
+    }
+}
+
+fn ui_query_group(
+    ui: &mut egui::Ui,
+    group: &mut QueryGroup,
+    catalog: &[FieldInfo],
+    id: &str,
+    is_root: bool,
+    t: &Tr,
+) -> bool {
+    let mut search = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new(t.v2_match).weak());
+        egui::ComboBox::from_id_salt(format!("{id}-logic"))
+            .selected_text(logic_op_label(group.op, t))
+            .width(135.0)
+            .show_ui(ui, |ui| {
+                search |= ui
+                    .selectable_value(&mut group.op, LogicOp::And, t.v2_match_all)
+                    .changed();
+                search |= ui
+                    .selectable_value(&mut group.op, LogicOp::Or, t.v2_match_any)
+                    .changed();
+            });
+        search |= ui
+            .checkbox(&mut group.negated, t.v2_exclude_group)
+            .changed();
+        ui.menu_button(t.v2_add_condition, |ui| {
+            ui.set_min_width(260.0);
+            for field in catalog {
+                if ui.button(&field.label).clicked() {
+                    group
+                        .children
+                        .push(QueryExpr::Condition(default_condition_for_field(field)));
+                    search = true;
+                    ui.close();
+                }
+            }
+        });
+        ui.menu_button(t.v2_add_group, |ui| {
+            if ui.button(t.v2_add_and_group).clicked() {
+                group.children.push(QueryExpr::Group(QueryGroup {
+                    op: LogicOp::And,
+                    negated: false,
+                    children: Vec::new(),
+                }));
+                search = true;
+                ui.close();
+            }
+            if ui.button(t.v2_add_or_group).clicked() {
+                group.children.push(QueryExpr::Group(QueryGroup {
+                    op: LogicOp::Or,
+                    negated: false,
+                    children: Vec::new(),
+                }));
+                search = true;
+                ui.close();
+            }
+        });
+        if is_root && ui.small_button(t.v2_clear_group).clicked() {
+            group.children.clear();
+            search = true;
+        }
+    });
+
+    let mut action: Option<(usize, AdvancedTreeAction)> = None;
+    for index in 0..group.children.len() {
+        ui.push_id(format!("{id}-{index}"), |ui| {
+            ui.indent("child", |ui| match &mut group.children[index] {
+                QueryExpr::Group(child_group) => {
+                    ui.horizontal(|ui| {
+                        let mut label = group_label_for_ui(child_group.op, t);
+                        if child_group.negated {
+                            label = format!("{}: {label}", t.v2_excluding);
+                        }
+                        ui.label(egui::RichText::new(label).strong());
+                        ui.menu_button(t.v2_more, |ui| {
+                            if ui.button(t.v2_duplicate).clicked() {
+                                action = Some((index, AdvancedTreeAction::Duplicate));
+                                ui.close();
+                            }
+                            if ui.button(t.v2_remove).clicked() {
+                                action = Some((index, AdvancedTreeAction::Remove));
+                                ui.close();
+                            }
+                        });
+                    });
+                    search |= ui_query_group(
+                        ui,
+                        child_group,
+                        catalog,
+                        &format!("{id}-{index}"),
+                        false,
+                        t,
+                    );
+                }
+                QueryExpr::Condition(condition) => {
+                    let child_action = ui_query_condition(ui, condition, catalog, id, t);
+                    search |= child_action.0;
+                    if let Some(action_kind) = child_action.1 {
+                        action = Some((index, action_kind));
+                    }
+                }
+            });
+        });
+    }
+    if let Some((index, action_kind)) = action {
+        match action_kind {
+            AdvancedTreeAction::Duplicate => {
+                if let Some(expr) = group.children.get(index).cloned() {
+                    group.children.insert(index + 1, expr);
+                    search = true;
+                }
+            }
+            AdvancedTreeAction::Remove => {
+                if index < group.children.len() {
+                    group.children.remove(index);
+                    search = true;
+                }
+            }
+        }
+    }
+    search
+}
+
+fn ui_query_condition(
+    ui: &mut egui::Ui,
+    condition: &mut QueryCondition,
+    catalog: &[FieldInfo],
+    id: &str,
+    t: &Tr,
+) -> (bool, Option<AdvancedTreeAction>) {
+    ensure_value_matches_operator(condition);
+    let mut search = false;
+    let mut action = None;
+    ui.horizontal_wrapped(|ui| {
+        search |= ui
+            .checkbox(&mut condition.negated, t.v2_exclude_rule)
+            .changed();
+        let field_id = condition.field.id();
+        egui::ComboBox::from_id_salt(format!("{id}-field-{field_id}"))
+            .selected_text(field_label(&condition.field, catalog))
+            .width(170.0)
+            .show_ui(ui, |ui| {
+                for field in catalog {
+                    if ui
+                        .selectable_label(field.id == field_id, &field.label)
+                        .clicked()
+                    {
+                        *condition = default_condition_for_field(field);
+                        search = true;
+                        ui.close();
+                    }
+                }
+            });
+        let ops = catalog
+            .iter()
+            .find(|field| field.id == condition.field.id())
+            .map(|field| field.operators.clone())
+            .unwrap_or_else(|| vec![condition.op]);
+        egui::ComboBox::from_id_salt(format!("{id}-op-{}", condition.field.id()))
+            .selected_text(condition_op_label(condition.op, t))
+            .width(120.0)
+            .show_ui(ui, |ui| {
+                for op in ops {
+                    if ui
+                        .selectable_value(&mut condition.op, op, condition_op_label(op, t))
+                        .changed()
+                    {
+                        condition.value = default_value_for_op(op);
+                        search = true;
+                    }
+                }
+            });
+        search |= ui_condition_value(ui, condition, id, t);
+        ui.menu_button(t.v2_more, |ui| {
+            if ui.button(t.v2_duplicate).clicked() {
+                action = Some(AdvancedTreeAction::Duplicate);
+                ui.close();
+            }
+            if ui.button(t.v2_remove).clicked() {
+                action = Some(AdvancedTreeAction::Remove);
+                ui.close();
+            }
+        });
+    });
+    (search, action)
+}
+
+fn ui_condition_value(ui: &mut egui::Ui, condition: &mut QueryCondition, id: &str, t: &Tr) -> bool {
+    match &mut condition.value {
+        ConditionValue::None => {
+            ui.label(egui::RichText::new(t.v2_no_value).weak());
+            false
+        }
+        ConditionValue::Single(value) => {
+            let response = ui.add(
+                egui::TextEdit::singleline(value)
+                    .desired_width(170.0)
+                    .hint_text(t.v2_value_hint),
+            );
+            response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+        }
+        ConditionValue::List(values) => {
+            let mut raw = values.join(", ");
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut raw)
+                    .desired_width(220.0)
+                    .hint_text(t.v2_list_hint),
+            );
+            if response.changed() {
+                *values = raw
+                    .split(',')
+                    .map(|value| value.trim().to_string())
+                    .collect();
+            }
+            response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+        }
+        ConditionValue::Range { from, to } => {
+            let mut from_text = from.clone().unwrap_or_default();
+            let mut to_text = to.clone().unwrap_or_default();
+            let from_response = ui.add(
+                egui::TextEdit::singleline(&mut from_text)
+                    .desired_width(95.0)
+                    .hint_text(t.v2_from_hint)
+                    .id_salt(format!("{id}-from")),
+            );
+            ui.label("..");
+            let to_response = ui.add(
+                egui::TextEdit::singleline(&mut to_text)
+                    .desired_width(95.0)
+                    .hint_text(t.v2_to_hint)
+                    .id_salt(format!("{id}-to")),
+            );
+            if from_response.changed() {
+                *from = (!from_text.trim().is_empty()).then_some(from_text.trim().to_string());
+            }
+            if to_response.changed() {
+                *to = (!to_text.trim().is_empty()).then_some(to_text.trim().to_string());
+            }
+            (from_response.lost_focus() || to_response.lost_focus())
+                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+        }
+    }
+}
+
 fn filter_field(ui: &mut egui::Ui, label: &str, value: &mut String, width: f32, search: &mut bool) {
     ui.vertical(|ui| {
         ui.label(egui::RichText::new(label).small().weak());
@@ -6867,7 +7598,7 @@ fn setup_style(ctx: &egui::Context) {
         style.spacing.button_padding = egui::vec2(12.0, 5.0);
         style.animation_time = 0.14;
         style.visuals.selection.bg_fill = ACCENT;
-        style.visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+        style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
         style.visuals.hyperlink_color = ACCENT;
         style.visuals.slider_trailing_fill = true;
     });
@@ -6883,12 +7614,14 @@ fn setup_style(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuidedQuestionKind, StoredQuery, decode_stored_queries, encode_stored_queries,
-        exact_edrpou_candidate, guided_question_title, guided_questions_for,
-        invalidate_underpricing_generation,
+        GuidedQuestionKind, StoredQuery, condition_op_label, decode_stored_queries,
+        decode_stored_queries_v2, decode_stored_queries_with_fallback, encode_stored_queries,
+        encode_stored_queries_v2, exact_edrpou_candidate, guided_question_title,
+        guided_questions_for, invalidate_underpricing_generation,
     };
     use crate::db::{Filters, Query};
-    use crate::i18n::Lang;
+    use crate::i18n::{Lang, tr};
+    use crate::search::{ConditionOp, ConditionValue, FieldRef, QueryCondition, QueryExpr};
 
     #[test]
     fn invalidating_underpricing_generation_rejects_stale_results() {
@@ -6911,6 +7644,7 @@ mod tests {
                 origin_country: "CN".into(),
                 ..Filters::default()
             },
+            advanced: None,
         };
         let stored = vec![StoredQuery {
             name: "Apple saved".into(),
@@ -6923,6 +7657,53 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].name, "Apple saved");
         assert_eq!(decoded[0].query, query);
+    }
+
+    #[test]
+    fn stored_queries_v2_round_trip_advanced_query() {
+        let query = Query {
+            text: "phones".into(),
+            filters: Filters::default(),
+            advanced: Some(QueryExpr::Condition(QueryCondition {
+                field: FieldRef::Column("sender".into()),
+                op: ConditionOp::Contains,
+                value: ConditionValue::Single("Apple".into()),
+                negated: true,
+            })),
+        };
+        let stored = vec![StoredQuery {
+            name: "No Apple senders".into(),
+            query: query.clone(),
+        }];
+
+        let encoded = encode_stored_queries_v2(&stored);
+        let decoded = decode_stored_queries_v2(&encoded);
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].name, "No Apple senders");
+        assert_eq!(decoded[0].query, query);
+    }
+
+    #[test]
+    fn stored_queries_fallback_reads_legacy_v1() {
+        let legacy_query = Query {
+            text: "legacy".into(),
+            filters: Filters {
+                year: "2024".into(),
+                ..Filters::default()
+            },
+            advanced: None,
+        };
+        let legacy = vec![StoredQuery {
+            name: "Legacy".into(),
+            query: legacy_query.clone(),
+        }];
+
+        let decoded =
+            decode_stored_queries_with_fallback(None, Some(encode_stored_queries(&legacy)));
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].query, legacy_query);
     }
 
     #[test]
@@ -6949,6 +7730,66 @@ mod tests {
         for lang in Lang::ALL {
             for kind in kinds {
                 assert!(!guided_question_title(kind, lang).trim().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn v2_search_translations_cover_all_languages() {
+        let ops = [
+            ConditionOp::Contains,
+            ConditionOp::Equals,
+            ConditionOp::StartsWith,
+            ConditionOp::IsAnyOf,
+            ConditionOp::Range,
+            ConditionOp::IsEmpty,
+            ConditionOp::IsNotEmpty,
+        ];
+        for lang in Lang::ALL {
+            let t = tr(lang);
+            for value in [
+                t.v2_query_summary,
+                t.v2_add_filter,
+                t.v2_advanced,
+                t.v2_clear_advanced,
+                t.v2_advanced_search,
+                t.v2_logic_hint,
+                t.v2_match,
+                t.v2_match_all,
+                t.v2_match_any,
+                t.v2_exclude_group,
+                t.v2_exclude_rule,
+                t.v2_excluding,
+                t.v2_add_group,
+                t.v2_edit_in_filters,
+                t.v2_edit,
+                t.v2_duplicate,
+                t.v2_toggle_not,
+                t.v2_remove,
+                t.v2_more,
+                t.v2_add_condition,
+                t.v2_add_and_group,
+                t.v2_add_or_group,
+                t.v2_clear_group,
+                t.v2_group,
+                t.v2_and_group,
+                t.v2_or_group,
+                t.v2_no_value,
+                t.v2_value_hint,
+                t.v2_list_hint,
+                t.v2_from_hint,
+                t.v2_to_hint,
+            ] {
+                assert!(
+                    !value.trim().is_empty(),
+                    "missing V2 translation for {lang:?}"
+                );
+            }
+            for op in ops {
+                assert!(
+                    !condition_op_label(op, t).trim().is_empty(),
+                    "missing V2 operator translation for {lang:?}"
+                );
             }
         }
     }

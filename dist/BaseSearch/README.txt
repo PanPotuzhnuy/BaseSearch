@@ -1,4 +1,4 @@
-Base Search 1.3.0
+Base Search 1.4.0
 ===============
 
 How to run
@@ -42,8 +42,10 @@ Basic workflow
 2. Click Import Excel and select .xlsx, .xlsb, or .xls files.
 3. Search by product, company, product code, declaration number, country, or trademark.
 4. Use filters for year, code, EDRPOU, company, and country fields.
-5. Use Questions when you want the app to choose the right analytics view.
-6. Open Analytics to understand the current search: rows, declarations,
+5. Use + Filter and Advanced when a search needs several rules, any/all logic,
+   excluded rules, ranges, empty/not-empty checks, or extra imported columns.
+6. Use Questions when you want the app to choose the right analytics view.
+7. Open Analytics to understand the current search: rows, declarations,
    companies, value, net/gross weight, average value per kg, product codes,
    brands, countries, and price indicators.
    The Analytics tab is split into Overview, Companies, Goods, Countries,
@@ -54,9 +56,16 @@ Basic workflow
    popups; Prices has a stronger undervaluation scan with judged samples,
    suspicious value, estimated gap, and row-level risk details. Click an
    analytics row to apply its filter back to the results.
-7. Double-click a row to see all imported fields; right-click for quick
+8. Double-click a row to see all imported fields; right-click for quick
    filters and the company profile.
-8. Export matching rows to CSV or XLSX when needed.
+9. Export matching rows to CSV or XLSX when needed.
+
+Advanced search
+---------------
+The desktop app includes a flexible rule builder. Use it for searches such as
+"sender contains A or B", "exclude origin country CN", "year/date is between",
+or "extra imported column is not empty". Rules can be combined with all/any
+groups and nested when a search needs more structure.
 
 Privacy
 -------

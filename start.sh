@@ -88,9 +88,20 @@ fi
 
 if [ "$PLATFORM" = "Linux" ]; then
     # egui needs the X11/Wayland and keyboard libraries at build time.
-    if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists xkbcommon 2>/dev/null; then
+    MISSING_GUI_LIBS=
+    if command -v pkg-config >/dev/null 2>&1; then
+        for module in xkbcommon wayland-client xcb xcb-render xcb-shape xcb-xfixes; do
+            if ! pkg-config --exists "$module" 2>/dev/null; then
+                MISSING_GUI_LIBS="$MISSING_GUI_LIBS $module"
+            fi
+        done
+    else
+        MISSING_GUI_LIBS=" pkg-config"
+    fi
+    if [ -z "$MISSING_GUI_LIBS" ]; then
         ok "GUI build libraries are present"
     else
+        warn "Missing GUI build libraries:$MISSING_GUI_LIBS"
         warn "Installing the GUI build libraries (this needs your password for sudo)"
         SUDO=
         if [ "$(id -u)" -ne 0 ]; then SUDO=sudo; fi

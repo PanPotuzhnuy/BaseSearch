@@ -15,20 +15,20 @@ use base_search::import::{self, ImportPhase};
 use base_search::schema::RESULT_COLUMNS;
 use base_search::web;
 
-const USAGE: &str = "base-search-cli — техническая проверка базы Base Search
+const USAGE: &str = "base-search-cli - technical database checks for Base Search
 
-Использование:
+Usage:
   base-search-cli stats  <db>
   base-search-cli peek   <file.xlsx|file.xlsb>
   base-search-cli import <db> <file.xlsx|file.xlsb> [...]
-  base-search-cli search <db> [запрос...] [--limit N] [--year Y] [--code C]
+  base-search-cli search <db> [query...] [--limit N] [--year Y] [--code C]
                      [--sender S] [--recipient R] [--edrpou E]
                      [--trademark T] [--description D]
                      [--repeat N] [--warmups N] [--no-print-rows] [--json]
-  base-search-cli analytics <db> [запрос...] [--year Y] [--code C]
+  base-search-cli analytics <db> [query...] [--year Y] [--code C]
                        [--sender S] [--recipient R] [--edrpou E]
                        [--trademark T] [--description D]
-  base-search-cli export <db> <out.csv|out.xlsx> [запрос...]
+  base-search-cli export <db> <out.csv|out.xlsx> [query...]
   base-search-cli web [db] [--host 127.0.0.1] [--port 7832] [--no-open]";
 
 fn main() -> ExitCode {
@@ -50,7 +50,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("Ошибка: {e}");
+            eprintln!("Error: {e}");
             ExitCode::FAILURE
         }
     }
@@ -95,15 +95,15 @@ fn cmd_web(args: &[String]) -> Result<(), String> {
 
 fn cmd_stats(db_path: &Path) -> Result<(), String> {
     let db = Db::open(db_path)?;
-    println!("База: {}", db_path.display());
-    println!("Строк: {}", db.total_rows());
-    println!("Не проиндексировано: {}", db.unindexed_rows());
+    println!("Database: {}", db_path.display());
+    println!("Rows: {}", db.total_rows());
+    println!("Unindexed rows: {}", db.unindexed_rows());
     let log = db.import_log(20);
     if !log.is_empty() {
-        println!("Последние импорты:");
+        println!("Recent imports:");
         for e in log {
             println!(
-                "  {}  строк {}  добавлено {}  дубликатов {}  {:.1}с  {}",
+                "  {}  rows {}  imported {}  duplicates {}  {:.1}s  {}",
                 e.file_name, e.total_rows, e.imported, e.duplicates, e.seconds, e.imported_at
             );
         }
@@ -146,11 +146,11 @@ fn cmd_peek(path: &Path) -> Result<(), String> {
     use calamine::Reader;
     let mut wb = calamine::open_workbook_auto(path).map_err(|e| e.to_string())?;
     let names: Vec<String> = wb.sheet_names().to_vec();
-    println!("Листы: {names:?}");
+    println!("Sheets: {names:?}");
     for (i, name) in names.iter().enumerate().take(3) {
         if let Some(Ok(range)) = wb.worksheet_range_at(i) {
             println!(
-                "-- Лист {i} «{name}»: {} строк x {} колонок",
+                "-- Sheet {i} \"{name}\": {} rows x {} columns",
                 range.height(),
                 range.width()
             );
@@ -193,9 +193,9 @@ fn cmd_import(db_path: &Path, files: &[String]) -> Result<(), String> {
                 last_phase = Some(phase);
                 last_print = Instant::now();
                 let name = match phase {
-                    ImportPhase::Reading => "чтение",
-                    ImportPhase::Inserting => "запись",
-                    ImportPhase::Indexing => "индексация",
+                    ImportPhase::Reading => "reading",
+                    ImportPhase::Inserting => "inserting",
+                    ImportPhase::Indexing => "indexing",
                 };
                 if total > 0 {
                     println!("   {name}: {done} / {total}");
@@ -205,12 +205,12 @@ fn cmd_import(db_path: &Path, files: &[String]) -> Result<(), String> {
             }
         });
         match (&summary.error, &summary.skipped_duplicate_of) {
-            (Some(e), _) => println!("   ОШИБКА: {e}"),
+            (Some(e), _) => println!("   ERROR: {e}"),
             (None, Some(previous)) => {
-                println!("   пропущен: файл уже импортирован (совпадает с «{previous}»)")
+                println!("   skipped: file was already imported (matches \"{previous}\")")
             }
             (None, None) => println!(
-                "   готово: строк {}, добавлено {}, дубликатов {}, за {:.1}с ({:.0} строк/с)",
+                "   done: rows {}, imported {}, duplicates {}, in {:.1}s ({:.0} rows/s)",
                 summary.total_rows,
                 summary.imported,
                 summary.duplicates,
@@ -219,37 +219,58 @@ fn cmd_import(db_path: &Path, files: &[String]) -> Result<(), String> {
             ),
         }
     }
-    println!("Всего строк в базе: {}", db.total_rows());
+    println!("Total rows in database: {}", db.total_rows());
     Ok(())
 }
 
-fn parse_query(args: &[String]) -> (Query, u64) {
+fn parse_query(args: &[String]) -> Result<(Query, u64), String> {
+    parse_query_with_options(args, true)
+}
+
+fn parse_export_query(args: &[String]) -> Result<Query, String> {
+    parse_query_with_options(args, false).map(|(query, _)| query)
+}
+
+fn parse_query_with_options(args: &[String], allow_limit: bool) -> Result<(Query, u64), String> {
     let mut q = Query::default();
     let mut limit = 10u64;
     let mut filters = Filters::default();
-    let mut words: Vec<&str> = Vec::new();
+    let mut words: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        let take = |i: &mut usize| -> String {
+        let take = |i: &mut usize, flag: &str| -> Result<String, String> {
             *i += 1;
-            args.get(*i).cloned().unwrap_or_default()
+            match args.get(*i) {
+                Some(value) if !value.starts_with("--") => Ok(value.clone()),
+                _ => Err(format!("{flag} requires a value")),
+            }
         };
         match args[i].as_str() {
-            "--limit" => limit = take(&mut i).parse().unwrap_or(10),
-            "--year" => filters.year = take(&mut i),
-            "--code" => filters.product_code = take(&mut i),
-            "--sender" => filters.sender = take(&mut i),
-            "--recipient" => filters.recipient = take(&mut i),
-            "--edrpou" => filters.edrpou = take(&mut i),
-            "--trademark" => filters.trademark = take(&mut i),
-            "--description" => filters.description = take(&mut i),
-            word => words.push(word),
+            "--limit" if allow_limit => {
+                let value = take(&mut i, "--limit")?;
+                limit = value
+                    .parse()
+                    .map_err(|_| "--limit must be a positive integer".to_string())?;
+                if limit == 0 {
+                    return Err("--limit must be a positive integer".to_string());
+                }
+            }
+            "--limit" => return Err("--limit is not supported by export".to_string()),
+            "--year" => filters.year = take(&mut i, "--year")?,
+            "--code" => filters.product_code = take(&mut i, "--code")?,
+            "--sender" => filters.sender = take(&mut i, "--sender")?,
+            "--recipient" => filters.recipient = take(&mut i, "--recipient")?,
+            "--edrpou" => filters.edrpou = take(&mut i, "--edrpou")?,
+            "--trademark" => filters.trademark = take(&mut i, "--trademark")?,
+            "--description" => filters.description = take(&mut i, "--description")?,
+            flag if flag.starts_with("--") => return Err(format!("Unknown query option: {flag}")),
+            word => words.push(word.to_string()),
         }
         i += 1;
     }
     q.text = words.join(" ");
     q.filters = filters;
-    (q, limit)
+    Ok((q, limit))
 }
 
 #[derive(Debug, Clone)]
@@ -324,7 +345,7 @@ fn parse_positive_usize(value: Option<&String>, flag: &str) -> Result<usize, Str
 /// Completes the search index after an interrupted import or migration.
 fn ensure_indexed(db: &mut Db) -> Result<(), String> {
     if db.unindexed_rows() > 0 {
-        eprintln!("Индекс перестраивается...");
+        eprintln!("Rebuilding search index...");
         let cancel = AtomicBool::new(false);
         db.index_fts(&cancel, |_, _| {})
             .map_err(|e| e.to_string())?;
@@ -336,7 +357,7 @@ fn cmd_search(db_path: &Path, args: &[String]) -> Result<(), String> {
     let mut db = Db::open(db_path)?;
     ensure_indexed(&mut db)?;
     let (query_args, options) = parse_search_args(args)?;
-    let (q, limit) = parse_query(&query_args);
+    let (q, limit) = parse_query(&query_args)?;
     for _ in 0..options.warmups {
         run_search_once(&db, &q, limit, false)?;
     }
@@ -352,7 +373,7 @@ fn cmd_search(db_path: &Path, args: &[String]) -> Result<(), String> {
     if options.repeat == 1 {
         let run = &runs[0];
         println!(
-            "Найдено: {} (count {:.3} мс, страница {:.3} мс)",
+            "Found: {} (count {:.3} ms, page {:.3} ms)",
             run.total, run.count_ms, run.page_ms
         );
     } else {
@@ -488,7 +509,7 @@ fn json_escape(value: &str) -> String {
 fn cmd_analytics(db_path: &Path, args: &[String]) -> Result<(), String> {
     let mut db = Db::open(db_path)?;
     ensure_indexed(&mut db)?;
-    let (q, _) = parse_query(args);
+    let (q, _) = parse_query(args)?;
     let started = Instant::now();
     let analytics = db.analytics(&q, 10).map_err(|e| e.to_string())?;
     println!(
@@ -614,7 +635,7 @@ fn trunc(s: &str, n: usize) -> String {
 fn cmd_export(db_path: &Path, out: &str, args: &[String]) -> Result<(), String> {
     let mut db = Db::open(db_path)?;
     ensure_indexed(&mut db)?;
-    let (q, _) = parse_query(args);
+    let q = parse_export_query(args)?;
     let cancel = AtomicBool::new(false);
     let started = Instant::now();
     let mut last_print = Instant::now();
@@ -624,10 +645,56 @@ fn cmd_export(db_path: &Path, out: &str, args: &[String]) -> Result<(), String> 
             println!("  {done} / {total}");
         }
     })
-    .map_err(|e| format!("{e:?}"))?;
+    .map_err(export_error_message)?;
     println!(
-        "Экспортировано {written} строк в {out} за {:.1}с",
+        "Exported {written} rows to {out} in {:.1}s",
         started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+fn export_error_message(err: export::ExportError) -> String {
+    match err {
+        export::ExportError::TooManyRowsForXlsx(rows) => {
+            format!("{rows} rows exceed the XLSX row limit; export CSV instead")
+        }
+        export::ExportError::UnsupportedExtension(ext) if ext.is_empty() => {
+            "Unsupported export extension. Use .csv or .xlsx.".to_string()
+        }
+        export::ExportError::UnsupportedExtension(ext) => {
+            format!("Unsupported export extension: .{ext}. Use .csv or .xlsx.")
+        }
+        export::ExportError::Cancelled => "Export cancelled".to_string(),
+        export::ExportError::Other(message) => message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parse_query_rejects_missing_filter_values() {
+        assert!(parse_query(&args(&["--year"])).is_err());
+        assert!(parse_query(&args(&["--code"])).is_err());
+    }
+
+    #[test]
+    fn parse_query_rejects_invalid_limit() {
+        assert!(parse_query(&args(&["--limit", "nope"])).is_err());
+    }
+
+    #[test]
+    fn parse_query_rejects_unknown_flags() {
+        assert!(parse_query(&args(&["--unknown"])).is_err());
+    }
+
+    #[test]
+    fn parse_export_query_rejects_limit() {
+        assert!(parse_export_query(&args(&["--limit", "10"])).is_err());
+    }
 }

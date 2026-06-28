@@ -22,7 +22,7 @@ use calamine::{Data, Reader, Sheets, open_workbook_auto};
 use chrono::Timelike;
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::db::{Db, ImportRecord, extract_year};
+use crate::db::{Db, ImportRecord, canonical_record_hash, extract_year};
 use crate::schema::{COLUMNS, DATE_COL, REQUIRED_HEADERS};
 
 const BATCH_SIZE: usize = 8192;
@@ -966,7 +966,7 @@ impl RowSink<'_> {
     }
 
     fn data_row(&mut self, row: Vec<Data>) -> Result<bool, String> {
-        let mapping = self.mapping.as_ref().expect("mapping установлен");
+        let mapping = self.mapping.as_ref().expect("mapping initialized");
         let mut values: Vec<String> = Vec::with_capacity(COLUMNS.len());
         for (i, src) in mapping.iter().enumerate() {
             let value = match src {
@@ -990,11 +990,10 @@ impl RowSink<'_> {
         }
         values[DATE_COL] = normalize_date(&values[DATE_COL]);
         let extra = self.collect_extra(&row);
+        let hash = canonical_record_hash(&values, extra.as_deref());
         self.summary.total_rows += 1;
         self.batch.push(ImportRecord {
-            // Hash the full source row so rows that differ only in unmapped
-            // columns are not treated as duplicates.
-            hash: row_hash_cells(&row),
+            hash,
             year: extract_year(&values[DATE_COL]),
             values,
             extra,
@@ -1166,22 +1165,42 @@ pub fn collapse_ws(s: &str) -> String {
 }
 
 /// "31.12.2024" / "31/12/2024" / "31-12-2024" -> "2024-12-31".
+/// "2024.12.31" / "2024-1-5" -> "2024-12-31" / "2024-01-05".
 /// Existing ISO dates and unrecognized text are returned unchanged.
 pub fn normalize_date(value: &str) -> String {
     let parts: Vec<&str> = value.split(['.', '/', '-']).collect();
-    if parts.len() == 3
-        && parts[0].len() <= 2
-        && parts[1].len() <= 2
-        && parts[2].len() == 4
-        && let (Ok(d), Ok(m), Ok(y)) = (
-            parts[0].parse::<u32>(),
-            parts[1].parse::<u32>(),
-            parts[2].parse::<u32>(),
-        )
-        && (1..=31).contains(&d)
-        && (1..=12).contains(&m)
-    {
-        return format!("{y:04}-{m:02}-{d:02}");
+    if parts.len() == 3 {
+        // DD.MM.YYYY (also with '/' or '-' separators).
+        if parts[0].len() <= 2
+            && parts[1].len() <= 2
+            && parts[2].len() == 4
+            && let (Ok(d), Ok(m), Ok(y)) = (
+                parts[0].parse::<u32>(),
+                parts[1].parse::<u32>(),
+                parts[2].parse::<u32>(),
+            )
+            && (1..=31).contains(&d)
+            && (1..=12).contains(&m)
+        {
+            return format!("{y:04}-{m:02}-{d:02}");
+        }
+        // YYYY.MM.DD / YYYY-M-D: canonicalize the separator to '-' and zero-pad
+        // the month/day so the monthly-analytics filter (which matches the
+        // "YYYY-MM" prefix) still sees these rows instead of silently dropping
+        // them. ISO "2024-12-31" passes through here unchanged.
+        if parts[0].len() == 4
+            && parts[1].len() <= 2
+            && parts[2].len() <= 2
+            && let (Ok(y), Ok(m), Ok(d)) = (
+                parts[0].parse::<u32>(),
+                parts[1].parse::<u32>(),
+                parts[2].parse::<u32>(),
+            )
+            && (1..=12).contains(&m)
+            && (1..=31).contains(&d)
+        {
+            return format!("{y:04}-{m:02}-{d:02}");
+        }
     }
     value.to_string()
 }
