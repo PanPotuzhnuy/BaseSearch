@@ -1,4 +1,4 @@
-# Base Search 1.4.0
+# Base Search 1.4.1
 
 [![CI](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml)
 
@@ -326,6 +326,31 @@ In development testing, Base Search handled multi-million-row datasets locally:
 These are not universal benchmark guarantees. A weak HDD-based PC and a modern
 SSD desktop will behave very differently.
 
+### Database Maintenance
+
+SQLite databases can temporarily look larger than the visible data after large
+imports, migrations, cancelled imports, or heavy deletes. Two normal SQLite
+mechanisms are involved:
+
+- the `*.db-wal` file, which stores recent writes before they are checkpointed;
+- free pages inside the main `*.db` file, which SQLite can reuse but the
+  operating system does not see as free disk space until `VACUUM` rewrites the
+  file.
+
+The command-line tool can inspect and compact local storage:
+
+```powershell
+base-search-cli stats data/base_search.db
+base-search-cli compact data/base_search.db
+base-search-cli compact data/base_search.db --vacuum
+```
+
+`compact` without `--vacuum` performs a safe WAL checkpoint and is usually
+quick. `compact --vacuum` keeps the data but rewrites the database file to
+return internal free pages to the filesystem; on multi-gigabyte databases this
+can take a long time and should be run only after closing other Base Search
+windows.
+
 ## Command-Line Utility
 
 The distribution includes a small diagnostic tool for checking data without the
@@ -333,6 +358,7 @@ graphical interface:
 
 ```powershell
 base-search-cli stats  <db>
+base-search-cli compact <db> [--vacuum]
 base-search-cli peek   <file.xlsx|file.xlsb>
 base-search-cli import <db> <file.xlsx|file.xlsb> [...]
 base-search-cli search <db> [query...] [--limit N] [--year Y] [--code C]
@@ -400,6 +426,18 @@ selected local spreadsheets and writes a local SQLite database beside the
 application executable.
 
 ## Changelog
+
+### 1.4.1
+
+- **Database startup hotfix.** Existing large databases are migrated in place
+  without forcing a multi-gigabyte FTS rebuild when the indexed text is already
+  compatible.
+- **SQLite maintenance CLI.** `base-search-cli stats` now reports file sizes,
+  WAL size, and SQLite free pages. `base-search-cli compact` can truncate WAL
+  safely, and `compact --vacuum` can rewrite the database to return internal
+  free pages to the filesystem.
+- **Release hygiene.** Local release packages and multi-gigabyte databases are
+  kept out of git, while the Windows distribution binaries are rebuilt.
 
 ### 1.4.0
 

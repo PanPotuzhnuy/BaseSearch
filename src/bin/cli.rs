@@ -7,8 +7,8 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use base_search::db::{
-    AnalyticsGroupRow, AnalyticsPriceMetric, AnalyticsSection, AnalyticsSectionKind, Db, Filters,
-    PriceMetricKind, Query,
+    AnalyticsGroupRow, AnalyticsPriceMetric, AnalyticsSection, AnalyticsSectionKind,
+    DatabaseStorageInfo, Db, Filters, PriceMetricKind, Query,
 };
 use base_search::export;
 use base_search::import::{self, ImportPhase};
@@ -19,6 +19,7 @@ const USAGE: &str = "base-search-cli - technical database checks for Base Search
 
 Usage:
   base-search-cli stats  <db>
+  base-search-cli compact <db> [--vacuum]
   base-search-cli peek   <file.xlsx|file.xlsb>
   base-search-cli import <db> <file.xlsx|file.xlsb> [...]
   base-search-cli search <db> [query...] [--limit N] [--year Y] [--code C]
@@ -35,6 +36,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("stats") if args.len() == 2 => cmd_stats(Path::new(&args[1])),
+        Some("compact") if args.len() >= 2 => cmd_compact(Path::new(&args[1]), &args[2..]),
         Some("peek") if args.len() == 2 => cmd_peek(Path::new(&args[1])),
         Some("import") if args.len() >= 3 => cmd_import(Path::new(&args[1]), &args[2..]),
         Some("search") if args.len() >= 2 => cmd_search(Path::new(&args[1]), &args[2..]),
@@ -98,6 +100,7 @@ fn cmd_stats(db_path: &Path) -> Result<(), String> {
     println!("Database: {}", db_path.display());
     println!("Rows: {}", db.total_rows());
     println!("Unindexed rows: {}", db.unindexed_rows());
+    print_storage_info(&db.storage_info(db_path).map_err(|e| e.to_string())?);
     let log = db.import_log(20);
     if !log.is_empty() {
         println!("Recent imports:");
@@ -109,6 +112,71 @@ fn cmd_stats(db_path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn cmd_compact(db_path: &Path, args: &[String]) -> Result<(), String> {
+    let vacuum = parse_compact_options(args)?;
+    let db = Db::open(db_path)?;
+    println!("Database: {}", db_path.display());
+    println!("Before:");
+    let before = db.storage_info(db_path).map_err(|e| e.to_string())?;
+    print_storage_info(&before);
+
+    let checkpoint = db.checkpoint_wal_truncate().map_err(|e| e.to_string())?;
+    println!(
+        "WAL checkpoint: busy {}, log frames {}, checkpointed {}",
+        checkpoint.busy, checkpoint.log_frames, checkpoint.checkpointed_frames
+    );
+
+    if vacuum {
+        println!("Running VACUUM. This can take a long time on large databases.");
+        db.vacuum_database().map_err(|e| e.to_string())?;
+    } else if before.freelist_bytes > 0 {
+        println!(
+            "SQLite free pages remain inside the main database file. Run with --vacuum to rewrite the file and return about {} to the filesystem.",
+            format_bytes(before.freelist_bytes)
+        );
+    }
+
+    println!("After:");
+    print_storage_info(&db.storage_info(db_path).map_err(|e| e.to_string())?);
+    Ok(())
+}
+
+fn parse_compact_options(args: &[String]) -> Result<bool, String> {
+    match args {
+        [] => Ok(false),
+        [flag] if flag == "--vacuum" => Ok(true),
+        _ => Err("Usage: base-search-cli compact <db> [--vacuum]".to_string()),
+    }
+}
+
+fn print_storage_info(info: &DatabaseStorageInfo) {
+    println!("Storage:");
+    println!("  database file: {}", format_bytes(info.database_bytes));
+    println!("  WAL file: {}", format_bytes(info.wal_bytes));
+    println!("  SHM file: {}", format_bytes(info.shm_bytes));
+    println!(
+        "  SQLite free pages: {} ({})",
+        info.freelist_pages,
+        format_bytes(info.freelist_bytes)
+    );
+    println!("  total files: {}", format_bytes(info.total_file_bytes()));
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
 }
 
 /// Diagnostic query: arbitrary SELECT, limited to 50 printed rows.
@@ -696,5 +764,13 @@ mod tests {
     #[test]
     fn parse_export_query_rejects_limit() {
         assert!(parse_export_query(&args(&["--limit", "10"])).is_err());
+    }
+
+    #[test]
+    fn parse_compact_options_accepts_only_vacuum_flag() {
+        assert!(!parse_compact_options(&[]).unwrap());
+        assert!(parse_compact_options(&args(&["--vacuum"])).unwrap());
+        assert!(parse_compact_options(&args(&["--unknown"])).is_err());
+        assert!(parse_compact_options(&args(&["--vacuum", "--again"])).is_err());
     }
 }

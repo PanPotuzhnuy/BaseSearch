@@ -9,6 +9,7 @@
 !/dist/BaseSearch/base-search-cli.exe
 !/dist/BaseSearch/README.txt
 /dist/BaseSearch/data/
+/release_packages/
 
 # Local application data and SQLite sidecar files
 /data/

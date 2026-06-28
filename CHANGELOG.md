@@ -2,6 +2,18 @@
 
 All notable project changes are documented here.
 
+## 1.4.1
+
+- Optimized startup migration for existing large databases so compatible FTS
+  indexes are reused instead of being rebuilt unnecessarily.
+- Added database storage reporting to `base-search-cli stats`: main database
+  file size, WAL size, SHM size, SQLite free pages, and total storage.
+- Added `base-search-cli compact <db> [--vacuum]` for safe WAL truncation and
+  optional SQLite `VACUUM` compaction without deleting records.
+- Ignored local release package folders so zip artifacts do not get committed
+  accidentally.
+- Rebuilt the Windows distribution binaries for the 1.4.1 release.
+
 ## 1.4.0
 
 - Added a flexible desktop Advanced Search builder with editable rule chips,

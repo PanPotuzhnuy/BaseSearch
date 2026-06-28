@@ -42,6 +42,34 @@ fn result_table_exposes_all_source_columns() {
 }
 
 #[test]
+fn database_storage_maintenance_reports_and_compacts_without_deleting_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("maintenance.db");
+    let db = Db::open(&db_path).unwrap();
+    db.conn
+        .execute_batch(
+            "CREATE TABLE storage_test(value TEXT);
+             INSERT INTO storage_test VALUES (zeroblob(100000));
+             DROP TABLE storage_test;",
+        )
+        .unwrap();
+
+    let before = db.storage_info(&db_path).unwrap();
+    assert!(before.database_bytes > 0);
+    assert!(before.page_size > 0);
+    assert!(before.page_count > 0);
+
+    let checkpoint = db.checkpoint_wal_truncate().unwrap();
+    assert_eq!(checkpoint.busy, 0);
+    db.vacuum_database().unwrap();
+
+    let after = db.storage_info(&db_path).unwrap();
+    assert_eq!(db.total_rows(), 0);
+    assert_eq!(after.wal_bytes, 0);
+    assert!(after.total_file_bytes() <= before.total_file_bytes());
+}
+
+#[test]
 fn column_glossary_covers_abbreviated_table_headers() {
     for name in [
         "clearance_time",

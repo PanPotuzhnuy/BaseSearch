@@ -1,4 +1,4 @@
-Base Search 1.4.0
+Base Search 1.4.1
 ===============
 
 How to run
@@ -35,6 +35,22 @@ What this folder contains
 - base-search-cli.exe: optional command-line diagnostics.
 - Open Browser Mode.cmd: starts the local browser interface.
 - data/: local database folder. It is created and used on the user's computer.
+
+Database maintenance
+--------------------
+If data/base_search.db becomes much larger after big imports, close other
+Base Search windows and run:
+
+base-search-cli.exe stats data\base_search.db
+base-search-cli.exe compact data\base_search.db
+
+The compact command safely truncates the SQLite WAL file. For deeper
+compaction, run:
+
+base-search-cli.exe compact data\base_search.db --vacuum
+
+The --vacuum mode keeps records but rewrites the database file. It can take a
+long time on multi-gigabyte databases.
 
 Basic workflow
 --------------
