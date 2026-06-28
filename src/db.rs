@@ -1,6 +1,6 @@
 //! SQLite storage: schema, batched inserts, FTS5 indexing, search, and filters.
 
-use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -13,7 +13,7 @@ use xxhash_rust::xxh3::Xxh3;
 use crate::schema::{COLUMNS, RESULT_COLUMNS, SEARCH_COLUMNS};
 use crate::search::{
     ConditionOp, ConditionValue, FieldInfo, FieldKind, FieldRef, LogicOp, QueryExpr,
-    default_field_catalog, field_catalog, field_kind_for_column,
+    default_field_catalog, field_catalog, field_kind_for_column, result_field_catalog,
 };
 
 /// Filter values; an empty string means the filter is not set.
@@ -503,6 +503,12 @@ pub struct Db {
 }
 
 pub type SearchPage = (Vec<i64>, Vec<Vec<String>>, Vec<Option<String>>);
+pub type DynamicSearchPage = (
+    Vec<FieldInfo>,
+    Vec<i64>,
+    Vec<Vec<String>>,
+    Vec<Option<String>>,
+);
 
 #[derive(Clone)]
 struct SearchFieldSql {
@@ -1117,22 +1123,27 @@ impl Db {
         }
     }
 
+    pub fn result_fields(&self) -> rusqlite::Result<Vec<FieldInfo>> {
+        Ok(result_field_catalog(self.extra_headers()?))
+    }
+
     pub fn extra_headers(&self) -> rusqlite::Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT extra FROM records
              WHERE extra IS NOT NULL AND TRIM(extra) <> ''",
         )?;
         let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
-        let mut headers = BTreeMap::new();
+        let mut seen = HashSet::new();
+        let mut headers = Vec::new();
         for raw in rows {
             for (header, _) in parse_extra(raw?.as_deref()) {
                 let key = normalize_text_key(&header);
-                if !key.is_empty() {
-                    headers.entry(key).or_insert(header);
+                if !key.is_empty() && seen.insert(key) {
+                    headers.push(header);
                 }
             }
         }
-        Ok(headers.into_values().collect())
+        Ok(headers)
     }
 
     // ---------- search ----------
@@ -1466,6 +1477,55 @@ impl Db {
         Ok((ids, data, dups))
     }
 
+    pub fn search_page_dynamic(
+        &self,
+        q: &Query,
+        limit: u64,
+        offset: u64,
+    ) -> rusqlite::Result<DynamicSearchPage> {
+        let fields = self.result_fields()?;
+        let (joins, where_sql, params) = self.build_where(q, false)?;
+        let mut select = Vec::with_capacity(fields.len());
+        let mut extra_headers = Vec::new();
+        for field in &fields {
+            match &field.source {
+                FieldRef::Column(name) => select.push(format!("r.{name}")),
+                FieldRef::Extra(header) => {
+                    select.push("extra_value(r.extra, ?)".to_string());
+                    extra_headers.push(header.clone());
+                }
+            }
+        }
+        let order = if uses_fast_result_order(q) {
+            "r.id DESC"
+        } else {
+            "r.declaration_date DESC, r.id DESC"
+        };
+        let sql = format!(
+            "SELECT r.id, {}, r.dup_first_file FROM records r{joins}{where_sql} ORDER BY {order} LIMIT ? OFFSET ?",
+            select.join(", ")
+        );
+        let mut final_params: Vec<Value> = extra_headers.into_iter().map(Value::from).collect();
+        final_params.extend(params);
+        final_params.push((limit as i64).into());
+        final_params.push((offset as i64).into());
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(final_params))?;
+        let mut ids = Vec::new();
+        let mut data = Vec::new();
+        let mut dups = Vec::new();
+        while let Some(row) = rows.next()? {
+            ids.push(row.get::<_, i64>(0)?);
+            let mut values = Vec::with_capacity(fields.len());
+            for i in 0..fields.len() {
+                values.push(row.get::<_, Option<String>>(i + 1)?.unwrap_or_default());
+            }
+            data.push(values);
+            dups.push(row.get::<_, Option<String>>(fields.len() + 1)?);
+        }
+        Ok((fields, ids, data, dups))
+    }
+
     /// Export row batch using keyset pagination by id: all 41 columns plus file.
     pub fn export_batch(
         &self,
@@ -1494,6 +1554,64 @@ impl Db {
             max_id = row.get::<_, i64>(0)?;
             let mut values = Vec::with_capacity(COLUMNS.len() + 1);
             for i in 0..=COLUMNS.len() {
+                values.push(row.get::<_, Option<String>>(i + 1)?.unwrap_or_default());
+            }
+            data.push(values);
+        }
+        Ok((max_id, data))
+    }
+
+    pub fn export_batch_dynamic(
+        &self,
+        q: &Query,
+        last_id: i64,
+        limit: u64,
+    ) -> rusqlite::Result<(Vec<FieldInfo>, i64, Vec<Vec<String>>)> {
+        let fields = self.result_fields()?;
+        let (max_id, data) = self.export_batch_fields(q, last_id, limit, &fields)?;
+        Ok((fields, max_id, data))
+    }
+
+    pub fn export_batch_fields(
+        &self,
+        q: &Query,
+        last_id: i64,
+        limit: u64,
+        fields: &[FieldInfo],
+    ) -> rusqlite::Result<(i64, Vec<Vec<String>>)> {
+        let (joins, where_sql, params) = self.build_where(q, false)?;
+        let mut select = Vec::with_capacity(fields.len());
+        let mut extra_headers = Vec::new();
+        for field in fields {
+            match &field.source {
+                FieldRef::Column(name) => select.push(format!("r.{name}")),
+                FieldRef::Extra(header) => {
+                    select.push("extra_value(r.extra, ?)".to_string());
+                    extra_headers.push(header.clone());
+                }
+            }
+        }
+        let cond = if where_sql.is_empty() {
+            " WHERE"
+        } else {
+            " AND"
+        };
+        let sql = format!(
+            "SELECT r.id, {} FROM records r{joins}{where_sql}{cond} r.id > ? ORDER BY r.id LIMIT ?",
+            select.join(", ")
+        );
+        let mut final_params: Vec<Value> = extra_headers.into_iter().map(Value::from).collect();
+        final_params.extend(params);
+        final_params.push(last_id.into());
+        final_params.push((limit as i64).into());
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(final_params))?;
+        let mut data = Vec::new();
+        let mut max_id = last_id;
+        while let Some(row) = rows.next()? {
+            max_id = row.get::<_, i64>(0)?;
+            let mut values = Vec::with_capacity(fields.len());
+            for i in 0..fields.len() {
                 values.push(row.get::<_, Option<String>>(i + 1)?.unwrap_or_default());
             }
             data.push(values);

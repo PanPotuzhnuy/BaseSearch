@@ -2,6 +2,21 @@
 
 All notable project changes are documented here.
 
+## 1.5.0
+
+- Added universal table import: spreadsheets that do not match any known
+  customs layout are imported as generic tables instead of being rejected.
+- Preserved every generic source column as a dynamic field, indexed it for
+  full-text search, and exposed it in Advanced Search.
+- Switched desktop result pages to dynamic result columns so imported extra
+  fields are visible directly in the main table.
+- Switched the local browser schema, search results, and page CSV export to the
+  same dynamic column model.
+- Updated full CSV/XLSX export to include dynamic imported columns, not only
+  the fixed customs schema.
+- Preserved extra-column order by first appearance in the source data.
+- Added regression coverage for arbitrary non-customs Excel tables.
+
 ## 1.4.1
 
 - Optimized startup migration for existing large databases so compatible FTS

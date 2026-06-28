@@ -36,7 +36,6 @@ impl Lang {
     pub fn from_code(code: &str) -> Lang {
         match code {
             "ua" => Lang::Ua,
-            "ru" => Lang::Ua,
             "de" => Lang::De,
             "es" => Lang::Es,
             "fr" => Lang::Fr,
@@ -45,7 +44,6 @@ impl Lang {
             "ro" => Lang::Ro,
             "hu" => Lang::Hu,
             "bg" => Lang::Bg,
-            "be" => Lang::Ua,
             "zh" => Lang::Zh,
             _ => Lang::En,
         }

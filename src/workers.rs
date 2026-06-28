@@ -12,6 +12,7 @@ use crate::db::{
 };
 use crate::export::{self, ExportError};
 use crate::import::{self, FileSummary, ImportPhase};
+use crate::search::FieldInfo;
 
 pub enum WorkerReq {
     Search {
@@ -78,6 +79,7 @@ pub struct ImportEvent {
 pub enum Msg {
     SearchPage {
         generation: u64,
+        fields: Vec<FieldInfo>,
         ids: Vec<i64>,
         rows: Vec<Vec<String>>,
         /// Per row: Some(first file) if it is a kept duplicate, else None.
@@ -324,9 +326,9 @@ pub fn spawn_search_worker(
                     generation,
                 } => {
                     let started = Instant::now();
-                    let result = db.search_page(&q, PAGE_SIZE + 1, page * PAGE_SIZE);
+                    let result = db.search_page_dynamic(&q, PAGE_SIZE + 1, page * PAGE_SIZE);
                     match result {
-                        Ok((mut ids, mut rows, mut dups)) => {
+                        Ok((fields, mut ids, mut rows, mut dups)) => {
                             let empty_first_page = page == 0 && ids.is_empty();
                             let has_next = rows.len() as u64 > PAGE_SIZE;
                             if has_next {
@@ -336,6 +338,7 @@ pub fn spawn_search_worker(
                             }
                             let msg = Msg::SearchPage {
                                 generation,
+                                fields,
                                 ids,
                                 rows,
                                 dups,

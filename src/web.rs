@@ -29,7 +29,8 @@ use crate::db::{
 };
 use crate::export::csv_safe_cell;
 use crate::i18n::{Lang, tr};
-use crate::schema::{RESULT_COLUMNS, column_glossary, header_for};
+use crate::schema::column_glossary;
+use crate::search::{FieldInfo, FieldKind, FieldRef};
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 7832;
@@ -427,7 +428,7 @@ fn route(state: &WebState, request: &HttpRequest) -> HttpResponse {
         "/assets/app.css" => serve_static("text/css; charset=utf-8", APP_CSS),
         "/assets/app.js" => serve_static("text/javascript; charset=utf-8", APP_JS),
         "/api/stats" => api_stats(state),
-        "/api/schema" => api_schema(),
+        "/api/schema" => api_schema(state),
         "/api/i18n" => api_i18n(&request.params),
         "/api/search" => api_search(state, &request.params),
         "/api/count" => api_count(state, &request.params),
@@ -519,18 +520,41 @@ fn api_stats(state: &WebState) -> HttpResponse {
     }))
 }
 
-fn api_schema() -> HttpResponse {
-    let columns: Vec<Value> = RESULT_COLUMNS
-        .iter()
-        .map(|name| {
-            json!({
-                "name": name,
-                "label": header_for(name),
-                "glossary": column_glossary(name).unwrap_or(""),
-            })
-        })
-        .collect();
-    json_ok(json!({ "ok": true, "columns": columns }))
+fn api_schema(state: &WebState) -> HttpResponse {
+    respond(with_db(state, |db| {
+        let columns: Vec<Value> = db
+            .result_fields()
+            .map_err(|err| err.to_string())?
+            .iter()
+            .map(field_json)
+            .collect();
+        Ok(json!({ "ok": true, "columns": columns }))
+    }))
+}
+
+fn field_json(field: &FieldInfo) -> Value {
+    let glossary = match &field.source {
+        FieldRef::Column(name) => column_glossary(name).unwrap_or(""),
+        FieldRef::Extra(_) => "",
+    };
+    json!({
+        "name": &field.id,
+        "label": &field.label,
+        "kind": field_kind_id(field.kind),
+        "glossary": glossary,
+        "extra": matches!(&field.source, FieldRef::Extra(_)),
+    })
+}
+
+fn field_kind_id(kind: FieldKind) -> &'static str {
+    match kind {
+        FieldKind::Text => "text",
+        FieldKind::Code => "code",
+        FieldKind::Country => "country",
+        FieldKind::Number => "number",
+        FieldKind::Date => "date",
+        FieldKind::Year => "year",
+    }
 }
 
 fn api_search(state: &WebState, params: &HashMap<String, String>) -> HttpResponse {
@@ -542,8 +566,8 @@ fn api_search(state: &WebState, params: &HashMap<String, String>) -> HttpRespons
 
     respond(with_db(state, |db| {
         // Fetch one extra row to learn whether a next page exists.
-        let (mut ids, mut rows, mut dups) = db
-            .search_page(&query, limit.saturating_add(1), offset)
+        let (fields, mut ids, mut rows, mut dups) = db
+            .search_page_dynamic(&query, limit.saturating_add(1), offset)
             .map_err(|err| err.to_string())?;
         let has_next = rows.len() as u64 > limit;
         if has_next {
@@ -551,6 +575,7 @@ fn api_search(state: &WebState, params: &HashMap<String, String>) -> HttpRespons
             rows.truncate(limit as usize);
             dups.truncate(limit as usize);
         }
+        let columns: Vec<Value> = fields.iter().map(field_json).collect();
         let row_values: Vec<Value> = rows
             .into_iter()
             .enumerate()
@@ -566,6 +591,7 @@ fn api_search(state: &WebState, params: &HashMap<String, String>) -> HttpRespons
             "ok": true,
             "page": page,
             "limit": limit,
+            "columns": columns,
             "has_next": has_next,
             "rows": row_values,
             "elapsed_ms": started.elapsed().as_millis() as u64,
@@ -738,14 +764,14 @@ fn api_export_csv(state: &WebState, params: &HashMap<String, String>) -> HttpRes
     let page = parse_u64(params, "page", 0);
     let offset = page.saturating_mul(limit);
     match with_db(state, |db| {
-        let (_ids, rows, _dups) = db
-            .search_page(&query, limit, offset)
+        let (fields, _ids, rows, _dups) = db
+            .search_page_dynamic(&query, limit, offset)
             .map_err(|err| err.to_string())?;
         let mut csv = String::from('\u{feff}');
         csv.push_str(
-            &RESULT_COLUMNS
+            &fields
                 .iter()
-                .map(|name| csv_cell(header_for(name)))
+                .map(|field| csv_cell(&field.label))
                 .collect::<Vec<_>>()
                 .join(";"),
         );

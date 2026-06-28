@@ -1,4 +1,4 @@
-# Base Search 1.4.1
+# Base Search 1.5.0
 
 [![CI](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml)
 
@@ -9,24 +9,26 @@ index, and lets users find, inspect, summarize, and export records without
 fighting slow filters, freezing workbooks, or repeated manual searches in
 Excel.
 
-The first version was built for customs and import datasets, but the core idea
-is broader: take large tabular Excel exports, store them locally, and make them
-searchable.
+The first version was built for customs and import datasets. Version 1.5 turns
+that into a broader table engine: take large tabular Excel exports, preserve
+their real columns, store them locally, and make them searchable.
 
 Base Search works offline. Source files, the database, and search results stay
 on the user's computer.
 
 ## Features
 
-- Import `.xlsx`, `.xlsb`, and `.xls` files.
+- Import `.xlsx`, `.xlsb`, and `.xls` files, including ordinary tables that do
+  not follow the customs schema.
 - Search across product descriptions, companies, product codes, declaration
   numbers, trademarks, countries, and dates.
 - Filter by year, product code, company, organization code, and country fields.
 - Build flexible advanced searches with editable rules, all/any rule groups,
   exclusion rules, nested groups, range filters, empty/not-empty checks, and
   preserved extra columns from imported spreadsheets.
-- View all imported source columns in the result table, including value, price,
-  weight, rate, and technical customs fields when they exist in the source data.
+- View all imported source columns in the result table. Known customs fields
+  keep their analytical meaning; unknown spreadsheet columns are preserved as
+  dynamic fields and shown beside them.
 - Hover abbreviated customs headers to see what fields such as `43`,
   `43_01`, `ФВ вал.контр`, `РФВ`, `РМВ`, `Вага по МД`, `Умови пост.`,
   `3001`, `3002`, and `9610` mean.
@@ -48,7 +50,7 @@ on the user's computer.
   brands dominate, where goods came from, and how much value/weight each group
   represents.
 - Copy single values, whole rows, or selected rows back into Excel.
-- Export search results to CSV or XLSX.
+- Export search results to CSV or XLSX with the dynamic columns included.
 - Open an optional local browser interface on `127.0.0.1` for searching,
   viewing tables, opening row cards, and reading analytics in a regular
   browser. This is still local: it is not an internet service.
@@ -294,17 +296,20 @@ Supported input patterns include:
 
 | Pattern | What it means |
 |---|---|
-| Standard table | A regular spreadsheet table with recognizable columns. |
-| Extended table | A standard table with extra columns; the extra columns are preserved, searchable, and shown on the record card. |
+| Any regular table | A spreadsheet table with a header row and consistent columns, even when none of the columns are known customs fields. |
+| Standard customs table | A regular customs spreadsheet table with recognizable columns. |
+| Extended table | A standard table with extra columns; the extra columns are preserved, searchable, shown in results, and exported. |
 | Registry-style export | A table where some logical fields are split across multiple columns. |
 | Header after title rows | A file with title or metadata rows before the actual table header. |
 
-Columns that do not match the known schema are not discarded: they are kept with
-each row, indexed for full-text search, and listed on the record card, so
-differently shaped exports import without losing data.
+Columns that do not match the known customs schema are not discarded: they are
+kept with each row, indexed for full-text search, shown in the desktop table,
+served through the browser interface, listed on the record card, available in
+Advanced Search as extra fields, and included in CSV/XLSX export.
 
-If a file cannot be recognized, Base Search reports which required columns are
-missing instead of crashing.
+If a file cannot be recognized as a customs export, Base Search imports it as a
+generic table instead of rejecting it. Customs-specific analytics use only the
+recognized semantic fields; generic columns remain searchable and exportable.
 
 ## Performance
 
@@ -426,6 +431,19 @@ selected local spreadsheets and writes a local SQLite database beside the
 application executable.
 
 ## Changelog
+
+### 1.5.0
+
+- **Universal table import.** Excel files no longer need to match the customs
+  schema. If no known layout is detected, Base Search imports the sheet as a
+  generic table and preserves every source column.
+- **Dynamic result columns.** Desktop results, browser results, row cards, page
+  CSV export, and full CSV/XLSX export now include imported extra columns.
+- **Universal Advanced Search fields.** Extra spreadsheet headers remain
+  available as typed search fields, with inferred text/code/date/number/country
+  behavior where possible.
+- **Source-order preservation.** Extra columns are listed in the order they
+  first appear in the imported file instead of being alphabetically reordered.
 
 ### 1.4.1
 

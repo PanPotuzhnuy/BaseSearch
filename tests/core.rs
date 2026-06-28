@@ -2060,6 +2060,85 @@ fn import_captures_unmapped_columns_as_extra() {
     assert!(db2.record_card(ids2[0]).unwrap().extra.is_empty());
 }
 
+#[test]
+fn import_arbitrary_table_preserves_all_columns_in_results_filters_and_export() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("arbitrary.xlsx");
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    let headers = ["SKU", "Product Name", "Category", "Price EUR", "Warehouse"];
+    for (c, h) in headers.iter().enumerate() {
+        sheet.write_string(0, c as u16, *h).unwrap();
+    }
+    let rows = [
+        ["SKU-42", "Laptop Pro", "Electronics", "1299.50", "Berlin"],
+        ["SKU-77", "Office chair", "Furniture", "240", "Lviv"],
+    ];
+    for (r, row) in rows.iter().enumerate() {
+        for (c, value) in row.iter().enumerate() {
+            sheet
+                .write_string((r + 1) as u32, c as u16, *value)
+                .unwrap();
+        }
+    }
+    workbook.save(&xlsx).unwrap();
+
+    let db_path = dir.path().join("arbitrary.db");
+    let mut db = Db::open(&db_path).unwrap();
+    let cancel = AtomicBool::new(false);
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 2);
+
+    let q = Query {
+        text: "Laptop".into(),
+        ..Default::default()
+    };
+    assert_eq!(db.count(&q).unwrap(), 1);
+    let (fields, ids, rows, _dups) = db.search_page_dynamic(&q, 10, 0).unwrap();
+    assert_eq!(ids.len(), 1);
+    let sku_idx = fields.iter().position(|f| f.id == "extra:SKU").unwrap();
+    let price_idx = fields
+        .iter()
+        .position(|f| f.id == "extra:Price EUR")
+        .unwrap();
+    assert_eq!(rows[0][sku_idx], "SKU-42");
+    assert_eq!(rows[0][price_idx], "1299.50");
+
+    let card = db.record_card(ids[0]).unwrap();
+    assert_eq!(
+        card.extra,
+        vec![
+            ("SKU".to_string(), "SKU-42".to_string()),
+            ("Product Name".to_string(), "Laptop Pro".to_string()),
+            ("Category".to_string(), "Electronics".to_string()),
+            ("Price EUR".to_string(), "1299.50".to_string()),
+            ("Warehouse".to_string(), "Berlin".to_string()),
+        ]
+    );
+
+    let price_query = Query {
+        advanced: Some(QueryExpr::Condition(QueryCondition {
+            field: FieldRef::Extra("Price EUR".to_string()),
+            op: ConditionOp::Range,
+            value: ConditionValue::Range {
+                from: Some("1000".to_string()),
+                to: Some("2000".to_string()),
+            },
+            negated: false,
+        })),
+        ..Default::default()
+    };
+    assert_eq!(db.count(&price_query).unwrap(), 1);
+
+    let csv_path = dir.path().join("arbitrary.csv");
+    let exported = export::export(&db, &Query::default(), &csv_path, &cancel, |_, _| {}).unwrap();
+    assert_eq!(exported, 2);
+    let csv = std::fs::read_to_string(csv_path).unwrap();
+    assert!(csv.contains("SKU;Product Name;Category;Price EUR;Warehouse"));
+    assert!(csv.contains("SKU-42;Laptop Pro;Electronics;1299.50;Berlin"));
+}
+
 /// Reimporting the same file is skipped by content hash without parsing Excel.
 #[test]
 fn duplicate_file_skipped_by_content_hash() {
@@ -2244,9 +2323,9 @@ fn cancelled_import_rolls_back_inserted_batches() {
 }
 
 #[test]
-fn missing_required_columns() {
+fn unknown_two_column_table_imports_as_universal_data() {
     let dir = tempfile::tempdir().unwrap();
-    let xlsx = dir.path().join("bad.xlsx");
+    let xlsx = dir.path().join("generic.xlsx");
     let mut workbook = rust_xlsxwriter::Workbook::new();
     let sheet = workbook.add_worksheet();
     sheet.write_string(0, 0, "Номер МД").unwrap();
@@ -2258,11 +2337,22 @@ fn missing_required_columns() {
     let mut db = Db::open(&db_path).unwrap();
     let cancel = AtomicBool::new(false);
     let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
-    let err = summary.error.expect("expected an error");
-    assert!(err.starts_with("__MISSING__"));
-    assert!(err.contains("Дата"));
-    assert!(err.contains("Опис товару"));
-    assert_eq!(db.total_rows(), 0);
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 1);
+    assert_eq!(db.total_rows(), 1);
+
+    let q = Query {
+        text: "24UA1".into(),
+        ..Default::default()
+    };
+    assert_eq!(db.count(&q).unwrap(), 1);
+    let (fields, ids, rows, _) = db.search_page_dynamic(&q, 10, 0).unwrap();
+    let md_idx = fields
+        .iter()
+        .position(|field| field.id == "extra:Номер МД")
+        .unwrap();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(rows[0][md_idx], "24UA1");
 }
 
 #[test]

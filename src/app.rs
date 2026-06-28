@@ -19,11 +19,11 @@ use crate::db::{
 use crate::export::ExportError;
 use crate::i18n::{Lang, Tr, fmt, group_digits, help_sections, tr};
 use crate::import::{FileSummary, ImportPhase};
-use crate::schema::{RESULT_COLUMNS, column_glossary, header_for};
+use crate::schema::{column_glossary, header_for};
 use crate::search::{
     ConditionOp, ConditionValue, FieldInfo, LogicOp, QueryCondition, QueryExpr, QueryGroup,
     default_condition_for_field, default_field_catalog, default_value_for_op,
-    ensure_value_matches_operator, field_label,
+    ensure_value_matches_operator, field_label, result_field_catalog,
 };
 use crate::workers::{self, ImportEvent, Msg, PAGE_SIZE, WorkerReq};
 
@@ -274,6 +274,28 @@ fn col_spec(name: &str) -> (f32, CellKind) {
         "trademark" => (110.0, CellKind::Weak),
         "source_file" => (140.0, CellKind::Weak),
         _ => (110.0, CellKind::Normal),
+    }
+}
+
+fn field_col_spec(field: &FieldInfo) -> (f32, CellKind) {
+    match &field.source {
+        crate::search::FieldRef::Column(name) => col_spec(name),
+        crate::search::FieldRef::Extra(_) => match field.kind {
+            crate::search::FieldKind::Number => (116.0, CellKind::Number),
+            crate::search::FieldKind::Code => (120.0, CellKind::Code),
+            crate::search::FieldKind::Date | crate::search::FieldKind::Country => {
+                (110.0, CellKind::Weak)
+            }
+            crate::search::FieldKind::Year => (72.0, CellKind::Weak),
+            crate::search::FieldKind::Text => (160.0, CellKind::Normal),
+        },
+    }
+}
+
+fn field_glossary(field: &FieldInfo) -> Option<&'static str> {
+    match &field.source {
+        crate::search::FieldRef::Column(name) => column_glossary(name),
+        crate::search::FieldRef::Extra(_) => None,
     }
 }
 
@@ -1238,6 +1260,7 @@ pub struct App {
     underpricing_gen: u64,
     selected: HashSet<usize>,
     select_anchor: Option<usize>,
+    result_fields: Vec<FieldInfo>,
     visible_cols: Vec<bool>,
     search_gen: u64,
     search_in_flight: bool,
@@ -1302,9 +1325,13 @@ impl App {
             .and_then(|db| db.meta_get("hidden_cols"))
             .map(|s| s.split(',').map(str::to_owned).collect())
             .unwrap_or_default();
-        let visible_cols = RESULT_COLUMNS
+        let result_fields = lite_db
+            .as_ref()
+            .and_then(|db| db.result_fields().ok())
+            .unwrap_or_else(|| result_field_catalog(Vec::<String>::new()));
+        let visible_cols = result_fields
             .iter()
-            .map(|name| !hidden.contains(*name))
+            .map(|field| !hidden.contains(&field.id))
             .collect();
         let recent_queries = decode_stored_queries_with_fallback(
             lite_db
@@ -1387,6 +1414,7 @@ impl App {
             underpricing_gen: 0,
             selected: HashSet::new(),
             select_anchor: None,
+            result_fields,
             visible_cols,
             search_gen: 0,
             search_in_flight: false,
@@ -1444,13 +1472,41 @@ impl App {
     }
 
     fn persist_hidden_cols(&self) {
-        let hidden: Vec<&str> = RESULT_COLUMNS
+        let hidden: Vec<&str> = self
+            .result_fields
             .iter()
             .zip(&self.visible_cols)
             .filter(|(_, v)| !**v)
-            .map(|(n, _)| *n)
+            .map(|(field, _)| field.id.as_str())
             .collect();
         self.persist("hidden_cols", &hidden.join(","));
+    }
+
+    fn hidden_result_ids(&self) -> HashSet<String> {
+        self.result_fields
+            .iter()
+            .zip(&self.visible_cols)
+            .filter(|(_, visible)| !**visible)
+            .map(|(field, _)| field.id.clone())
+            .collect()
+    }
+
+    fn set_result_fields(&mut self, fields: Vec<FieldInfo>) {
+        let hidden = self.hidden_result_ids();
+        self.visible_cols = fields
+            .iter()
+            .map(|field| !hidden.contains(&field.id))
+            .collect();
+        self.result_fields = fields;
+    }
+
+    fn refresh_result_fields(&mut self) {
+        let fields = self
+            .lite_db
+            .as_ref()
+            .and_then(|db| db.result_fields().ok())
+            .unwrap_or_else(|| result_field_catalog(Vec::<String>::new()));
+        self.set_result_fields(fields);
     }
 
     fn refresh_search_fields(&mut self) {
@@ -1776,6 +1832,7 @@ impl App {
             match msg {
                 Msg::SearchPage {
                     generation,
+                    fields,
                     ids,
                     rows,
                     dups,
@@ -1783,6 +1840,7 @@ impl App {
                     ms,
                 } => {
                     if generation == self.search_gen {
+                        self.set_result_fields(fields);
                         self.row_ids = ids;
                         self.rows = rows;
                         self.result_dups = dups;
@@ -1929,6 +1987,7 @@ impl App {
                     self.op = None;
                     self.db_total_rows = Some(total_rows);
                     self.refresh_search_fields();
+                    self.refresh_result_fields();
                     if !summaries.is_empty() {
                         let imported: u64 = summaries.iter().map(|s| s.imported).sum();
                         let dups: u64 = summaries.iter().map(|s| s.duplicates).sum();
@@ -2373,13 +2432,16 @@ impl App {
                     ui.separator();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.menu_button(t.columns_btn, |ui| {
-                            for (i, name) in RESULT_COLUMNS.iter().enumerate() {
-                                let mut v = self.visible_cols[i];
-                                if ui.checkbox(&mut v, header_for(name)).changed() {
+                            for i in 0..self.result_fields.len() {
+                                let mut v = self.visible_cols.get(i).copied().unwrap_or(true);
+                                let label = self.result_fields[i].label.clone();
+                                if ui.checkbox(&mut v, label).changed() {
                                     let visible_count =
                                         self.visible_cols.iter().filter(|x| **x).count();
                                     if v || visible_count > 1 {
-                                        self.visible_cols[i] = v;
+                                        if let Some(visible) = self.visible_cols.get_mut(i) {
+                                            *visible = v;
+                                        }
                                         self.persist_hidden_cols();
                                     }
                                 }
@@ -3544,7 +3606,7 @@ impl App {
                 });
                 return;
             }
-            let visible: Vec<usize> = (0..RESULT_COLUMNS.len())
+            let visible: Vec<usize> = (0..self.result_fields.len())
                 .filter(|i| self.visible_cols[*i])
                 .collect();
             // Read modifiers from the click event itself: the keyboard state at
@@ -3590,27 +3652,25 @@ impl App {
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .min_scrolled_height(0.0);
                 for idx in &visible {
-                    let (width, _) = col_spec(RESULT_COLUMNS[*idx]);
+                    let (width, _) = field_col_spec(&self.result_fields[*idx]);
                     table = table.column(Column::initial(width).at_least(40.0).clip(true));
                 }
                 table
                     .header(28.0, |mut header| {
                         for idx in &visible {
-                            let name = RESULT_COLUMNS[*idx];
-                            let (_, kind) = col_spec(name);
+                            let field = &self.result_fields[*idx];
+                            let (_, kind) = field_col_spec(field);
                             header.col(|ui| {
                                 let resp = if kind == CellKind::Number {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| ui.strong(header_for(name)),
+                                        |ui| ui.strong(&field.label),
                                     )
                                     .inner
                                 } else {
-                                    ui.strong(header_for(name))
+                                    ui.strong(&field.label)
                                 };
-                                // Hover hint with the expanded meaning for
-                                // abbreviated customs value/price columns.
-                                if let Some(glossary) = column_glossary(name) {
+                                if let Some(glossary) = field_glossary(field) {
                                     resp.on_hover_text(glossary);
                                 }
                             });
@@ -3627,8 +3687,13 @@ impl App {
                             let mut clicked = false;
                             let mut double = false;
                             for idx in &visible {
-                                let value = &self.rows[i][*idx];
-                                let (_, kind) = col_spec(RESULT_COLUMNS[*idx]);
+                                let value = self
+                                    .rows
+                                    .get(i)
+                                    .and_then(|row| row.get(*idx))
+                                    .map(String::as_str)
+                                    .unwrap_or("");
+                                let (_, kind) = field_col_spec(&self.result_fields[*idx]);
                                 let (_, response) = row.col(|ui| {
                                     let rich = match kind {
                                         CellKind::Normal => egui::RichText::new(value),
@@ -3672,7 +3737,8 @@ impl App {
                                         ui.close();
                                     }
                                     if ui.button(t.copy_value).clicked() {
-                                        menu_action = Some(RowMenuAction::CopyCell(value.clone()));
+                                        menu_action =
+                                            Some(RowMenuAction::CopyCell(value.to_string()));
                                         ui.close();
                                     }
                                     if ui.button(t.copy_row).clicked() {
@@ -3681,7 +3747,9 @@ impl App {
                                     }
                                     ui.separator();
                                     // Company profile by the row EDRPOU.
-                                    if let Some(col) = result_col_index("edrpou") {
+                                    if let Some(col) =
+                                        result_field_index(&self.result_fields, "edrpou")
+                                    {
                                         let edrpou = cells[col].trim();
                                         if !edrpou.is_empty()
                                             && ui
@@ -3708,7 +3776,9 @@ impl App {
                                         (t.flt_edrpou, "edrpou", RowMenuAction::FilterEdrpou),
                                     ];
                                     for (label, column, make) in quick {
-                                        let Some(col) = result_col_index(column) else {
+                                        let Some(col) =
+                                            result_field_index(&self.result_fields, column)
+                                        else {
                                             continue;
                                         };
                                         let cell = cells[col].trim();
@@ -7001,8 +7071,8 @@ fn fmt_decimal(value: f64, decimals: usize) -> String {
     grouped
 }
 
-fn result_col_index(name: &str) -> Option<usize> {
-    RESULT_COLUMNS.iter().position(|column| *column == name)
+fn result_field_index(fields: &[FieldInfo], id: &str) -> Option<usize> {
+    fields.iter().position(|field| field.id == id)
 }
 
 enum AdvancedChipAction {

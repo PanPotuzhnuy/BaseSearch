@@ -220,6 +220,17 @@
     return Object.assign({ text: state.query.text }, state.query.filters, extra);
   }
 
+  function setSchema(columns) {
+    if (!Array.isArray(columns)) return;
+    const oldSig = state.schema.map((c) => c.name).join("\u001f");
+    const newSig = columns.map((c) => c.name).join("\u001f");
+    state.schema = columns;
+    if (oldSig !== newSig) {
+      state.colOrder = [];
+      state.colIndex = {};
+    }
+  }
+
   const runSearchDebounced = debounce(() => runSearch(true), 380);
 
   async function runSearch(resetPage) {
@@ -235,6 +246,7 @@
     try {
       const data = await api("/api/search", currentParams({ page: state.page, limit: 100 }));
       if (gen !== state.searchGen) return;
+      setSchema(data.columns);
       state.hasNext = data.has_next;
       state.shown = data.rows.length;
       renderResults(data);
@@ -327,6 +339,14 @@
     return order;
   }
 
+  function isNumericColumn(col) {
+    return NUM_COLS.has(col.name) || col.kind === "number";
+  }
+
+  function isMonoColumn(col) {
+    return MONO_COLS.has(col.name) || col.kind === "code";
+  }
+
   function renderResults(data) {
     const table = $("#results-table");
     const thead = table.tHead, tbody = table.tBodies[0];
@@ -346,7 +366,7 @@
     for (const ci of order) {
       const col = state.schema[ci];
       const th = el("th", { title: col.glossary || "", text: col.label || col.name });
-      if (NUM_COLS.has(col.name)) th.classList.add("num");
+      if (isNumericColumn(col)) th.classList.add("num");
       htr.appendChild(th);
     }
     thead.appendChild(htr);
@@ -362,8 +382,8 @@
         const col = state.schema[ci];
         const val = row.cells[ci] || "";
         const td = el("td");
-        if (NUM_COLS.has(col.name)) td.classList.add("num");
-        else if (MONO_COLS.has(col.name)) td.classList.add("mono");
+        if (isNumericColumn(col)) td.classList.add("num");
+        else if (isMonoColumn(col)) td.classList.add("mono");
         else if (col.name === "description") td.classList.add("muted");
 
         if (col.name === "edrpou" && val) {
@@ -913,7 +933,7 @@
     wire();
     try {
       const schema = await api("/api/schema");
-      state.schema = schema.columns || [];
+      setSchema(schema.columns || []);
     } catch (e) { toast(e.message, true); }
     await loadI18n("en").catch((e) => toast(e.message, true));
     loadStats();

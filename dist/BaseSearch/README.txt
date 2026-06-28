@@ -1,4 +1,4 @@
-Base Search 1.4.1
+Base Search 1.5.0
 ===============
 
 How to run
@@ -56,8 +56,11 @@ Basic workflow
 --------------
 1. Open BaseSearch.exe.
 2. Click Import Excel and select .xlsx, .xlsb, or .xls files.
-3. Search by product, company, product code, declaration number, country, or trademark.
-4. Use filters for year, code, EDRPOU, company, and country fields.
+3. For customs exports, search by product, company, product code, declaration
+   number, country, or trademark. For ordinary tables, search by any text or
+   value from the imported columns.
+4. Use filters for year, code, EDRPOU, company, and country fields when those
+   semantic fields exist.
 5. Use + Filter and Advanced when a search needs several rules, any/all logic,
    excluded rules, ranges, empty/not-empty checks, or extra imported columns.
 6. Use Questions when you want the app to choose the right analytics view.
@@ -82,6 +85,13 @@ The desktop app includes a flexible rule builder. Use it for searches such as
 "sender contains A or B", "exclude origin country CN", "year/date is between",
 or "extra imported column is not empty". Rules can be combined with all/any
 groups and nested when a search needs more structure.
+
+Universal tables
+----------------
+Base Search 1.5.0 can import regular Excel tables even when they do not follow
+the customs schema. Unknown columns are preserved as dynamic fields, included
+in full-text search, shown in the desktop and browser result tables, available
+in Advanced Search, listed on the row card, and exported to CSV/XLSX.
 
 Privacy
 -------

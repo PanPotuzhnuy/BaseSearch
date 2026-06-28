@@ -185,6 +185,12 @@ pub enum FieldKind {
 pub fn field_catalog(extra_headers: impl IntoIterator<Item = String>) -> Vec<FieldInfo> {
     let mut fields = Vec::new();
     fields.push(field_info("year", "Year".to_string(), FieldKind::Year));
+    fields.extend(result_field_catalog(extra_headers));
+    fields
+}
+
+pub fn result_field_catalog(extra_headers: impl IntoIterator<Item = String>) -> Vec<FieldInfo> {
+    let mut fields = Vec::new();
     for name in RESULT_COLUMNS {
         fields.push(field_info(
             name,

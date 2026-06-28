@@ -10,7 +10,9 @@
 //! - format B: registry-style layout with split declaration numbers, repeated
 //!   headers, and known source typos;
 //! - generic layout: heuristic matching through a multilingual header alias
-//!   dictionary, with the header row searched near the beginning of the sheet.
+//!   dictionary, with the header row searched near the beginning of the sheet;
+//! - universal layout: if no known schema matches, the best header row is used
+//!   and every source column is preserved as dynamic data.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -54,6 +56,7 @@ pub struct FileSummary {
 }
 
 /// Source for a schema column value in a file row.
+#[derive(Clone)]
 enum ColSrc {
     /// The file does not contain this column.
     Missing,
@@ -671,6 +674,51 @@ fn detect_mapping(headers: &[String]) -> Option<Vec<ColSrc>> {
         .or_else(|| map_generic(headers))
 }
 
+fn universal_mapping() -> Vec<ColSrc> {
+    vec![ColSrc::Missing; COLUMNS.len()]
+}
+
+fn universal_headers(row: &[Data], width: usize) -> Vec<String> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    (0..width)
+        .map(|i| {
+            let raw = row.get(i).map(header_text).unwrap_or_default();
+            let base = if raw.trim().is_empty() {
+                format!("Column {}", i + 1)
+            } else {
+                raw
+            };
+            let key = norm_header(&base);
+            let count = seen.entry(key).or_insert(0);
+            *count += 1;
+            if *count == 1 {
+                base
+            } else {
+                format!("{base} ({count})")
+            }
+        })
+        .collect()
+}
+
+fn best_universal_header(scanned: &[Vec<Data>]) -> Option<(usize, Vec<String>)> {
+    let width = scanned.iter().map(Vec::len).max().unwrap_or(0);
+    let mut best: Option<(usize, usize)> = None;
+    for (idx, row) in scanned.iter().enumerate() {
+        let non_empty = row
+            .iter()
+            .filter(|cell| !header_text(cell).trim().is_empty())
+            .count();
+        if non_empty > 0
+            && best
+                .map(|(_, best_non_empty)| non_empty > best_non_empty)
+                .unwrap_or(true)
+        {
+            best = Some((idx, non_empty));
+        }
+    }
+    best.map(|(idx, _)| (idx, universal_headers(&scanned[idx], width)))
+}
+
 /// Source columns the mapping does not consume, paired with their header names,
 /// in file order. These are preserved per row in the `extra` payload so the app
 /// keeps every column of differently shaped files, not only the known schema.
@@ -958,11 +1006,26 @@ impl RowSink<'_> {
             }
             self.scanned.push(row);
             if self.scanned.len() >= HEADER_SCAN_ROWS {
-                return Err(self.missing_error());
+                return self.start_universal_import();
             }
             return Ok(true);
         }
         self.data_row(row)
+    }
+
+    fn start_universal_import(&mut self) -> Result<bool, String> {
+        let scanned = std::mem::take(&mut self.scanned);
+        let Some((header_idx, headers)) = best_universal_header(&scanned) else {
+            return Err(self.missing_error());
+        };
+        self.mapping = Some(universal_mapping());
+        self.extra_cols = headers.into_iter().enumerate().collect();
+        for row in scanned.into_iter().skip(header_idx + 1) {
+            if !self.data_row(row)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn data_row(&mut self, row: Vec<Data>) -> Result<bool, String> {
@@ -985,11 +1048,11 @@ impl RowSink<'_> {
             };
             values.push(value);
         }
-        if values.iter().all(|v| v.is_empty()) {
+        let extra = self.collect_extra(&row);
+        if values.iter().all(|v| v.is_empty()) && extra.is_none() {
             return Ok(true);
         }
         values[DATE_COL] = normalize_date(&values[DATE_COL]);
-        let extra = self.collect_extra(&row);
         let hash = canonical_record_hash(&values, extra.as_deref());
         self.summary.total_rows += 1;
         self.batch.push(ImportRecord {
@@ -1045,7 +1108,7 @@ impl RowSink<'_> {
 
     fn finish(&mut self) -> Result<(), String> {
         if self.mapping.is_none() {
-            return Err(self.missing_error());
+            self.start_universal_import()?;
         }
         self.flush_batch()?;
         Ok(())

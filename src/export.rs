@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::db::{Db, Query};
-use crate::schema::COLUMNS;
 
 /// Excel worksheet row limit minus the header row.
 pub const XLSX_MAX_ROWS: u64 = 1_048_575;
@@ -42,14 +41,6 @@ pub enum ExportError {
     UnsupportedExtension(String),
     Cancelled,
     Other(String),
-}
-
-fn headers() -> Vec<&'static str> {
-    COLUMNS
-        .iter()
-        .map(|c| c.header)
-        .chain(std::iter::once("File"))
-        .collect()
 }
 
 /// Exports all rows matching the query and returns the row count.
@@ -102,8 +93,12 @@ fn export_csv(
         .delimiter(b';')
         .terminator(csv::Terminator::CRLF)
         .from_writer(std::io::BufWriter::new(file));
+    let fields = db
+        .result_fields()
+        .map_err(|e| ExportError::Other(e.to_string()))?;
+    let headers: Vec<&str> = fields.iter().map(|field| field.label.as_str()).collect();
     writer
-        .write_record(headers())
+        .write_record(headers)
         .map_err(|e| ExportError::Other(e.to_string()))?;
 
     let mut written: u64 = 0;
@@ -113,7 +108,7 @@ fn export_csv(
             return Err(ExportError::Cancelled);
         }
         let (max_id, rows) = db
-            .export_batch(q, last_id, BATCH)
+            .export_batch_fields(q, last_id, BATCH, &fields)
             .map_err(|e| ExportError::Other(e.to_string()))?;
         if rows.is_empty() {
             break;
@@ -173,9 +168,12 @@ fn export_xlsx(
 ) -> Result<u64, ExportError> {
     let mut workbook = rust_xlsxwriter::Workbook::new();
     let worksheet = workbook.add_worksheet_with_constant_memory();
-    for (col, header) in headers().iter().enumerate() {
+    let fields = db
+        .result_fields()
+        .map_err(|e| ExportError::Other(e.to_string()))?;
+    for (col, field) in fields.iter().enumerate() {
         worksheet
-            .write_string(0, col as u16, *header)
+            .write_string(0, col as u16, &field.label)
             .map_err(|e| ExportError::Other(e.to_string()))?;
     }
     let mut written: u64 = 0;
@@ -185,7 +183,7 @@ fn export_xlsx(
             return Err(ExportError::Cancelled);
         }
         let (max_id, rows) = db
-            .export_batch(q, last_id, BATCH)
+            .export_batch_fields(q, last_id, BATCH, &fields)
             .map_err(|e| ExportError::Other(e.to_string()))?;
         if rows.is_empty() {
             break;

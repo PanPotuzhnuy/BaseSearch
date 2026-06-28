@@ -12,7 +12,7 @@ use base_search::db::{
 };
 use base_search::export;
 use base_search::import::{self, ImportPhase};
-use base_search::schema::RESULT_COLUMNS;
+use base_search::search::FieldInfo;
 use base_search::web;
 
 const USAGE: &str = "base-search-cli - technical database checks for Base Search
@@ -366,6 +366,7 @@ struct SearchRun {
     page_ms: f64,
     total: u64,
     page_rows: usize,
+    fields: Option<Vec<FieldInfo>>,
     rows: Option<Vec<Vec<String>>>,
 }
 
@@ -461,7 +462,7 @@ fn cmd_search(db_path: &Path, args: &[String]) -> Result<(), String> {
         && options.repeat == 1
         && let Some(rows) = &runs[0].rows
     {
-        print_search_rows(rows);
+        print_search_rows(runs[0].fields.as_deref().unwrap_or(&[]), rows);
     }
     Ok(())
 }
@@ -471,29 +472,30 @@ fn run_search_once(db: &Db, q: &Query, limit: u64, keep_rows: bool) -> Result<Se
     let total = db.count(q).map_err(|e| e.to_string())?;
     let count_ms = started.elapsed().as_secs_f64() * 1000.0;
     let started = Instant::now();
-    let (_ids, rows, _dups) = db.search_page(q, limit, 0).map_err(|e| e.to_string())?;
+    let (fields, _ids, rows, _dups) = db
+        .search_page_dynamic(q, limit, 0)
+        .map_err(|e| e.to_string())?;
     let page_ms = started.elapsed().as_secs_f64() * 1000.0;
     Ok(SearchRun {
         count_ms,
         page_ms,
         total,
         page_rows: rows.len(),
+        fields: keep_rows.then_some(fields),
         rows: keep_rows.then_some(rows),
     })
 }
 
-fn print_search_rows(rows: &[Vec<String>]) {
+fn print_search_rows(fields: &[FieldInfo], rows: &[Vec<String>]) {
     for row in rows {
-        let desc: String = result_value(row, "description").chars().take(60).collect();
-        println!(
-            "  {} | {} | {} | {} | {} | {}",
-            result_value(row, "declaration_date"),
-            result_value(row, "declaration_number"),
-            trunc(result_value(row, "sender"), 25),
-            trunc(result_value(row, "recipient"), 25),
-            result_value(row, "product_code"),
-            desc
-        );
+        let cells: Vec<String> = fields
+            .iter()
+            .zip(row)
+            .filter(|(_, value)| !value.trim().is_empty())
+            .take(8)
+            .map(|(field, value)| format!("{}={}", field.label, trunc(value, 36)))
+            .collect();
+        println!("  {}", cells.join(" | "));
     }
 }
 
@@ -685,15 +687,6 @@ fn price_metric_title(kind: PriceMetricKind) -> &'static str {
         PriceMetricKind::RmvGrossUsdKg => "RMV gross $/kg",
         PriceMetricKind::MinBaseUsdKg => "Minimum base $/kg",
     }
-}
-
-fn result_value<'a>(row: &'a [String], name: &str) -> &'a str {
-    RESULT_COLUMNS
-        .iter()
-        .position(|column| *column == name)
-        .and_then(|idx| row.get(idx))
-        .map(String::as_str)
-        .unwrap_or("")
 }
 
 fn trunc(s: &str, n: usize) -> String {
