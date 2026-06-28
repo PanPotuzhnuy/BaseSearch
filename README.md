@@ -1,365 +1,256 @@
 # Base Search 1.5.0
 
-[![CI](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/PanPotuzhnuy/BaseSearch/actions/workflows/ci.yml)
+[![CI](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml)
 
-Base Search is a local cross-platform desktop application for fast search and
-practical analytics across large Excel datasets. It runs on **Windows, Linux,
-and macOS**, imports spreadsheet files into a local database, builds a search
-index, and lets users find, inspect, summarize, and export records without
-fighting slow filters, freezing workbooks, or repeated manual searches in
-Excel.
+Base Search is a local desktop application for fast search, filtering,
+analytics, and export across large Excel datasets.
 
-The first version was built for customs and import datasets. Version 1.5 turns
-that into a broader table engine: take large tabular Excel exports, preserve
-their real columns, store them locally, and make them searchable.
+It is built for people who have many large spreadsheet files and need to work
+with them as one searchable database instead of opening heavy workbooks one by
+one in Excel. The original focus was customs and trade data, but version 1.5.0
+can also import ordinary tabular Excel files and preserve their real source
+columns.
 
-Base Search works offline. Source files, the database, and search results stay
-on the user's computer.
+Base Search runs locally. It does not upload spreadsheets, search results, or
+the database to a cloud service.
 
-## Features
+## What It Does
 
-- Import `.xlsx`, `.xlsb`, and `.xls` files, including ordinary tables that do
-  not follow the customs schema.
-- Search across product descriptions, companies, product codes, declaration
-  numbers, trademarks, countries, and dates.
-- Filter by year, product code, company, organization code, and country fields.
-- Build flexible advanced searches with editable rules, all/any rule groups,
-  exclusion rules, nested groups, range filters, empty/not-empty checks, and
-  preserved extra columns from imported spreadsheets.
-- View all imported source columns in the result table. Known customs fields
-  keep their analytical meaning; unknown spreadsheet columns are preserved as
-  dynamic fields and shown beside them.
-- Hover abbreviated customs headers to see what fields such as `43`,
-  `43_01`, `ФВ вал.контр`, `РФВ`, `РМВ`, `Вага по МД`, `Умови пост.`,
-  `3001`, `3002`, and `9610` mean.
-- Open a full details view for any result row.
-- Use the **Questions** menu to jump from a current product, company, code,
-  year, or country filter to the right analytical view: who imported it, what
-  was moved, which countries dominate, how prices look, or how values changed
-  by month.
-- Open a separate Analytics tab for the current search/filter set: product
-  rows, unique declarations, companies, value, net/gross weight, average value
-  per kg, product codes, brands, countries, and price indicators. The Overview
-  screen includes visual decision cards, detailed counters, and richer
-  month-bar popups.
-- See monthly dynamics on a bar chart: how value, row count, net weight, or
-  average value per kg changed month to month for the matching rows. Hovering a
-  bar shows a visual popup with the month, selected metric, declarations,
-  value, weight, and price per kg.
-- Compare who received/imported goods, who sent them, which product codes and
-  brands dominate, where goods came from, and how much value/weight each group
-  represents.
-- Copy single values, whole rows, or selected rows back into Excel.
-- Export search results to CSV or XLSX with the dynamic columns included.
-- Open an optional local browser interface on `127.0.0.1` for searching,
-  viewing tables, opening row cards, and reading analytics in a regular
-  browser. This is still local: it is not an internet service.
-- Keep the interface responsive while importing, searching, exporting, or
-  cleaning the database.
-- Use light/dark theme, adjustable UI scale, and an 11-language interface
-  (English by default; also Ukrainian, German, Spanish, French, Polish,
-  Portuguese, Romanian, Hungarian, Bulgarian, and Chinese).
-- Run fully locally with no server and no cloud upload.
+- Imports `.xlsx`, `.xlsb`, and `.xls` files into one local SQLite database.
+- Preserves known trade/customs fields and unknown spreadsheet columns.
+- Builds a full-text search index for fast repeated searches.
+- Searches across products, companies, codes, declaration numbers, countries,
+  trademarks, and generic imported columns.
+- Supports advanced search rules: all/any groups, excluded rules, nested
+  groups, ranges, empty/not-empty checks, and filters over extra columns.
+- Shows paged results instead of trying to render millions of rows at once.
+- Opens a full details card for any row.
+- Provides analytics for the current query and filters.
+- Exports results to CSV or XLSX.
+- Includes an optional local browser interface on `127.0.0.1`.
+- Works offline on Windows, macOS, and Linux.
+
+## Typical Use Cases
+
+- Search across many Excel exports as one dataset.
+- Find all rows related to a product, brand, code, company, country, or year.
+- Compare which companies, product codes, brands, or countries dominate a
+  selected result set.
+- Inspect suspicious prices or unusual value-per-weight patterns.
+- Prepare filtered CSV/XLSX extracts for further work in Excel, BI tools, or
+  reports.
+- Use generic Excel tables as searchable local data without writing SQL.
 
 ## Why Not Just Excel?
 
-Excel is excellent for inspecting small and medium spreadsheets. It becomes
-uncomfortable when the workflow turns into searching across many huge files:
-opening takes time, filters lag, memory usage grows, and repeated searches are
-manual.
+Excel is strong for viewing and editing spreadsheets. It becomes inconvenient
+when the workflow is mostly:
 
-Base Search changes the workflow:
+1. Open a very large file.
+2. Wait for filters or search.
+3. Repeat the same search in several other files.
+4. Copy matching rows into a new workbook.
+
+Base Search changes that workflow:
 
 1. Import the files once.
-2. Build a local search index.
-3. Search the indexed database instead of reopening every spreadsheet.
+2. Let the app build a local database and search index.
+3. Search, filter, analyze, and export from the indexed database.
 
-That makes repeated search and filtering much faster and more predictable.
+This is especially useful when the same dataset is searched many times.
 
 ## Quick Start
 
-On macOS and Linux, the bundled `start.sh` script sets everything up in one
-guided step — it shows each action in the terminal, installs what is missing,
-builds the app, and opens it. The copy-paste blocks below use it.
-
 ### Windows
 
-Run the prebuilt application — no install needed:
+Run the prebuilt application from the distribution folder:
 
 ```text
 dist\BaseSearch\BaseSearch.exe
 ```
 
-For the browser interface, run:
+To open the local browser interface:
 
 ```text
 dist\BaseSearch\BaseSearch.exe --web
 ```
 
-The app opens a local page such as `http://127.0.0.1:7832`. The page talks only
-to the program running on the same computer; Excel files and the database are
-not uploaded to the internet.
+or double-click:
 
-### macOS (copy-paste)
+```text
+dist\BaseSearch\Open Browser Mode.cmd
+```
 
-Paste this block into Terminal. The guided `start.sh` script checks your
-system, installs the Rust toolchain if it is missing, builds the app while
-narrating each step, and then launches it:
+The browser opens a local address such as `http://127.0.0.1:7832`. This is not a
+hosted web service. The page talks to the Base Search process running on the
+same computer.
+
+### macOS
+
+Build and run from source:
 
 ```bash
 xcode-select --install 2>/dev/null || true
-git clone https://github.com/PanPotuzhnuy/BaseSearch.git
+git clone https://github.com/IvanK577/BaseSearch.git
 cd BaseSearch
 ./start.sh
 ```
 
-Run `./start.sh` again anytime to reopen the app — finished steps are skipped,
-so it starts almost instantly. For the command-line tool use
-`./run.sh cli stats data/base_search.db`.
+The `start.sh` script checks the environment, installs missing Rust tooling
+when needed, builds the app, and launches it.
 
-### Linux (copy-paste)
+### Linux
 
-The guided `start.sh` script installs the GUI build libraries (it detects
-apt, dnf, or pacman), installs the Rust toolchain if missing, builds the app
-step by step, and launches it. You only need git to clone first:
+Install Git first, then run the guided setup:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y git   # Debian / Ubuntu
-git clone https://github.com/PanPotuzhnuy/BaseSearch.git
+sudo apt-get update && sudo apt-get install -y git
+git clone https://github.com/IvanK577/BaseSearch.git
 cd BaseSearch
 ./start.sh
 ```
 
-On Fedora use `sudo dnf install -y git`; on Arch, `sudo pacman -S --needed git`.
-Run `./start.sh` again anytime to reopen the app.
+On Fedora use `sudo dnf install -y git`. On Arch use
+`sudo pacman -S --needed git`.
 
-### Where the data lives
+## Data Location
 
-The local database is stored in a `data` folder next to the executable. When
-that location is not writable (for example, a system-wide install), Base Search
-falls back to `~/.base-search/` in the user's home directory. If the database
-file does not exist, it is created automatically.
+Base Search stores its database outside the executable.
+
+Default locations:
+
+- distribution folder: `data/base_search.db`
+- fallback home folder: `~/.base-search/base_search.db`
+
+Large real-world databases can grow to many gigabytes. Keeping the database
+outside the executable makes updates and backups simpler.
 
 ## Basic Workflow
 
-1. Click **Import Excel** and select one or more spreadsheet files.
-2. Wait for import and indexing to finish. Progress is shown in the status bar.
-3. Type a query: product description, company name, product code, declaration
-   number, trademark, or country.
-4. Narrow results with filters when needed.
-5. Use **+ Filter** and **Advanced** when a search needs several rules, such as
-   "sender contains A or B", "exclude origin country CN", a year/date range, or
-   a condition on an extra imported column.
-6. Use **Questions** for guided shortcuts when you know the business question
-   but do not want to choose the tab manually.
-7. Open **Analytics** to understand the current query: who moved the goods,
-   what goods dominate, where they came from, and what the value/weight picture
-   looks like.
-8. Double-click a row to open its full details.
-9. Right-click a row for quick copy and quick filter actions.
-10. Export the current result set to CSV or XLSX.
+1. Open Base Search.
+2. Click **Import Excel** and choose one or more files.
+3. Wait until import and indexing finish.
+4. Type a search query or add filters.
+5. Use **Advanced** for structured search logic.
+6. Review the result table.
+7. Open row details when needed.
+8. Open **Analytics** for summaries and breakdowns.
+9. Export matching rows to CSV or XLSX.
 
-## Guided Questions
+## Universal Table Import
 
-The **Questions** menu turns common trade-data questions into one-click
-navigation. It reads the current search text and filters and offers relevant
-shortcuts:
+Base Search 1.5.0 is no longer limited to one fixed spreadsheet layout.
 
-- for a product, brand, product code, or free-text search: who imported it,
-  every company/EDRPOU, product-code and brand breakdowns, countries, prices,
-  monthly dynamics, and company-by-month comparison;
-- for a company or EDRPOU: the full company dossier, what it moved, who
-  supplied it, which countries it worked with, monthly dynamics, and
-  product-code-by-month comparison;
-- for a year/country/current slice: largest companies, dominant goods,
-  dominant routes, and price checks.
+If a file matches a known customs/trade layout, the app maps fields such as
+date, company, product code, country, value, weight, and price indicators into
+semantic columns.
 
-The menu is translated into all supported interface languages. It does not
-guess legal responsibility for an import; it simply routes the user to the
-matching recipient, sender, EDRPOU, goods, country, price, or pivot view.
+If a file does not match a known layout, Base Search imports it as a generic
+table:
+
+- the detected header row becomes the column list;
+- every source column is preserved;
+- values are indexed for full-text search;
+- extra fields are visible in the result table;
+- extra fields are available in Advanced Search;
+- CSV/XLSX export includes the dynamic columns.
+
+Customs-specific analytics use recognized semantic fields when they exist.
+Generic columns remain searchable, filterable, visible, and exportable.
+
+## Search
+
+Base Search supports two search styles.
+
+### Simple Search
+
+Use the main search box for fast broad search:
+
+```text
+apple
+8504
+wine bottle
+company name
+```
+
+Rules:
+
+- multiple words must all be present;
+- `word*` searches by prefix;
+- numeric terms with 4 or more digits are treated as code prefixes;
+- text matching is case-insensitive;
+- field filters are better when the meaning matters.
+
+For example, searching `Apple` everywhere is broad. Filtering by trademark or
+company is narrower and more precise.
+
+### Advanced Search
+
+Use Advanced Search for structured questions:
+
+- sender contains A or B;
+- origin country is not CN;
+- year is between 2024 and 2026;
+- value is greater than a threshold;
+- an imported extra column is empty or not empty;
+- several groups of rules should match with all/any logic.
+
+Advanced Search is designed for users who need flexible filtering without
+writing SQL.
+
+## Analytics
+
+Analytics follows the current search and filters. If the Results table is
+showing a filtered subset, Analytics is calculated for the same subset.
+
+Available views include:
+
+| View | Purpose |
+|---|---|
+| Overview | Headline totals, declarations, companies, value, weight, quantity, countries, and monthly dynamics. |
+| Companies | Top organization codes, recipients/importers, and senders. |
+| Goods | Product codes, brands, and product groups. |
+| Countries | Origin, dispatch, and trade countries. |
+| Prices | Average and weighted price metrics, medians, quartiles, and possible undervaluation checks. |
+| Pivot | Cross-tab analysis by company, code, country, month, year, or other supported dimensions. |
+| Report | A compact working report that can be copied or saved as print-ready HTML. |
+| Compare | Compare the current result set with another query or year. |
+
+For very broad data, Base Search avoids running heavy analytics on an empty
+global query by accident. Add a query or filter first.
 
 ## Browser Mode
 
-Base Search can also run a local browser interface:
+Browser mode exposes the same local database through a localhost interface:
 
 ```text
-dist\BaseSearch\BaseSearch.exe --web
+BaseSearch.exe --web
 ```
 
-or, in the Windows distribution folder, double-click:
+It is useful when a browser-based table and analytics view is more convenient
+than the native desktop UI.
 
-```text
-Open Browser Mode.cmd
-```
+Security notes:
 
-The browser opens a local address such as `http://127.0.0.1:7832`. This is a
-localhost interface, not an internet service: the database remains on the same
-computer. The local API is protected by a per-session token sent in the request
-header, so another page in the browser cannot casually read the local database.
-Requests are served by a small fixed pool of worker threads that reuse their
-database connections.
+- the server binds to localhost by default;
+- API routes use a per-session token;
+- files and database content stay on the same machine;
+- this is not a multi-user hosted server.
 
-## Analytics Tab
+## Export
 
-Analytics always follows the same query and filters as the Results table. For
-example, if the user searches for `Apple` and filters year `2024`, the Analytics
-tab is calculated only for those matching rows.
+Base Search can export the current result set to:
 
-The free-text search is intentionally broad: a word can match the product
-description, company names, trademark, declaration number, product code, or
-country fields. For business questions such as "show only the Apple trademark",
-use the dedicated **Trademark** filter or click a trademark row in Analytics.
-Those drill-down actions now apply field-specific filters instead of replacing
-the whole query with another broad search.
+- CSV for large exports and compatibility with most tools;
+- XLSX for smaller Excel-friendly exports.
 
-The Analytics tab is split into focused sub-tabs, so each screen answers one
-kind of question instead of cramming everything into one long page. A one-line
-summary (rows · value · net weight · period) stays visible on every sub-tab.
+XLSX export is limited by Excel worksheet limits. CSV is recommended for very
+large result sets.
 
-| Sub-tab | What it answers |
-|---|---|
-| **Overview** | Visual decision cards for scale, documents, participants, goods, and geography; detailed counters for value, net/gross weight, quantity, companies, trademarks, and countries; plus a **monthly dynamics** bar chart. Switch the chart metric between source value, rows, net weight, and **value per kg**. Hover a bar for a popup with the full month. |
-| **Companies** | Which organization codes dominate, who received/imported, and who sent. EDRPOU is shown first because it is more stable than company names with address variants. |
-| **Goods** | Which product codes, brands, and product groups dominate. Codes can be grouped by HS level — **2 / 4 / 6 digits or full** — to see structure from chapter down to exact code. Brand totals depend on source files that actually contain trademark data. |
-| **Countries** | Origin, dispatch, and trade countries for the matching shipments. Common country name/code variants are normalized, for example `CN` and `КИТАЙ` are grouped together. |
-| **Prices** | Per price field: average, weighted average, **median, and the P25–P75 range** with the value count. Below the table, a **price-undervaluation scan** compares each row's value per kg with the median for its own product code, shows how many rows/codes were judged, the suspicious value, an estimated value gap, sample size, quartile range, and row-level risk details. |
-| **Pivot** | A **cross-tab**: pick any dimension for rows and any for columns (company, EDRPOU, product code, trademark, origin/dispatch/trade country, month, year) and a value (source value, rows, net weight). The result is a heatmap with row, column, and grand totals; row/column labels drill into the Results table, and the whole matrix copies into Excel. |
-| **Report** | A one-screen working report for the current query: headline totals, monthly dynamics, top companies, goods, countries, and price metrics. The report can be copied as text or exported as a print-ready HTML file that can be saved as PDF from the browser print dialog. |
-| **Compare** | Compare the current query against another product/company text or another year while keeping the same filters. The app shows both sides and the delta for rows, declarations, value, net weight, value per kg, and EDRPOU count. |
+## Command-Line Tool
 
-Only the active sub-tab is calculated, which keeps the tab fast even on very
-broad queries. Companies, Goods, and Countries are shown as side-by-side cards
-with compact share rows — each row shows its value and share, the full numbers
-(rows, declarations, companies, weight, average price) appear on hover, and
-clicking a row applies the matching filter back to the Results table. Each card
-has a **copy-table button** that puts the whole top list on the clipboard as a
-tab-separated table, ready to paste into Excel or a report.
-
-When the top list is not enough, each Companies, Goods, and Countries card also
-has an **All** button. It opens an on-demand drill-down window for that exact
-section: search inside the grouped list, sort by rows, declarations, companies,
-value, weight, share, or value per kg, copy the visible rows to Excel, or click
-a row to apply it as a Results filter. To keep the UI responsive on very broad
-queries, the drill-down window loads up to the first 20,000 groups and says so
-explicitly if that safety limit is reached.
-
-Values and prices are shown exactly as they appear in the source files: in the
-41-column layout the "value" can be in the contract currency rather than only
-USD, which the tab notes explicitly so totals are not misread.
-
-Numeric analytics accepts both comma and dot decimals. Customs weights with
-three decimal places, such as `13804.656`, are treated as decimal values rather
-than thousands-formatted integers.
-
-To avoid heavy full-database grouping by accident, the Analytics tab asks for a
-search term or filter before running large calculations.
-
-## Company Dossier
-
-Right-click any result row and choose **Company profile** (by EDRPOU) to open a
-one-screen dossier for that importer: all name variants seen for the code,
-headline numbers (rows, declarations, value, net weight, value per kg, distinct
-product codes and suppliers), first-read highlights for the main good, sender,
-and origin country, a monthly dynamics chart, and the company's top product
-codes, suppliers, countries, and price metrics. Any card row drills back into the
-filtered Results table, so "tell me everything about this company, then show me
-the underlying lines" is a couple of clicks.
-
-## Built-in Quick Guide
-
-A short guide opens automatically on the first run and is available any time
-from the **?** button or by pressing **F1**. It covers the basic interactions —
-search syntax, double-click for the record card, right-click for quick filters
-and the company profile, click / Ctrl+click / Shift+click selection with Ctrl+C
-copy, the Analytics sub-tabs, and import/export/settings — in the chosen
-interface language.
-
-## Search Syntax
-
-- `wine bottle` means both words must be present.
-- `wine*` searches by word prefix.
-- Numeric terms with 4+ digits, for example `8504`, are treated as prefixes,
-  which is useful for product codes.
-- Text filters are case-insensitive and support Cyrillic text.
-- Use field filters when the meaning matters: **Trademark = Apple** is narrower
-  than searching for `Apple` everywhere.
-- Use **Advanced** for structured logic instead of SQL syntax: combine rules
-  with **All rules** or **Any rule**, mark a rule or group as excluded, create
-  nested groups, and search imported extra columns with the same rule builder.
-
-## Supported Data
-
-Base Search is designed for tabular spreadsheet exports. It works best when the
-file contains one main table with a header row and consistent columns.
-
-Supported input patterns include:
-
-| Pattern | What it means |
-|---|---|
-| Any regular table | A spreadsheet table with a header row and consistent columns, even when none of the columns are known customs fields. |
-| Standard customs table | A regular customs spreadsheet table with recognizable columns. |
-| Extended table | A standard table with extra columns; the extra columns are preserved, searchable, shown in results, and exported. |
-| Registry-style export | A table where some logical fields are split across multiple columns. |
-| Header after title rows | A file with title or metadata rows before the actual table header. |
-
-Columns that do not match the known customs schema are not discarded: they are
-kept with each row, indexed for full-text search, shown in the desktop table,
-served through the browser interface, listed on the record card, available in
-Advanced Search as extra fields, and included in CSV/XLSX export.
-
-If a file cannot be recognized as a customs export, Base Search imports it as a
-generic table instead of rejecting it. Customs-specific analytics use only the
-recognized semantic fields; generic columns remain searchable and exportable.
-
-## Performance
-
-Performance depends on the user's hardware, disk speed, file format, dataset
-shape, and query breadth. An SSD is strongly recommended for large databases.
-
-In development testing, Base Search handled multi-million-row datasets locally:
-
-| Operation type | Expected behavior |
-|---|---|
-| Import | Usually limited by Excel parsing speed and disk writes. Large files may take minutes. |
-| Repeat import of the same file | Fast, because identical files are skipped by content hash. |
-| Narrow search | Usually interactive after indexing. |
-| Very broad search | Slower, because the app must count and page through many matching rows. |
-| Analytics | Calculated for the active query/filter. Broad analytics depends on result size and disk speed. |
-| CSV export | Recommended for very large result sets. |
-| XLSX export | Convenient for smaller exports, but limited by Excel worksheet size. |
-
-These are not universal benchmark guarantees. A weak HDD-based PC and a modern
-SSD desktop will behave very differently.
-
-### Database Maintenance
-
-SQLite databases can temporarily look larger than the visible data after large
-imports, migrations, cancelled imports, or heavy deletes. Two normal SQLite
-mechanisms are involved:
-
-- the `*.db-wal` file, which stores recent writes before they are checkpointed;
-- free pages inside the main `*.db` file, which SQLite can reuse but the
-  operating system does not see as free disk space until `VACUUM` rewrites the
-  file.
-
-The command-line tool can inspect and compact local storage:
-
-```powershell
-base-search-cli stats data/base_search.db
-base-search-cli compact data/base_search.db
-base-search-cli compact data/base_search.db --vacuum
-```
-
-`compact` without `--vacuum` performs a safe WAL checkpoint and is usually
-quick. `compact --vacuum` keeps the data but rewrites the database file to
-return internal free pages to the filesystem; on multi-gigabyte databases this
-can take a long time and should be run only after closing other Base Search
-windows.
-
-## Command-Line Utility
-
-The distribution includes a small diagnostic tool for checking data without the
-graphical interface:
+The distribution includes `base-search-cli` for diagnostics, maintenance, and
+automation:
 
 ```powershell
 base-search-cli stats  <db>
@@ -372,195 +263,113 @@ base-search-cli export <db> <out.csv|out.xlsx> [query...]
 base-search-cli web [db] [--host 127.0.0.1] [--port 7832] [--no-open]
 ```
 
-The GUI is the primary user interface. The CLI is intended for troubleshooting,
-benchmarking, and quick verification.
+The desktop app is the primary interface. The CLI is mainly for verification,
+batch work, troubleshooting, and database maintenance.
+
+## Database Maintenance
+
+SQLite can temporarily use extra disk space after large imports, cancelled
+imports, deletes, or migrations. This is normal.
+
+Useful commands:
+
+```powershell
+base-search-cli stats data/base_search.db
+base-search-cli compact data/base_search.db
+base-search-cli compact data/base_search.db --vacuum
+```
+
+`compact` checkpoints and truncates the WAL file. `compact --vacuum` rewrites
+the database to return unused pages to the filesystem. Vacuuming a large
+database can take a long time and should be done after closing other Base
+Search windows.
+
+## Performance Notes
+
+Performance depends on:
+
+- CPU speed;
+- SSD/HDD speed;
+- Excel file format;
+- number of rows and columns;
+- query breadth;
+- available RAM;
+- whether analytics or export is running.
+
+Narrow searches after indexing are usually interactive. Import speed is often
+limited by Excel parsing and disk writes. Very broad analytics and large exports
+depend heavily on database size and hardware.
 
 ## Build From Source
 
 Requirements:
 
-- Rust stable (1.96+)
-- **Windows:** MSVC toolchain (Visual Studio Build Tools)
-- **Linux:** `build-essential`, `pkg-config`, `libxkbcommon-dev`,
-  `libwayland-dev` (X11 and Wayland are both supported at runtime)
-- **macOS:** Xcode Command Line Tools
+- Rust stable
+- Windows: MSVC toolchain
+- macOS: Xcode Command Line Tools
+- Linux: build tools, `pkg-config`, `libxkbcommon-dev`, and Wayland/X11 GUI
+  libraries
 
-Commands (identical on every platform):
+Build and test:
 
 ```bash
 cargo test
 cargo build --release
 ```
 
-Release binaries are created in `target/release/`: `BaseSearch` and
-`base-search-cli` (with `.exe` on Windows). On macOS and Linux two helper
-scripts are bundled:
+Release binaries are created in `target/release/`:
+
+- `BaseSearch` / `BaseSearch.exe`
+- `base-search-cli` / `base-search-cli.exe`
+
+Helper scripts for macOS and Linux:
 
 ```bash
-./start.sh            # guided first run: checks tools, installs, builds, launches
-./run.sh              # quiet build (release) and run, for repeat use
-./run.sh cli stats data/base_search.db   # run the command-line tool
+./start.sh
+./run.sh
+./run.sh cli stats data/base_search.db
 ```
-
-Continuous integration builds and tests every commit on Windows, Linux, and
-macOS and publishes downloadable binaries as workflow artifacts. macOS and
-Linux CI binaries are unsigned — on macOS, clear the quarantine flag once with
-`xattr -d com.apple.quarantine ./BaseSearch` (or right-click → Open), or just
-build from source as above.
 
 ## Architecture
 
-- **Rust** for the application core and native executables on every platform.
-- **egui/eframe** for the desktop interface.
-- **calamine** for reading Excel files.
-- **SQLite** for local storage in a single database file.
-- **SQLite FTS5** for fast full-text search.
-- **SQLite aggregate queries** for local analytics over the current result set.
-- **Built-in localhost web interface** for optional browser-based search and
-  analytics without uploading data.
-- **xxhash** for duplicate detection.
-- **CSV and XLSX writers** for exporting results.
+Base Search is built with:
 
-The database is intentionally stored outside the executable because real
-datasets can grow to many gigabytes.
+- Rust for the application core and native executables;
+- egui/eframe for the desktop interface;
+- calamine for reading Excel files;
+- SQLite for local storage;
+- SQLite FTS5 for full-text search;
+- SQLite aggregate queries for analytics;
+- a small localhost web server for browser mode;
+- xxhash for duplicate detection;
+- CSV and XLSX writers for export.
+
+The current architecture is a local single-machine application. A hosted or
+multi-user server edition would require a separate deployment model and is not
+part of the current release.
 
 ## Privacy
 
-Base Search has no cloud backend and does not upload user files. It reads
-selected local spreadsheets and writes a local SQLite database beside the
-application executable.
+Base Search has no cloud backend. It reads selected local files and writes a
+local database. Users are responsible for protecting the files, exported
+reports, and database on their own machine.
+
+## Limitations
+
+- Base Search is not a spreadsheet editor.
+- It does not replace legal, customs, accounting, or compliance review.
+- Generic tables are searchable and exportable, but semantic analytics require
+  recognizable fields such as dates, values, weights, companies, codes, or
+  countries.
+- Browser mode is local-only, not a shared web application.
+- Very large databases still need enough disk space and a reasonably fast SSD.
 
 ## Changelog
 
-### 1.5.0
-
-- **Universal table import.** Excel files no longer need to match the customs
-  schema. If no known layout is detected, Base Search imports the sheet as a
-  generic table and preserves every source column.
-- **Dynamic result columns.** Desktop results, browser results, row cards, page
-  CSV export, and full CSV/XLSX export now include imported extra columns.
-- **Universal Advanced Search fields.** Extra spreadsheet headers remain
-  available as typed search fields, with inferred text/code/date/number/country
-  behavior where possible.
-- **Source-order preservation.** Extra columns are listed in the order they
-  first appear in the imported file instead of being alphabetically reordered.
-
-### 1.4.1
-
-- **Database startup hotfix.** Existing large databases are migrated in place
-  without forcing a multi-gigabyte FTS rebuild when the indexed text is already
-  compatible.
-- **SQLite maintenance CLI.** `base-search-cli stats` now reports file sizes,
-  WAL size, and SQLite free pages. `base-search-cli compact` can truncate WAL
-  safely, and `compact --vacuum` can rewrite the database to return internal
-  free pages to the filesystem.
-- **Release hygiene.** Local release packages and multi-gigabyte databases are
-  kept out of git, while the Windows distribution binaries are rebuilt.
-
-### 1.4.0
-
-- **Advanced Search 1.4.** Added a flexible query builder for the desktop app:
-  editable rule chips, all/any groups, exclusion rules and groups, nested
-  groups, range filters, empty/not-empty checks, and extra-column conditions.
-- **Universal query model.** Search rules are stored as a structured AST and
-  compiled to parameterized SQLite queries, while the existing flat filters and
-  full-text search behavior remain compatible.
-- **Saved and recent advanced searches.** Advanced queries are serialized as V2
-  saved/recent search data while legacy saved searches still decode.
-- **Field catalog.** The app now builds a searchable field catalog from known
-  record fields, the virtual year field, and extra headers discovered during
-  import.
-- **Localized advanced-search interface.** New search-builder labels, menus,
-  operators, hints, and rule summaries are translated across all 11 supported
-  interface languages.
-
-### 1.3.0
-
-- **Universal column capture.** Columns beyond the known schema are now kept with
-  each imported row, included in full-text search, and listed on the record card.
-  Differently shaped customs exports import without losing data.
-- **Browser mode hardening.** The local web interface now runs on a fixed pool of
-  worker threads that reuse their database connections, parses requests more
-  strictly, and authenticates with a per-session token sent in the request header
-  instead of the URL.
-
-### 1.2.0
-
-- **Smart Questions menu.** Context-aware business questions now route the user
-  directly from the current product, company, EDRPOU, year, or country filter
-  into the right analytical view: companies, goods, countries, prices, monthly
-  dynamics, pivots, full group lists, or company dossiers. The menu is
-  translated for all supported interface languages.
-- **Expanded column glossary.** Abbreviated customs table headers now show
-  hover explanations for technical fields such as `43`, `43_01`, `Вага по МД`,
-  `Умови пост.`, `Місце пост`, `Вага.один.`, `Вага різн.`, `3001`, `3002`,
-  `9610`, `пільгова`, `повна`, and the value/price columns.
-- **Local browser mode.** The app can start a local web interface on
-  `127.0.0.1` with token-protected API routes. The Windows distribution
-  includes `Open Browser Mode.cmd` for a double-click launch.
-- **Search and analytics workflow polish.** Recent and saved searches preserve
-  full filters, broad structural searches page faster, and analytics explains
-  how rows, declarations, totals, shares, and price metrics are calculated.
-- **Report and Compare modes.** Analytics now includes a printable Report view
-  for the current query and a Compare view for checking another product,
-  company, or year against the current selection. Reports export as Unicode-safe
-  HTML that can be saved as PDF from the browser print dialog.
-- **Company dossier polish.** Company profiles now open with a clearer identity
-  block and first-read highlights for the main good, sender, and country before
-  the detailed sections.
-
-### 1.1.1
-
-- **Guided first-run script for macOS and Linux.** `./start.sh` narrates each
-  step in the terminal — it checks the OS, installs the Rust toolchain (and the
-  Linux GUI libraries) only when missing, builds the app, and launches it — so
-  a non-technical user can set everything up with a single command.
-- **11 interface languages, English by default.** The app now starts in
-  English everywhere; the interface is also available in Ukrainian, German,
-  Spanish, French, Polish, Portuguese, Romanian, Hungarian, Bulgarian, and
-  Chinese, switchable any time in Settings.
-- **CJK font fallback.** Base Search uses system CJK fonts when available so
-  the Chinese interface renders without bundling a large font into the binary.
-- **Localization cleanup.** UI strings that used to be hardcoded in the app are
-  centralized in the translation layer, so every supported language gets the
-  analytics labels, tooltips, pivot text, price labels, and quick guide.
-
-### 1.1
-
-- **Cross-platform support.** Base Search now builds and runs on Windows,
-  Linux (X11 and Wayland), and macOS. System fonts are picked per OS with a
-  safe built-in fallback; the database location falls back to the home
-  directory when the install folder is read-only.
-- **Analytics restructured into focused sub-tabs.** Overview, Companies,
-  Goods, Countries, Prices, and Pivot are separate screens instead of one
-  long scrolling page, with a persistent one-line summary. Only the active
-  sub-tab is calculated, so the tab stays fast on broad queries.
-- **Pivot cross-tab.** Cross-tabulate any dimension by any other (company,
-  EDRPOU, code, trademark, country, month, year) for value / rows / net
-  weight, as a heatmap with totals; labels drill into results and the matrix
-  copies into Excel.
-- **Company dossier.** A one-screen profile per importer (by EDRPOU) with
-  name variants, headline numbers, monthly dynamics, and top products,
-  suppliers, and origin countries; opened from the row context menu.
-- **Price-undervaluation scan.** Flags declarations priced per kg far below
-  the median for their own product code — a customs undervaluation signal.
-- **Deeper analytics for real work:** value-per-kg metric on the
-  monthly chart (price trends and dumping), HS-code grouping by 2/4/6/full
-  digits, median and P25–P75 in the price table instead of misleading
-  min/max, a copy-table button on every card (pastes into Excel), and an
-  explicit note about contract-currency values.
-- **Continuous integration.** Every commit is tested and built on all three
-  platforms; binaries are published as workflow artifacts.
-
-### 1.0
-
-- Initial public release: streaming Excel import (`.xlsx`/`.xlsb`/`.xls`),
-  full-text search with FTS5, filters, analytics tab with KPI tiles and
-  clickable share charts, two-level duplicate protection, CSV/XLSX export,
-  UA/RU/EN interface, light/dark theme.
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 
 Base Search is released under the MIT License. You can use, copy, modify, and
-redistribute the application and source code, as long as the copyright notice
+redistribute the application and source code as long as the copyright notice
 and license text are included.
