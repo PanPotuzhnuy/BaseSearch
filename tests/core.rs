@@ -381,6 +381,14 @@ fn import_search_filter_export() {
     assert_eq!(summary.total_rows, 3);
     assert_eq!(summary.imported, 3);
     assert_eq!(summary.duplicates, 0);
+    assert_eq!(summary.quality.layout, "standard customs");
+    assert_eq!(summary.quality.header_row, 1);
+    assert_eq!(summary.quality.source_columns, COLUMNS.len() as u64);
+    assert_eq!(summary.quality.recognized_columns, COLUMNS.len() as u64);
+    assert_eq!(summary.quality.extra_columns, 0);
+    assert_eq!(summary.quality.non_empty_cells, 24);
+    assert_eq!(summary.quality.empty_cells, 99);
+    assert!(summary.quality.warnings.is_empty());
     assert_eq!(db.total_rows(), 3);
     assert_eq!(db.unindexed_rows(), 0);
 
@@ -2089,6 +2097,26 @@ fn import_arbitrary_table_preserves_all_columns_in_results_filters_and_export() 
     let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
     assert_eq!(summary.error, None);
     assert_eq!(summary.imported, 2);
+    assert_eq!(summary.quality.layout, "universal table");
+    assert_eq!(summary.quality.header_row, 1);
+    assert_eq!(summary.quality.source_columns, 5);
+    assert_eq!(summary.quality.recognized_columns, 0);
+    assert_eq!(summary.quality.extra_columns, 5);
+    assert_eq!(summary.quality.non_empty_cells, 10);
+    assert_eq!(summary.quality.empty_cells, 0);
+    assert!(
+        summary
+            .quality
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("generic table"))
+    );
+
+    let log = db.import_log(1);
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].quality.layout, "universal table");
+    assert_eq!(log[0].quality.source_columns, 5);
+    assert_eq!(log[0].quality.extra_columns, 5);
 
     let q = Query {
         text: "Laptop".into(),

@@ -2,6 +2,18 @@
 
 All notable project changes are documented here.
 
+## 1.5.1
+
+- Added import quality reporting for every completed file: detected layout,
+  header row, source columns, recognized semantic columns, preserved extra
+  columns, table fill rate, and warnings.
+- Stored import quality metadata in `import_log` with automatic migration for
+  existing databases.
+- Extended the desktop import report and `base-search-cli stats` with the new
+  quality details.
+- Added warning signals for universal generic imports, title/header row shifts,
+  low semantic recognition, and mostly empty imported tables.
+
 ## 1.5.0
 
 - Added universal table import: spreadsheets that do not match any known

@@ -1,4 +1,4 @@
-Base Search 1.5.0
+Base Search 1.5.1
 ===============
 
 How to run
@@ -88,10 +88,17 @@ groups and nested when a search needs more structure.
 
 Universal tables
 ----------------
-Base Search 1.5.0 can import regular Excel tables even when they do not follow
+Base Search 1.5.1 can import regular Excel tables even when they do not follow
 the customs schema. Unknown columns are preserved as dynamic fields, included
 in full-text search, shown in the desktop and browser result tables, available
 in Advanced Search, listed on the row card, and exported to CSV/XLSX.
+
+Import quality report
+---------------------
+After import, the app shows how the file was understood: detected layout,
+header row, source columns, recognized semantic columns, preserved extra
+columns, table fill rate, and warnings. The same metadata appears in
+base-search-cli.exe stats for recent imports.
 
 Privacy
 -------

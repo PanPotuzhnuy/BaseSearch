@@ -95,6 +95,54 @@ pub struct ImportLogEntry {
     pub duplicates: u64,
     pub seconds: f64,
     pub imported_at: String,
+    pub quality: ImportQuality,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportQuality {
+    pub layout: String,
+    pub header_row: u64,
+    pub source_columns: u64,
+    pub recognized_columns: u64,
+    pub extra_columns: u64,
+    pub non_empty_cells: u64,
+    pub empty_cells: u64,
+    pub warnings: Vec<String>,
+}
+
+impl ImportQuality {
+    pub fn filled_percent(&self) -> f64 {
+        let total = self.non_empty_cells + self.empty_cells;
+        if total == 0 {
+            0.0
+        } else {
+            self.non_empty_cells as f64 * 100.0 / total as f64
+        }
+    }
+
+    fn warnings_text(&self) -> String {
+        self.warnings.join("\n")
+    }
+
+    fn with_warnings_text(mut self, warnings: String) -> ImportQuality {
+        self.warnings = warnings
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        self
+    }
+}
+
+pub struct ImportLogWrite<'a> {
+    pub file_name: &'a str,
+    pub total_rows: u64,
+    pub imported: u64,
+    pub duplicates: u64,
+    pub seconds: f64,
+    pub file_hash: Option<&'a str>,
+    pub quality: &'a ImportQuality,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -748,6 +796,14 @@ impl Db {
                 imported INTEGER NOT NULL,
                 duplicates INTEGER NOT NULL,
                 seconds REAL NOT NULL,
+                layout TEXT,
+                header_row INTEGER,
+                source_columns INTEGER,
+                recognized_columns INTEGER,
+                extra_columns INTEGER,
+                non_empty_cells INTEGER,
+                empty_cells INTEGER,
+                warnings TEXT,
                 imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_records_year ON records(year);
@@ -760,6 +816,26 @@ impl Db {
         let _ = self
             .conn
             .execute("ALTER TABLE import_log ADD COLUMN file_hash TEXT", []);
+        self.ensure_import_log_quality_columns()?;
+        Ok(())
+    }
+
+    fn ensure_import_log_quality_columns(&self) -> rusqlite::Result<()> {
+        for (name, ty) in [
+            ("layout", "TEXT"),
+            ("header_row", "INTEGER"),
+            ("source_columns", "INTEGER"),
+            ("recognized_columns", "INTEGER"),
+            ("extra_columns", "INTEGER"),
+            ("non_empty_cells", "INTEGER"),
+            ("empty_cells", "INTEGER"),
+            ("warnings", "TEXT"),
+        ] {
+            if !self.table_has_column("import_log", name)? {
+                let sql = format!("ALTER TABLE import_log ADD COLUMN {name} {ty}");
+                self.conn.execute(&sql, [])?;
+            }
+        }
         Ok(())
     }
 
@@ -2420,25 +2496,30 @@ impl Db {
             .unwrap_or(0) as u64
     }
 
-    pub fn add_import_log(
-        &self,
-        file_name: &str,
-        total_rows: u64,
-        imported: u64,
-        duplicates: u64,
-        seconds: f64,
-        file_hash: Option<&str>,
-    ) {
+    pub fn add_import_log(&self, entry: ImportLogWrite<'_>) {
+        let warnings = entry.quality.warnings_text();
         let _ = self.conn.execute(
-            "INSERT INTO import_log (file_name, total_rows, imported, duplicates, seconds, file_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO import_log (
+                file_name, total_rows, imported, duplicates, seconds, file_hash,
+                layout, header_row, source_columns, recognized_columns, extra_columns,
+                non_empty_cells, empty_cells, warnings
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
-                file_name,
-                total_rows as i64,
-                imported as i64,
-                duplicates as i64,
-                seconds,
-                file_hash
+                entry.file_name,
+                entry.total_rows as i64,
+                entry.imported as i64,
+                entry.duplicates as i64,
+                entry.seconds,
+                entry.file_hash,
+                empty_to_null(&entry.quality.layout),
+                entry.quality.header_row as i64,
+                entry.quality.source_columns as i64,
+                entry.quality.recognized_columns as i64,
+                entry.quality.extra_columns as i64,
+                entry.quality.non_empty_cells as i64,
+                entry.quality.empty_cells as i64,
+                empty_to_null(&warnings),
             ],
         );
     }
@@ -2514,12 +2595,32 @@ impl Db {
 
     pub fn import_log(&self, limit: u64) -> Vec<ImportLogEntry> {
         let Ok(mut stmt) = self.conn.prepare(
-            "SELECT file_name, total_rows, imported, duplicates, seconds, imported_at
+            "SELECT
+                file_name, total_rows, imported, duplicates, seconds, imported_at,
+                COALESCE(layout, ''),
+                COALESCE(header_row, 0),
+                COALESCE(source_columns, 0),
+                COALESCE(recognized_columns, 0),
+                COALESCE(extra_columns, 0),
+                COALESCE(non_empty_cells, 0),
+                COALESCE(empty_cells, 0),
+                COALESCE(warnings, '')
              FROM import_log ORDER BY id DESC LIMIT ?1",
         ) else {
             return Vec::new();
         };
         stmt.query_map([limit as i64], |row| {
+            let quality = ImportQuality {
+                layout: row.get(6)?,
+                header_row: row.get::<_, i64>(7)?.max(0) as u64,
+                source_columns: row.get::<_, i64>(8)?.max(0) as u64,
+                recognized_columns: row.get::<_, i64>(9)?.max(0) as u64,
+                extra_columns: row.get::<_, i64>(10)?.max(0) as u64,
+                non_empty_cells: row.get::<_, i64>(11)?.max(0) as u64,
+                empty_cells: row.get::<_, i64>(12)?.max(0) as u64,
+                warnings: Vec::new(),
+            }
+            .with_warnings_text(row.get(13)?);
             Ok(ImportLogEntry {
                 file_name: row.get(0)?,
                 total_rows: row.get::<_, i64>(1)? as u64,
@@ -2527,11 +2628,17 @@ impl Db {
                 duplicates: row.get::<_, i64>(3)? as u64,
                 seconds: row.get(4)?,
                 imported_at: row.get(5)?,
+                quality,
             })
         })
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default()
     }
+}
+
+fn empty_to_null(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn pragma_u64(conn: &Connection, name: &str) -> rusqlite::Result<u64> {

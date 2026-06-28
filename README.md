@@ -1,4 +1,4 @@
-# Base Search 1.5.0
+# Base Search 1.5.1
 
 [![CI](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml)
 
@@ -17,6 +17,8 @@ the database to a cloud service.
 ## What It Does
 
 - Imports `.xlsx`, `.xlsb`, and `.xls` files into one local SQLite database.
+- Shows an import quality report with detected layout, header row, recognized
+  columns, preserved extra columns, table fill rate, and warnings.
 - Preserves known trade/customs fields and unknown spreadsheet columns.
 - Builds a full-text search index for fast repeated searches.
 - Searches across products, companies, codes, declaration numbers, countries,
@@ -139,7 +141,7 @@ outside the executable makes updates and backups simpler.
 
 ## Universal Table Import
 
-Base Search 1.5.0 is no longer limited to one fixed spreadsheet layout.
+Base Search 1.5.1 is not limited to one fixed spreadsheet layout.
 
 If a file matches a known customs/trade layout, the app maps fields such as
 date, company, product code, country, value, weight, and price indicators into
@@ -157,6 +159,12 @@ table:
 
 Customs-specific analytics use recognized semantic fields when they exist.
 Generic columns remain searchable, filterable, visible, and exportable.
+
+After each import, Base Search shows a quality report. It explains which layout
+was detected, which row was used as the header, how many columns were recognized
+as semantic trade fields, how many columns were preserved as extra dynamic
+fields, how full the imported table is, and whether anything deserves a manual
+check.
 
 ## Search
 

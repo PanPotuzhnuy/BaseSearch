@@ -109,6 +109,20 @@ fn cmd_stats(db_path: &Path) -> Result<(), String> {
                 "  {}  rows {}  imported {}  duplicates {}  {:.1}s  {}",
                 e.file_name, e.total_rows, e.imported, e.duplicates, e.seconds, e.imported_at
             );
+            if !e.quality.layout.is_empty() {
+                println!(
+                    "    quality: {} | header row {} | columns {} recognized {} extra {} | filled {:.0}%",
+                    e.quality.layout,
+                    e.quality.header_row,
+                    e.quality.source_columns,
+                    e.quality.recognized_columns,
+                    e.quality.extra_columns,
+                    e.quality.filled_percent()
+                );
+                for warning in &e.quality.warnings {
+                    println!("    warning: {warning}");
+                }
+            }
         }
     }
     Ok(())

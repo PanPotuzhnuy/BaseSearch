@@ -4252,7 +4252,18 @@ impl App {
                                     text.push_str(" \u{00B7} ");
                                     text.push_str(t.cancelled);
                                 }
-                                ui.label(text);
+                                ui.vertical(|ui| {
+                                    ui.label(text);
+                                    ui.label(
+                                        egui::RichText::new(import_quality_line(s)).weak().small(),
+                                    );
+                                    for warning in &s.quality.warnings {
+                                        ui.colored_label(
+                                            ui.visuals().warn_fg_color,
+                                            egui::RichText::new(warning).small(),
+                                        );
+                                    }
+                                });
                             }
                             ui.end_row();
                         }
@@ -4752,6 +4763,22 @@ fn fmt_compact(value: f64) -> String {
     } else {
         format!("{value:.1}")
     }
+}
+
+fn import_quality_line(summary: &FileSummary) -> String {
+    let q = &summary.quality;
+    if q.layout.is_empty() {
+        return "Quality: not available".to_string();
+    }
+    format!(
+        "Quality: {} · header row {} · columns {} (recognized {}, extra {}) · filled {:.0}%",
+        q.layout,
+        q.header_row,
+        group_digits(q.source_columns),
+        group_digits(q.recognized_columns),
+        group_digits(q.extra_columns),
+        q.filled_percent()
+    )
 }
 
 fn analytics_report_label(lang: Lang) -> &'static str {

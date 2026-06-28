@@ -24,7 +24,9 @@ use calamine::{Data, Reader, Sheets, open_workbook_auto};
 use chrono::Timelike;
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::db::{Db, ImportRecord, canonical_record_hash, extract_year};
+use crate::db::{
+    Db, ImportLogWrite, ImportQuality, ImportRecord, canonical_record_hash, extract_year,
+};
 use crate::schema::{COLUMNS, DATE_COL, REQUIRED_HEADERS};
 
 const BATCH_SIZE: usize = 8192;
@@ -53,6 +55,7 @@ pub struct FileSummary {
     /// Whole-file skip because this content was already imported.
     /// Stores the previously imported filename.
     pub skipped_duplicate_of: Option<String>,
+    pub quality: ImportQuality,
 }
 
 /// Source for a schema column value in a file row.
@@ -63,6 +66,12 @@ enum ColSrc {
     Cell(usize),
     /// Several file columns joined with a separator, such as `UA100290/2024/102794`.
     Join(Vec<usize>, &'static str),
+}
+
+#[derive(Clone)]
+struct MappingPlan {
+    layout: &'static str,
+    columns: Vec<ColSrc>,
 }
 
 // ---------- header mapping ----------
@@ -666,12 +675,30 @@ fn map_generic(headers: &[String]) -> Option<Vec<ColSrc>> {
     )
 }
 
-fn detect_mapping(headers: &[String]) -> Option<Vec<ColSrc>> {
+fn detect_mapping(headers: &[String]) -> Option<MappingPlan> {
     let idx = HeaderIndex::new(headers);
-    map_format_a(&idx)
-        .or_else(|| map_format_b(&idx))
-        .or_else(|| map_wide_customs(headers, &idx))
-        .or_else(|| map_generic(headers))
+    if let Some(columns) = map_format_a(&idx) {
+        return Some(MappingPlan {
+            layout: "standard customs",
+            columns,
+        });
+    }
+    if let Some(columns) = map_format_b(&idx) {
+        return Some(MappingPlan {
+            layout: "registry customs",
+            columns,
+        });
+    }
+    if let Some(columns) = map_wide_customs(headers, &idx) {
+        return Some(MappingPlan {
+            layout: "wide customs",
+            columns,
+        });
+    }
+    map_generic(headers).map(|columns| MappingPlan {
+        layout: "generic customs-like",
+        columns,
+    })
 }
 
 fn universal_mapping() -> Vec<ColSrc> {
@@ -743,6 +770,22 @@ fn unmapped_columns(headers: &[String], mapping: &[ColSrc]) -> Vec<(usize, Strin
         .filter(|(i, header)| !header.is_empty() && !consumed.contains(i))
         .map(|(i, header)| (i, header.clone()))
         .collect()
+}
+
+fn recognized_columns(mapping: &[ColSrc]) -> usize {
+    mapping
+        .iter()
+        .filter(|src| !matches!(src, ColSrc::Missing))
+        .count()
+}
+
+fn cell_has_value(data: &Data) -> bool {
+    match data {
+        Data::Empty | Data::Error(_) => false,
+        Data::String(s) => !s.trim().is_empty(),
+        Data::DateTimeIso(s) | Data::DurationIso(s) => !s.trim().is_empty(),
+        Data::Float(_) | Data::Int(_) | Data::Bool(_) | Data::DateTime(_) => true,
+    }
 }
 
 // ---------- import ----------
@@ -834,19 +877,73 @@ pub fn import_file(
         }
     }
     summary.seconds = started.elapsed().as_secs_f64();
+    finalize_quality(&mut summary);
     if committed {
         // Store the hash only for fully imported files, so interrupted imports
         // can be retried.
-        db.add_import_log(
-            &file_name,
-            summary.total_rows,
-            summary.imported,
-            summary.duplicates,
-            summary.seconds,
-            Some(file_hash.as_str()),
-        );
+        db.add_import_log(ImportLogWrite {
+            file_name: &file_name,
+            total_rows: summary.total_rows,
+            imported: summary.imported,
+            duplicates: summary.duplicates,
+            seconds: summary.seconds,
+            file_hash: Some(file_hash.as_str()),
+            quality: &summary.quality,
+        });
     }
     summary
+}
+
+fn finalize_quality(summary: &mut FileSummary) {
+    let quality = &mut summary.quality;
+    if quality.layout.is_empty() {
+        return;
+    }
+    if quality.layout == "universal table" {
+        push_quality_warning(
+            quality,
+            "No known trade schema was detected; the file was imported as a generic table.",
+        );
+    }
+    if quality.header_row > 1 {
+        push_quality_warning(
+            quality,
+            &format!(
+                "Header row was detected at row {}; earlier rows were treated as title or metadata.",
+                quality.header_row
+            ),
+        );
+    }
+    if quality.recognized_columns == 0 {
+        push_quality_warning(
+            quality,
+            "No semantic trade columns were recognized; analytics will be limited to generic table data.",
+        );
+    } else if quality.recognized_columns < 6 {
+        push_quality_warning(
+            quality,
+            &format!(
+                "Only {} semantic columns were recognized; check that important fields mapped correctly.",
+                quality.recognized_columns
+            ),
+        );
+    }
+    let total_cells = quality.non_empty_cells + quality.empty_cells;
+    if total_cells > 0 {
+        let empty_percent = quality.empty_cells as f64 * 100.0 / total_cells as f64;
+        if empty_percent >= 90.0 {
+            push_quality_warning(
+                quality,
+                &format!("{empty_percent:.0}% of imported table cells are empty."),
+            );
+        }
+    }
+}
+
+fn push_quality_warning(quality: &mut ImportQuality, warning: &str) {
+    if !quality.warnings.iter().any(|existing| existing == warning) {
+        quality.warnings.push(warning.to_string());
+    }
 }
 
 fn import_file_inner(
@@ -998,9 +1095,18 @@ impl RowSink<'_> {
             if self.first_row_headers.is_empty() {
                 self.first_row_headers = headers.clone();
             }
-            if let Some(mapping) = detect_mapping(&headers) {
-                self.extra_cols = unmapped_columns(&headers, &mapping);
-                self.mapping = Some(mapping);
+            if let Some(plan) = detect_mapping(&headers) {
+                self.extra_cols = unmapped_columns(&headers, &plan.columns);
+                self.summary.quality = ImportQuality {
+                    layout: plan.layout.to_string(),
+                    header_row: self.rows_seen,
+                    source_columns: headers.iter().filter(|header| !header.is_empty()).count()
+                        as u64,
+                    recognized_columns: recognized_columns(&plan.columns) as u64,
+                    extra_columns: self.extra_cols.len() as u64,
+                    ..Default::default()
+                };
+                self.mapping = Some(plan.columns);
                 self.scanned.clear(); // rows above the header are title noise
                 return Ok(true);
             }
@@ -1020,6 +1126,14 @@ impl RowSink<'_> {
         };
         self.mapping = Some(universal_mapping());
         self.extra_cols = headers.into_iter().enumerate().collect();
+        self.summary.quality = ImportQuality {
+            layout: "universal table".to_string(),
+            header_row: (header_idx + 1) as u64,
+            source_columns: self.extra_cols.len() as u64,
+            recognized_columns: 0,
+            extra_columns: self.extra_cols.len() as u64,
+            ..Default::default()
+        };
         for row in scanned.into_iter().skip(header_idx + 1) {
             if !self.data_row(row)? {
                 return Ok(false);
@@ -1052,6 +1166,7 @@ impl RowSink<'_> {
         if values.iter().all(|v| v.is_empty()) && extra.is_none() {
             return Ok(true);
         }
+        self.count_quality_cells(&row);
         values[DATE_COL] = normalize_date(&values[DATE_COL]);
         let hash = canonical_record_hash(&values, extra.as_deref());
         self.summary.total_rows += 1;
@@ -1069,6 +1184,20 @@ impl RowSink<'_> {
             }
         }
         Ok(true)
+    }
+
+    fn count_quality_cells(&mut self, row: &[Data]) {
+        let width = self.summary.quality.source_columns as usize;
+        if width == 0 {
+            return;
+        }
+        for col in 0..width {
+            if row.get(col).is_some_and(cell_has_value) {
+                self.summary.quality.non_empty_cells += 1;
+            } else {
+                self.summary.quality.empty_cells += 1;
+            }
+        }
     }
 
     /// Builds the `extra` JSON payload (unmapped columns) for one source row.
