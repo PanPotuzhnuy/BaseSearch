@@ -688,15 +688,17 @@ impl Db {
                 value TEXT
             );",
         )?;
-        // Search index settings changed between versions. On mismatch, the
-        // table is recreated and rebuilt from the watermark, with progress on
-        // the next import or startup.
-        // Bumped when the indexed text changes (extra columns now contribute).
+        // Search index settings changed between versions. When older rows do
+        // not have any `extra` payload yet, their indexed text is unchanged and
+        // the existing FTS table can be reused instead of forcing a multi-GB
+        // rebuild on first launch.
         const FTS_SCHEMA_VERSION: &str = "5";
         if self.meta_get("fts_schema").as_deref() != Some(FTS_SCHEMA_VERSION) {
-            self.conn
-                .execute_batch("DROP TABLE IF EXISTS records_fts;")?;
-            self.meta_set("fts_watermark", "0");
+            if self.existing_rows_may_need_fts_rebuild()? {
+                self.conn
+                    .execute_batch("DROP TABLE IF EXISTS records_fts;")?;
+                self.meta_set("fts_watermark", "0");
+            }
             self.meta_set("fts_schema", FTS_SCHEMA_VERSION);
         }
         self.migrate_records_schema()?;
@@ -721,11 +723,7 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_records_year ON records(year);
             CREATE INDEX IF NOT EXISTS idx_records_product_code ON records(product_code);
             CREATE INDEX IF NOT EXISTS idx_records_edrpou ON records(edrpou);
-            CREATE INDEX IF NOT EXISTS idx_records_source_file ON records(source_file);
-            CREATE INDEX IF NOT EXISTS idx_records_hash ON records(row_hash);
-            CREATE INDEX IF NOT EXISTS idx_records_origin_country_key ON records(country_key(origin_country));
-            CREATE INDEX IF NOT EXISTS idx_records_dispatch_country_key ON records(country_key(dispatch_country));
-            CREATE INDEX IF NOT EXISTS idx_records_trade_country_key ON records(country_key(trade_country));",
+            CREATE INDEX IF NOT EXISTS idx_records_hash ON records(row_hash);",
             records = records_ddl()
         ))?;
         // This column was added after early versions; add it without a migration.
@@ -737,7 +735,8 @@ impl Db {
 
     fn migrate_records_schema(&self) -> rusqlite::Result<()> {
         const RECORDS_SCHEMA_VERSION: &str = "4";
-        if self.meta_get("records_schema").as_deref() == Some(RECORDS_SCHEMA_VERSION) {
+        let current_schema = self.meta_get("records_schema");
+        if current_schema.as_deref() == Some(RECORDS_SCHEMA_VERSION) {
             return Ok(());
         }
 
@@ -754,6 +753,33 @@ impl Db {
         if self.table_exists("records")? {
             let has_dup_first = self.table_has_column("records", "dup_first_file")?;
             let has_extra = self.table_has_column("records", "extra")?;
+            if self.records_have_known_columns()? {
+                if !has_dup_first {
+                    self.conn
+                        .execute_batch("ALTER TABLE records ADD COLUMN dup_first_file TEXT;")?;
+                }
+                if !has_extra {
+                    self.conn
+                        .execute_batch("ALTER TABLE records ADD COLUMN extra TEXT;")?;
+                }
+                if self.table_exists("import_log")? {
+                    let _ = self
+                        .conn
+                        .execute("ALTER TABLE import_log ADD COLUMN file_hash TEXT", []);
+                    self.conn
+                        .execute("UPDATE import_log SET file_hash = NULL", [])?;
+                }
+                let schema_version = current_schema
+                    .as_deref()
+                    .and_then(|version| version.parse::<u32>().ok())
+                    .unwrap_or(0);
+                if schema_version < 2 {
+                    self.meta_set("fts_watermark", "0");
+                }
+                self.meta_set("records_schema", RECORDS_SCHEMA_VERSION);
+                return Ok(());
+            }
+
             let column_names = COLUMNS.iter().map(|c| c.name).collect::<Vec<_>>();
             let columns_sql = column_names.join(", ");
             let dup_expr = if has_dup_first {
@@ -801,6 +827,36 @@ impl Db {
 
         self.meta_set("records_schema", RECORDS_SCHEMA_VERSION);
         Ok(())
+    }
+
+    fn existing_rows_may_need_fts_rebuild(&self) -> rusqlite::Result<bool> {
+        if !self.table_exists("records")? || !self.table_has_column("records", "extra")? {
+            return Ok(false);
+        }
+        let has_extra_payload = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM records
+                WHERE extra IS NOT NULL AND TRIM(extra) <> ''
+                LIMIT 1
+            )",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(has_extra_payload != 0)
+    }
+
+    fn records_have_known_columns(&self) -> rusqlite::Result<bool> {
+        for name in ["id", "row_hash", "source_file", "year", "imported_at"] {
+            if !self.table_has_column("records", name)? {
+                return Ok(false);
+            }
+        }
+        for column in COLUMNS {
+            if !self.table_has_column("records", column.name)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn rebuild_record_hashes(&self) -> rusqlite::Result<()> {
