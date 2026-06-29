@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::table::{ColumnRole, ColumnStorage, SourceColumn, TableShape};
 use crate::schema::{RESULT_COLUMNS, header_for};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +190,32 @@ pub fn field_catalog(extra_headers: impl IntoIterator<Item = String>) -> Vec<Fie
     fields
 }
 
+pub fn field_catalog_for_context(
+    shape: Option<&TableShape>,
+    fallback_extra_headers: impl IntoIterator<Item = String>,
+) -> Vec<FieldInfo> {
+    match shape.filter(|shape| !shape.columns.is_empty()) {
+        Some(shape) => field_catalog_for_shape(shape, fallback_extra_headers),
+        None => field_catalog(fallback_extra_headers),
+    }
+}
+
+pub fn field_catalog_for_shape(
+    shape: &TableShape,
+    fallback_extra_headers: impl IntoIterator<Item = String>,
+) -> Vec<FieldInfo> {
+    if shape.columns.is_empty() {
+        return field_catalog(fallback_extra_headers);
+    }
+    let mut fields = Vec::new();
+    fields.push(field_info("year", "Year".to_string(), FieldKind::Year));
+    fields.extend(result_field_catalog_for_shape(
+        shape,
+        fallback_extra_headers,
+    ));
+    fields
+}
+
 pub fn result_field_catalog(extra_headers: impl IntoIterator<Item = String>) -> Vec<FieldInfo> {
     let mut fields = Vec::new();
     for name in RESULT_COLUMNS {
@@ -211,6 +238,42 @@ pub fn result_field_catalog(extra_headers: impl IntoIterator<Item = String>) -> 
             source: FieldRef::Extra(trimmed.to_string()),
             operators: operators_for_kind(kind).to_vec(),
         });
+    }
+    fields
+}
+
+pub fn result_field_catalog_for_context(
+    shape: Option<&TableShape>,
+    fallback_extra_headers: impl IntoIterator<Item = String>,
+) -> Vec<FieldInfo> {
+    match shape.filter(|shape| !shape.columns.is_empty()) {
+        Some(shape) => result_field_catalog_for_shape(shape, fallback_extra_headers),
+        None => result_field_catalog(fallback_extra_headers),
+    }
+}
+
+pub fn result_field_catalog_for_shape(
+    shape: &TableShape,
+    fallback_extra_headers: impl IntoIterator<Item = String>,
+) -> Vec<FieldInfo> {
+    if shape.columns.is_empty() {
+        return result_field_catalog(fallback_extra_headers);
+    }
+    let mut fields = Vec::new();
+    for column in &shape.columns {
+        fields.push(source_column_field_info(column));
+    }
+    if !fields.iter().any(|field| {
+        matches!(
+            &field.source,
+            FieldRef::Column(name) if name == "source_file"
+        )
+    }) {
+        fields.push(field_info(
+            "source_file",
+            header_for("source_file").to_string(),
+            field_kind_for_column("source_file"),
+        ));
     }
     fields
 }
@@ -328,7 +391,7 @@ pub fn field_label(field: &FieldRef, catalog: &[FieldInfo]) -> String {
     let id = field.id();
     catalog
         .iter()
-        .find(|info| info.id == id)
+        .find(|info| info.id == id || info.source == *field)
         .map(|info| info.label.clone())
         .unwrap_or(id)
 }
@@ -368,6 +431,39 @@ fn field_info(name: &str, label: String, kind: FieldKind) -> FieldInfo {
         kind,
         source: FieldRef::Column(name.to_string()),
         operators: operators_for_kind(kind).to_vec(),
+    }
+}
+
+fn source_column_field_info(column: &SourceColumn) -> FieldInfo {
+    let kind = field_kind_for_source_column(column);
+    let source = match &column.storage {
+        ColumnStorage::SchemaColumn(name) => FieldRef::Column(name.clone()),
+        ColumnStorage::SourceJson => FieldRef::Extra(column.header.clone()),
+    };
+    FieldInfo {
+        id: format!("source:{}", column.id),
+        label: column.header.clone(),
+        kind,
+        source,
+        operators: operators_for_kind(kind).to_vec(),
+    }
+}
+
+fn field_kind_for_source_column(column: &SourceColumn) -> FieldKind {
+    match &column.storage {
+        ColumnStorage::SchemaColumn(name) => field_kind_for_column(name),
+        ColumnStorage::SourceJson => field_kind_for_role(column.role),
+    }
+}
+
+fn field_kind_for_role(role: ColumnRole) -> FieldKind {
+    match role {
+        ColumnRole::Text => FieldKind::Text,
+        ColumnRole::Number | ColumnRole::Money | ColumnRole::Weight => FieldKind::Number,
+        ColumnRole::Date => FieldKind::Date,
+        ColumnRole::Year => FieldKind::Year,
+        ColumnRole::Country => FieldKind::Country,
+        ColumnRole::Code | ColumnRole::Identifier => FieldKind::Code,
     }
 }
 

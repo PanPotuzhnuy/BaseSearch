@@ -76,9 +76,9 @@
 
   // --------------------------------------------------------------- state
   const FILTER_FIELDS = [
-    ["year", "2024"], ["product_code", "8517"], ["edrpou", "12345678"],
-    ["trademark", "Apple"], ["recipient", "—"], ["sender", "—"],
-    ["description", "iPhone…"], ["origin_country", "CN"],
+    ["year", "2024"], ["product_code", "SKU-42"], ["edrpou", "Company ID"],
+    ["trademark", "Brand"], ["recipient", "Customer"], ["sender", "Supplier"],
+    ["description", "Product name..."], ["origin_country", "CN"],
     ["dispatch_country", "PL"], ["trade_country", "IE"],
   ];
 

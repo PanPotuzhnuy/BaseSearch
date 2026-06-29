@@ -1,91 +1,72 @@
-//! Generates a small synthetic customs dataset as an .xlsx file, so the desktop
-//! and web interfaces can be tried without real data.
+//! Generates a small generic spreadsheet as an .xlsx file, so the desktop and
+//! web interfaces can be tried without private data.
 //!
 //! Usage: cargo run --example gen_sample -- <out.xlsx>
 //!
-//! The data is deterministic (no randomness) so repeated runs produce the same
-//! file. Headers use the standard 41-column customs layout the importer detects.
+//! The data is deterministic, so repeated runs produce the same file.
 
 use rust_xlsxwriter::Workbook;
 
-const HEADERS: [&str; 41] = [
-    "Час оформлення",
-    "Назва ПМО",
-    "Тип",
-    "Номер МД",
-    "Дата",
-    "Відправник",
-    "ЕДРПОУ",
-    "Одержувач",
-    "№",
-    "Код товару",
-    "Опис товару",
-    "Кр.торг.",
-    "Кр.відпр.",
-    "Кр.пох.",
-    "Умови пост.",
-    "Місце пост",
-    "К-ть",
-    "Один.вим.",
-    "Брутто, кг.",
-    "Нетто, кг.",
-    "Вага по МД",
-    "ФВ вал.контр",
-    "Особ.перем.",
-    "43",
-    "43_01",
-    "РФВ Дол/кг.",
-    "Вага.один.",
-    "Вага різн.",
-    "Контракт",
-    "3001",
-    "3002",
-    "9610",
-    "Торг.марк.",
-    "РМВ Нетто Дол/кг.",
-    "РМВ Дол/дод.од.",
-    "РМВ Брутто Дол/кг",
-    "Призн.Зед",
-    "Мін.База Дол/кг.",
-    "Різн.мін.база",
-    "пільгова",
-    "повна",
+const HEADERS: [&str; 14] = [
+    "Order Date",
+    "Invoice Number",
+    "Customer",
+    "Customer ID",
+    "Supplier",
+    "SKU",
+    "Product Name",
+    "Brand",
+    "Category",
+    "Country",
+    "Warehouse",
+    "Quantity",
+    "Net Weight kg",
+    "Value USD",
 ];
 
-/// Recipient company paired with a stable EDRPOU code.
-const RECIPIENTS: [(&str, &str); 6] = [
-    ("DEMO IMPORT LLC", "30215600"),
-    ("NORTHWIND TRADE", "41882300"),
-    ("GLOBEX UA", "38771200"),
-    ("ACME DEVICES", "44190077"),
-    ("SILK ROAD LOGISTICS", "39400512"),
-    ("CARPATHIA RETAIL", "42655810"),
+const CUSTOMERS: [(&str, &str); 6] = [
+    ("Demo Retail LLC", "C-1001"),
+    ("Northwind Market", "C-1002"),
+    ("Globex Online", "C-1003"),
+    ("Acme Devices", "C-1004"),
+    ("Carpathia Stores", "C-1005"),
+    ("Blue Harbor Supply", "C-1006"),
 ];
 
-const SENDERS: [&str; 6] = [
-    "SHENZHEN BRIGHT CO., LTD",
-    "APPLE DISTRIBUTION INTERNATIONAL",
-    "SAMSUNG ELECTRONICS GMBH",
-    "VIETNAM PRECISION IND.",
-    "POLARIS EUROPE SP. Z O.O.",
-    "MEDITERRA TRADING SRL",
+const SUPPLIERS: [&str; 6] = [
+    "Bright Components",
+    "Summit Manufacturing",
+    "Polar Logistics",
+    "Metro Distribution",
+    "Vector Goods",
+    "Noble Workshop",
 ];
 
-/// Product code paired with a description.
-const GOODS: [(&str, &str); 7] = [
-    ("8517120000", "Smartphones, cellular network telephones"),
-    ("8504401100", "Power adapters and chargers for telephones"),
-    ("8471300000", "Portable computers, tablets"),
-    ("8518300000", "Headphones and earphones"),
-    ("9403200000", "Metal furniture, office shelving"),
-    ("6109100000", "Cotton t-shirts, knitted"),
-    ("2204210000", "Wine of fresh grapes, bottled"),
+const PRODUCTS: [(&str, &str, &str, &str, f64); 8] = [
+    (
+        "SKU-1000",
+        "USB-C power adapter",
+        "Voltix",
+        "Electronics",
+        18.0,
+    ),
+    (
+        "SKU-1010",
+        "Wireless keyboard",
+        "Keylane",
+        "Electronics",
+        32.0,
+    ),
+    ("SKU-1020", "Office chair", "Worknest", "Furniture", 95.0),
+    ("SKU-1030", "Storage box", "Nordbox", "Household", 8.5),
+    ("SKU-1040", "LED desk lamp", "Lumio", "Lighting", 24.0),
+    ("SKU-1050", "Cotton t-shirt", "PlainWorks", "Apparel", 7.2),
+    ("SKU-1060", "Travel backpack", "Route", "Travel", 41.0),
+    ("SKU-1070", "Steel bottle", "Hydra", "Household", 11.0),
 ];
 
-const BRANDS: [&str; 6] = ["Apple", "Samsung", "Anker", "Xiaomi", "IKEA", "Generic"];
-
-/// Country code paired with itself for origin/dispatch/trade variety.
-const COUNTRIES: [&str; 6] = ["CN", "VN", "DE", "PL", "IT", "TR"];
+const COUNTRIES: [&str; 6] = ["CN", "DE", "PL", "TR", "IT", "VN"];
+const WAREHOUSES: [&str; 4] = ["Kyiv", "Lviv", "Warsaw", "Berlin"];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = std::env::args()
@@ -102,50 +83,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..rows {
         let r = i + 1;
         let idx = i as usize;
-        let (recipient, edrpou) = RECIPIENTS[idx % RECIPIENTS.len()];
-        let sender = SENDERS[(idx * 7) % SENDERS.len()];
-        let (code, desc) = GOODS[(idx * 3) % GOODS.len()];
-        let brand = BRANDS[(idx * 5) % BRANDS.len()];
-        let origin = COUNTRIES[(idx * 11) % COUNTRIES.len()];
-        let dispatch = COUNTRIES[(idx * 13 + 2) % COUNTRIES.len()];
+        let (customer, customer_id) = CUSTOMERS[idx % CUSTOMERS.len()];
+        let supplier = SUPPLIERS[(idx * 7) % SUPPLIERS.len()];
+        let (sku, product, brand, category, base_price) = PRODUCTS[(idx * 3) % PRODUCTS.len()];
+        let country = COUNTRIES[(idx * 11) % COUNTRIES.len()];
+        let warehouse = WAREHOUSES[(idx * 5) % WAREHOUSES.len()];
 
         let year = if idx.is_multiple_of(9) { 2025 } else { 2024 };
         let month = (idx % 12) + 1;
         let day = (idx % 27) + 1;
         let date = format!("{year:04}-{month:02}-{day:02}");
 
-        let quantity = 40.0 + (idx % 25) as f64 * 12.0;
-        let net_kg = 180.0 + (idx % 60) as f64 * 14.5;
-        let gross_kg = (net_kg * 1.08).round();
-        // Base price per kg varies by product, with a per-row wobble; a few rows
-        // are deliberately cheap so the price spread looks realistic.
-        let base_price = 6.0 + ((idx * 3) % 7) as f64 * 5.5;
-        let wobble = ((idx % 5) as f64 - 2.0) * 0.8;
-        let price = (base_price + wobble).max(1.5);
-        let value = (price * net_kg).round();
+        let quantity = 5.0 + (idx % 18) as f64 * 3.0;
+        let net_kg = (quantity * (0.4 + (idx % 7) as f64 * 0.35) * 10.0).round() / 10.0;
+        let price = base_price * (0.88 + (idx % 9) as f64 * 0.03);
+        let value = (price * quantity).round();
 
-        sheet.write_string(r, 1, "Kyiv City Customs")?;
-        sheet.write_string(r, 2, "IM 40")?;
-        sheet.write_string(r, 3, format!("UA100290/{year}/{:06}", 100000 + i))?;
-        sheet.write_string(r, 4, &date)?;
-        sheet.write_string(r, 5, sender)?;
-        sheet.write_string(r, 6, edrpou)?;
-        sheet.write_string(r, 7, recipient)?;
-        sheet.write_string(r, 8, "1")?;
-        sheet.write_string(r, 9, code)?;
-        sheet.write_string(r, 10, desc)?;
-        sheet.write_string(r, 11, origin)?;
-        sheet.write_string(r, 12, dispatch)?;
-        sheet.write_string(r, 13, origin)?;
-        sheet.write_string(r, 14, "CIF")?;
-        sheet.write_number(r, 16, quantity)?;
-        sheet.write_string(r, 17, "pcs")?;
-        sheet.write_number(r, 18, gross_kg)?;
-        sheet.write_number(r, 19, net_kg)?;
-        sheet.write_number(r, 21, value)?;
-        sheet.write_number(r, 25, (price * 100.0).round() / 100.0)?;
-        sheet.write_string(r, 28, format!("CT-{:04}", 2000 + (idx % 40)))?;
-        sheet.write_string(r, 32, brand)?;
+        sheet.write_string(r, 0, &date)?;
+        sheet.write_string(r, 1, format!("INV-{year}-{:06}", 100000 + i))?;
+        sheet.write_string(r, 2, customer)?;
+        sheet.write_string(r, 3, customer_id)?;
+        sheet.write_string(r, 4, supplier)?;
+        sheet.write_string(r, 5, sku)?;
+        sheet.write_string(r, 6, product)?;
+        sheet.write_string(r, 7, brand)?;
+        sheet.write_string(r, 8, category)?;
+        sheet.write_string(r, 9, country)?;
+        sheet.write_string(r, 10, warehouse)?;
+        sheet.write_number(r, 11, quantity)?;
+        sheet.write_number(r, 12, net_kg)?;
+        sheet.write_number(r, 13, value)?;
     }
 
     workbook.save(&out)?;

@@ -10,6 +10,7 @@ use base_search::db::{
     build_fts_query, canonical_record_hash, extract_year, fts_prefix_terms, parse_number,
     pivot_filter_action,
 };
+use base_search::domain::table::{ColumnRole, ColumnStorage, SemanticField};
 use base_search::export;
 use base_search::import::{self, ImportPhase, collapse_ws, normalize_date, normalize_value};
 use base_search::schema::{COLUMNS, RESULT_COLUMNS, col_index, column_glossary};
@@ -46,13 +47,12 @@ fn database_storage_maintenance_reports_and_compacts_without_deleting_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("maintenance.db");
     let db = Db::open(&db_path).unwrap();
-    db.conn
-        .execute_batch(
-            "CREATE TABLE storage_test(value TEXT);
+    db.diagnostic_execute_batch(
+        "CREATE TABLE storage_test(value TEXT);
              INSERT INTO storage_test VALUES (zeroblob(100000));
              DROP TABLE storage_test;",
-        )
-        .unwrap();
+    )
+    .unwrap();
 
     let before = db.storage_info(&db_path).unwrap();
     assert!(before.database_bytes > 0);
@@ -381,7 +381,7 @@ fn import_search_filter_export() {
     assert_eq!(summary.total_rows, 3);
     assert_eq!(summary.imported, 3);
     assert_eq!(summary.duplicates, 0);
-    assert_eq!(summary.quality.layout, "standard customs");
+    assert_eq!(summary.quality.layout, "recognized profile");
     assert_eq!(summary.quality.header_row, 1);
     assert_eq!(summary.quality.source_columns, COLUMNS.len() as u64);
     assert_eq!(summary.quality.recognized_columns, COLUMNS.len() as u64);
@@ -391,6 +391,29 @@ fn import_search_filter_export() {
     assert!(summary.quality.warnings.is_empty());
     assert_eq!(db.total_rows(), 3);
     assert_eq!(db.unindexed_rows(), 0);
+
+    let shape = db.table_shape().unwrap();
+    assert_eq!(shape.columns.len(), COLUMNS.len());
+    let product_code = shape
+        .columns
+        .iter()
+        .find(|column| column.semantic == Some(SemanticField::ProductCode))
+        .unwrap();
+    assert_eq!(product_code.source_index, result_col("product_code"));
+    assert_eq!(
+        product_code.storage,
+        ColumnStorage::SchemaColumn("product_code".to_string())
+    );
+    let value = shape
+        .columns
+        .iter()
+        .find(|column| column.semantic == Some(SemanticField::Value))
+        .unwrap();
+    assert_eq!(value.source_index, result_col("currency_control_value"));
+    assert_eq!(
+        value.storage,
+        ColumnStorage::SchemaColumn("currency_control_value".to_string())
+    );
 
     // A file with the same rows plus one new row: overlapping rows stay visible
     // in Results, but are flagged as duplicates for Analytics.
@@ -531,7 +554,7 @@ fn import_search_filter_export() {
     assert!(
         card.fields
             .iter()
-            .any(|(h, v)| *h == "Опис товару" && v.contains("Перетворювач"))
+            .any(|(h, v)| h == "Опис товару" && v.contains("Перетворювач"))
     );
 
     // CSV export: BOM plus all rows.
@@ -621,34 +644,34 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
             vec![
                 ("declaration_number", "24UA100110000101U1"),
                 ("declaration_date", "15.03.2024"),
-                ("sender", "APPLE DISTRIBUTION INTERNATIONAL LTD"),
+                ("sender", "NIMBUS DISTRIBUTION INTERNATIONAL LTD"),
                 ("edrpou", "11111111"),
                 ("recipient", "ТОВ «АЙФОН УКРАЇНА»"),
                 ("product_code", "8517130000"),
-                ("description", "Apple iPhone 15 smartphone"),
+                ("description", "Nimbus Widget 15 smartphone"),
                 ("trade_country", "IE"),
                 ("origin_country", "CN"),
                 ("quantity", "10"),
                 ("gross_kg", "12.5"),
                 ("net_kg", "10"),
                 ("currency_control_value", "1 200.50"),
-                ("trademark", "Apple"),
+                ("trademark", "Nimbus"),
             ],
             vec![
                 ("declaration_number", "24UA100110000102U2"),
                 ("declaration_date", "16.03.2024"),
-                ("sender", "APPLE OPERATIONS EUROPE"),
+                ("sender", "NIMBUS OPERATIONS EUROPE"),
                 ("edrpou", "22222222"),
                 ("recipient", "ТОВ «ТЕХНО ІМПОРТ»"),
                 ("product_code", "8517130000"),
-                ("description", "Apple iPhone parts"),
+                ("description", "Nimbus Widget parts"),
                 ("trade_country", "IE"),
                 ("origin_country", "CN"),
                 ("quantity", "2"),
                 ("gross_kg", "3,5"),
                 ("net_kg", "2,5"),
                 ("currency_control_value", "300,25"),
-                ("trademark", "Apple"),
+                ("trademark", "Nimbus"),
             ],
             vec![
                 ("declaration_number", "24UA100110000103U3"),
@@ -669,18 +692,18 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
             vec![
                 ("declaration_number", "25UA100110000104U4"),
                 ("declaration_date", "12.01.2025"),
-                ("sender", "APPLE DISTRIBUTION INTERNATIONAL LTD"),
+                ("sender", "NIMBUS DISTRIBUTION INTERNATIONAL LTD"),
                 ("edrpou", "11111111"),
                 ("recipient", "ТОВ «АЙФОН УКРАЇНА»"),
                 ("product_code", "8517130000"),
-                ("description", "Apple iPhone 16 smartphone"),
+                ("description", "Nimbus Widget 16 smartphone"),
                 ("trade_country", "IE"),
                 ("origin_country", "CN"),
                 ("quantity", "20"),
                 ("gross_kg", "25"),
                 ("net_kg", "20"),
                 ("currency_control_value", "2 400"),
-                ("trademark", "Apple"),
+                ("trademark", "Nimbus"),
             ],
         ],
     );
@@ -692,7 +715,7 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
     assert_eq!(summary.imported, 4);
 
     let q = Query {
-        text: "Apple".into(),
+        text: "Nimbus".into(),
         filters: Filters {
             year: "2024".into(),
             ..Default::default()
@@ -714,14 +737,14 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
     assert_close(analytics.top_recipients[0].total_value_usd, 1200.50);
     assert_eq!(
         analytics.top_senders[0].label,
-        "APPLE DISTRIBUTION INTERNATIONAL LTD"
+        "NIMBUS DISTRIBUTION INTERNATIONAL LTD"
     );
-    assert_eq!(analytics.top_trademarks[0].label, "Apple");
+    assert_eq!(analytics.top_trademarks[0].label, "Nimbus");
     assert_eq!(analytics.top_product_codes[0].label, "8517130000");
     assert_eq!(analytics.top_origin_countries[0].label, "CN");
     assert_eq!(analytics.top_origin_countries[0].rows, 2);
 
-    // Monthly dynamics: both Apple-2024 rows fall into the same month.
+    // Monthly dynamics: both Nimbus-2024 rows fall into the same month.
     assert_eq!(analytics.months.len(), 1);
     assert_eq!(analytics.months[0].month, "2024-03");
     assert_eq!(analytics.months[0].rows, 2);
@@ -730,7 +753,7 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
 
     // Without the year filter the months are listed chronologically.
     let q_all = Query {
-        text: "Apple".into(),
+        text: "Nimbus".into(),
         ..Default::default()
     };
     let analytics_all = db.analytics(&q_all, 5).unwrap();
@@ -743,7 +766,7 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
     assert_eq!(analytics_all.months[1].rows, 1);
     assert_close(analytics_all.months[1].total_value_usd, 2400.0);
 
-    // Robust price stats: per-kg prices for the three Apple rows are
+    // Robust price stats: per-kg prices for the three Nimbus rows are
     // 120.0, 120.05 and 120.1, so the median is the middle value.
     let price = &analytics_all.price_sections[0];
     assert_eq!(price.kind, PriceMetricKind::ValuePerNetKg);
@@ -765,7 +788,7 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
     assert!(overview_only.company_sections.is_empty());
     assert!(overview_only.price_sections.is_empty());
 
-    // Company dossier for EDRPOU 11111111 (the Apple importer, 2 rows total).
+    // Company dossier for EDRPOU 11111111 (the Nimbus importer, 2 rows total).
     let profile = db.company_profile("11111111", 10).unwrap();
     assert_eq!(profile.edrpou, "11111111");
     assert_eq!(profile.names, vec!["ТОВ «АЙФОН УКРАЇНА»".to_string()]);
@@ -774,13 +797,13 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
     assert_eq!(profile.top_products[0].label, "8517130000");
     assert_eq!(
         profile.top_senders[0].label,
-        "APPLE DISTRIBUTION INTERNATIONAL LTD"
+        "NIMBUS DISTRIBUTION INTERNATIONAL LTD"
     );
     assert_eq!(profile.top_origin_countries[0].label, "CN");
     assert_eq!(
         analytics_section(&profile.product_sections, AnalyticsSectionKind::Trademarks).rows[0]
             .label,
-        "Apple"
+        "Nimbus"
     );
     assert_eq!(
         analytics_section(
@@ -814,6 +837,8 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
     assert_eq!(pivot.col_labels, vec!["CN".to_string()]);
     assert_eq!(pivot.row_labels.len(), 2);
     assert_eq!(pivot.grand_total, 3.0);
+    assert!(pivot.row_filterable);
+    assert!(pivot.col_filterable);
     // The matrix and totals are internally consistent.
     let sum_cells: f64 = pivot.cells.iter().flat_map(|r| r.iter()).sum();
     assert_eq!(sum_cells, pivot.grand_total);
@@ -834,7 +859,9 @@ fn analytics_summarizes_filtered_rows_by_value_and_company() {
         pivot_m.col_labels,
         vec!["2024-03".to_string(), "2025-01".to_string()]
     );
-    // Apple value only: 1200.50 + 300.25 (2024-03) + 2400 (2025-01).
+    assert!(pivot_m.row_filterable);
+    assert!(!pivot_m.col_filterable);
+    // Nimbus value only: 1200.50 + 300.25 (2024-03) + 2400 (2025-01).
     assert_close(pivot_m.grand_total, 3900.75);
 }
 
@@ -891,6 +918,89 @@ fn undervaluation_flags_rows_below_code_median() {
 }
 
 #[test]
+fn generic_table_semantics_drive_undervaluation_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("generic_under.xlsx");
+    let db_path = dir.path().join("generic_under.db");
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    let headers = [
+        "Order Date",
+        "Invoice No",
+        "Supplier",
+        "Buyer",
+        "SKU",
+        "Description",
+        "Amount USD",
+        "Net kg",
+    ];
+    for (c, h) in headers.iter().enumerate() {
+        sheet.write_string(0, c as u16, *h).unwrap();
+    }
+    for (r, (value, net)) in [
+        ("100", "10"),
+        ("105", "10"),
+        ("98", "10"),
+        ("102", "10"),
+        ("110", "10"),
+        ("10", "10"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let row = [
+            "2024-03-15",
+            &format!("INV-{r:03}"),
+            "ACME SUPPLY",
+            "Buyer A",
+            "SKU-LOW",
+            "Generic widget",
+            value,
+            net,
+        ];
+        for (c, v) in row.iter().enumerate() {
+            sheet.write_string((r + 1) as u32, c as u16, *v).unwrap();
+        }
+    }
+    workbook.save(&xlsx).unwrap();
+
+    let cancel = AtomicBool::new(false);
+    let mut db = Db::open(&db_path).unwrap();
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.quality.layout, "generic table");
+    assert_eq!(summary.imported, 6);
+
+    for (id, semantic) in [
+        ("order_date", SemanticField::Date),
+        ("invoice_no", SemanticField::DeclarationNumber),
+        ("supplier", SemanticField::Sender),
+        ("buyer", SemanticField::Recipient),
+        ("sku", SemanticField::ProductCode),
+        ("description", SemanticField::Description),
+        ("amount_usd", SemanticField::Value),
+        ("net_kg", SemanticField::NetWeight),
+    ] {
+        assert!(
+            db.set_column_semantic(id, Some(semantic)),
+            "missing shape column {id}"
+        );
+    }
+
+    let uv = db.undervaluation(&Query::default(), 0.5, 5, 100).unwrap();
+    assert_eq!(uv.checked_codes, 1);
+    assert_eq!(uv.rows.len(), 1);
+    let flagged = &uv.rows[0];
+    assert_eq!(flagged.product_code, "SKU-LOW");
+    assert_eq!(flagged.recipient, "Buyer A");
+    assert_eq!(flagged.sender, "ACME SUPPLY");
+    assert_eq!(flagged.declaration_date, "2024-03-15");
+    assert_close(flagged.price_per_kg, 1.0);
+    assert_close(flagged.code_median, 10.2);
+    assert!(flagged.ratio < 0.5);
+}
+
+#[test]
 fn analytics_section_can_load_all_group_rows_beyond_visible_top() {
     let dir = tempfile::tempdir().unwrap();
     let xlsx = dir.path().join("many_recipients.xlsx");
@@ -905,14 +1015,14 @@ fn analytics_section_can_load_all_group_rows_beyond_visible_top() {
                 ("declaration_date".to_string(), "15.03.2024".to_string()),
                 (
                     "sender".to_string(),
-                    "APPLE DISTRIBUTION INTERNATIONAL LTD".to_string(),
+                    "NIMBUS DISTRIBUTION INTERNATIONAL LTD".to_string(),
                 ),
                 ("edrpou".to_string(), format!("{idx:08}")),
-                ("recipient".to_string(), format!("APPLE IMPORTER {idx:02}")),
+                ("recipient".to_string(), format!("NIMBUS IMPORTER {idx:02}")),
                 ("product_code".to_string(), "8517130000".to_string()),
                 (
                     "description".to_string(),
-                    "Apple iPhone smartphone".to_string(),
+                    "Nimbus Widget smartphone".to_string(),
                 ),
                 ("trade_country".to_string(), "IE".to_string()),
                 ("dispatch_country".to_string(), "IE".to_string()),
@@ -924,7 +1034,7 @@ fn analytics_section_can_load_all_group_rows_beyond_visible_top() {
                     "currency_control_value".to_string(),
                     (idx * 100).to_string(),
                 ),
-                ("trademark".to_string(), "Apple".to_string()),
+                ("trademark".to_string(), "Nimbus".to_string()),
             ]
         })
         .collect();
@@ -937,7 +1047,7 @@ fn analytics_section_can_load_all_group_rows_beyond_visible_top() {
     assert_eq!(summary.imported, 12);
 
     let q = Query {
-        text: "Apple".into(),
+        text: "Nimbus".into(),
         filters: Filters {
             year: "2024".into(),
             ..Default::default()
@@ -954,11 +1064,11 @@ fn analytics_section_can_load_all_group_rows_beyond_visible_top() {
         .analytics_section(&q, AnalyticsSectionKind::Recipients, 10, 50)
         .unwrap();
     assert_eq!(full.rows.len(), 12);
-    assert_eq!(full.rows[0].label, "APPLE IMPORTER 12");
-    assert_eq!(full.rows[11].label, "APPLE IMPORTER 01");
+    assert_eq!(full.rows[0].label, "NIMBUS IMPORTER 12");
+    assert_eq!(full.rows[11].label, "NIMBUS IMPORTER 01");
     let filter = full.rows[0].filter_action.as_ref().unwrap();
     assert_eq!(filter.field, AnalyticsFilterField::Recipient);
-    assert_eq!(filter.value, "APPLE IMPORTER 12");
+    assert_eq!(filter.value, "NIMBUS IMPORTER 12");
 }
 
 #[test]
@@ -972,15 +1082,15 @@ fn analytics_trademark_filter_is_field_specific() {
             vec![
                 ("declaration_number", "24UA100110000301U1"),
                 ("declaration_date", "15.03.2024"),
-                ("sender", "APPLE DISTRIBUTION INTERNATIONAL LTD"),
+                ("sender", "NIMBUS DISTRIBUTION INTERNATIONAL LTD"),
                 ("edrpou", "11111111"),
                 ("recipient", "IPHONE UKRAINE LLC"),
                 ("product_code", "8517130000"),
-                ("description", "Apple iPhone smartphone"),
+                ("description", "Nimbus Widget smartphone"),
                 ("origin_country", "CN"),
                 ("net_kg", "10"),
                 ("currency_control_value", "1200"),
-                ("trademark", "Apple"),
+                ("trademark", "Nimbus"),
             ],
             vec![
                 ("declaration_number", "24UA100110000302U2"),
@@ -989,7 +1099,7 @@ fn analytics_trademark_filter_is_field_specific() {
                 ("edrpou", "22222222"),
                 ("recipient", "COSMETICS IMPORT LLC"),
                 ("product_code", "3401110000"),
-                ("description", "Soap Apple & Cinnamon"),
+                ("description", "Soap Nimbus & Cinnamon"),
                 ("origin_country", "PL"),
                 ("net_kg", "30"),
                 ("currency_control_value", "500"),
@@ -1006,7 +1116,7 @@ fn analytics_trademark_filter_is_field_specific() {
                 ("origin_country", "CN"),
                 ("net_kg", "20"),
                 ("currency_control_value", "700"),
-                ("trademark", "APPLE GLOBE"),
+                ("trademark", "NIMBUS GLOBE"),
             ],
         ],
     );
@@ -1018,7 +1128,7 @@ fn analytics_trademark_filter_is_field_specific() {
     assert_eq!(summary.imported, 3);
 
     let broad = Query {
-        text: "Apple".into(),
+        text: "Nimbus".into(),
         filters: Filters {
             year: "2024".into(),
             ..Default::default()
@@ -1031,7 +1141,7 @@ fn analytics_trademark_filter_is_field_specific() {
         text: String::new(),
         filters: Filters {
             year: "2024".into(),
-            trademark: "Apple".into(),
+            trademark: "Nimbus".into(),
             ..Default::default()
         },
         advanced: None,
@@ -1039,7 +1149,7 @@ fn analytics_trademark_filter_is_field_specific() {
     let analytics = db.analytics(&exact_brand, 10).unwrap();
     assert_eq!(analytics.overview.row_count, 1);
     assert_close(analytics.overview.total_value_usd, 1200.0);
-    assert_eq!(analytics.top_trademarks[0].label, "Apple");
+    assert_eq!(analytics.top_trademarks[0].label, "Nimbus");
 }
 
 #[test]
@@ -1053,28 +1163,28 @@ fn analytics_country_sections_use_normalized_country_keys() {
             vec![
                 ("declaration_number", "24UA100110000401U1"),
                 ("declaration_date", "15.03.2024"),
-                ("sender", "APPLE DISTRIBUTION INTERNATIONAL LTD"),
+                ("sender", "NIMBUS DISTRIBUTION INTERNATIONAL LTD"),
                 ("edrpou", "11111111"),
                 ("recipient", "IPHONE UKRAINE LLC"),
                 ("product_code", "8517130000"),
-                ("description", "Apple iPhone smartphone"),
+                ("description", "Nimbus Widget smartphone"),
                 ("origin_country", "CN"),
                 ("net_kg", "10"),
                 ("currency_control_value", "1000"),
-                ("trademark", "Apple"),
+                ("trademark", "Nimbus"),
             ],
             vec![
                 ("declaration_number", "24UA100110000402U2"),
                 ("declaration_date", "16.03.2024"),
-                ("sender", "APPLE OPERATIONS EUROPE"),
+                ("sender", "NIMBUS OPERATIONS EUROPE"),
                 ("edrpou", "22222222"),
                 ("recipient", "TECH IMPORT LLC"),
                 ("product_code", "8517130000"),
-                ("description", "Apple iPhone parts"),
+                ("description", "Nimbus Widget parts"),
                 ("origin_country", "КИТАЙ"),
                 ("net_kg", "5"),
                 ("currency_control_value", "500"),
-                ("trademark", "Apple"),
+                ("trademark", "Nimbus"),
             ],
         ],
     );
@@ -1086,7 +1196,7 @@ fn analytics_country_sections_use_normalized_country_keys() {
     assert_eq!(summary.imported, 2);
 
     let q = Query {
-        text: "Apple".into(),
+        text: "Nimbus".into(),
         filters: Filters {
             year: "2024".into(),
             ..Default::default()
@@ -1119,7 +1229,7 @@ fn analytics_ignores_placeholder_labels_in_business_groups() {
                 ("edrpou", "0"),
                 ("recipient", "0"),
                 ("product_code", "0"),
-                ("description", "Apple device"),
+                ("description", "Nimbus device"),
                 ("origin_country", "0"),
                 ("net_kg", "10"),
                 ("currency_control_value", "10000"),
@@ -1132,11 +1242,11 @@ fn analytics_ignores_placeholder_labels_in_business_groups() {
                 ("edrpou", "12345678"),
                 ("recipient", "REAL IMPORT LLC"),
                 ("product_code", "8517130000"),
-                ("description", "Apple iPhone"),
+                ("description", "Nimbus Widget"),
                 ("origin_country", "CN"),
                 ("net_kg", "5"),
                 ("currency_control_value", "100"),
-                ("trademark", "Apple"),
+                ("trademark", "Nimbus"),
             ],
         ],
     );
@@ -1148,7 +1258,7 @@ fn analytics_ignores_placeholder_labels_in_business_groups() {
     assert_eq!(summary.imported, 2);
 
     let q = Query {
-        text: "Apple".into(),
+        text: "Nimbus".into(),
         filters: Filters {
             year: "2024".into(),
             ..Default::default()
@@ -1173,7 +1283,7 @@ fn analytics_ignores_placeholder_labels_in_business_groups() {
         &analytics.product_sections,
         AnalyticsSectionKind::Trademarks,
     );
-    assert_eq!(trademarks.rows[0].label, "Apple");
+    assert_eq!(trademarks.rows[0].label, "Nimbus");
 }
 
 #[test]
@@ -1187,11 +1297,11 @@ fn analytics_builds_decision_sections_for_trade_questions() {
             vec![
                 ("declaration_number", "24UA100110000201U1"),
                 ("declaration_date", "15.03.2024"),
-                ("sender", "APPLE DISTRIBUTION INTERNATIONAL LTD"),
+                ("sender", "NIMBUS DISTRIBUTION INTERNATIONAL LTD"),
                 ("edrpou", "11111111"),
                 ("recipient", "IPHONE UKRAINE LLC"),
                 ("product_code", "8517130000"),
-                ("description", "Apple iPhone 15 smartphone"),
+                ("description", "Nimbus Widget 15 smartphone"),
                 ("trade_country", "IE"),
                 ("dispatch_country", "IE"),
                 ("origin_country", "CN"),
@@ -1201,16 +1311,16 @@ fn analytics_builds_decision_sections_for_trade_questions() {
                 ("currency_control_value", "1 200.50"),
                 ("rfv_usd_kg", "120.05"),
                 ("rmv_net_usd_kg", "119.5"),
-                ("trademark", "Apple"),
+                ("trademark", "Nimbus"),
             ],
             vec![
                 ("declaration_number", "24UA100110000201U1"),
                 ("declaration_date", "16.03.2024"),
-                ("sender", "APPLE OPERATIONS EUROPE"),
+                ("sender", "NIMBUS OPERATIONS EUROPE"),
                 ("edrpou", "22222222"),
                 ("recipient", "TECH IMPORT LLC"),
                 ("product_code", "8517790000"),
-                ("description", "Apple iPhone parts"),
+                ("description", "Nimbus Widget parts"),
                 ("trade_country", "IE"),
                 ("dispatch_country", "PL"),
                 ("origin_country", "US"),
@@ -1220,16 +1330,16 @@ fn analytics_builds_decision_sections_for_trade_questions() {
                 ("currency_control_value", "300,25"),
                 ("rfv_usd_kg", "120.1"),
                 ("rmv_net_usd_kg", "121"),
-                ("trademark", "Apple"),
+                ("trademark", "Nimbus"),
             ],
             vec![
                 ("declaration_number", "24UA100110000202U2"),
                 ("declaration_date", "17.03.2024"),
-                ("sender", "APPLE OPERATIONS EUROPE"),
+                ("sender", "NIMBUS OPERATIONS EUROPE"),
                 ("edrpou", "22222222"),
                 ("recipient", "TECH IMPORT LLC"),
                 ("product_code", "8517790000"),
-                ("description", "Apple service replacement unit"),
+                ("description", "Nimbus service replacement unit"),
                 ("trade_country", "US"),
                 ("dispatch_country", "US"),
                 ("origin_country", "US"),
@@ -1239,7 +1349,7 @@ fn analytics_builds_decision_sections_for_trade_questions() {
                 ("currency_control_value", "not a number"),
                 ("rfv_usd_kg", ""),
                 ("rmv_net_usd_kg", "bad"),
-                ("trademark", "Apple"),
+                ("trademark", "Nimbus"),
             ],
             vec![
                 ("declaration_number", "24UA100110000203U3"),
@@ -1268,7 +1378,7 @@ fn analytics_builds_decision_sections_for_trade_questions() {
     assert_eq!(summary.imported, 4);
 
     let q = Query {
-        text: "Apple".into(),
+        text: "Nimbus".into(),
         filters: Filters {
             year: "2024".into(),
             ..Default::default()
@@ -1315,7 +1425,7 @@ fn analytics_builds_decision_sections_for_trade_questions() {
         &analytics.product_sections,
         AnalyticsSectionKind::Trademarks,
     );
-    assert_eq!(trademarks.rows[0].label, "Apple");
+    assert_eq!(trademarks.rows[0].label, "Nimbus");
     assert_eq!(trademarks.rows[0].companies, 2);
 
     let origin = analytics_section(
@@ -1353,6 +1463,265 @@ fn analytics_builds_decision_sections_for_trade_questions() {
 
     assert!(!analytics_should_run(&Query::default()));
     assert!(analytics_should_run(&q));
+}
+
+/// Shape-driven analytics: a generic table's value column lives in `extra` and
+/// carries no meaning until the user assigns it. Once assigned, analytics sums
+/// it — proving analytics is driven by the recorded shape, not only the fixed
+/// customs schema.
+#[test]
+fn user_assigned_semantic_drives_generic_table_analytics() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("generic_value.xlsx");
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    let headers = [
+        "Дата",
+        "Номер декларації",
+        "Відправник",
+        "Одержувач",
+        "Код товару",
+        "Опис товару",
+        "Сума", // generic column, not part of the customs schema
+    ];
+    for (c, h) in headers.iter().enumerate() {
+        sheet.write_string(0, c as u16, *h).unwrap();
+    }
+    let rows = [
+        [
+            "15.03.2024",
+            "UA1/2024/1",
+            "ACME",
+            "ТОВ A",
+            "8504405500",
+            "Widget one",
+            "1500.50",
+        ],
+        [
+            "16.03.2024",
+            "UA1/2024/2",
+            "ACME",
+            "ТОВ B",
+            "8504405500",
+            "Widget two",
+            "1000",
+        ],
+    ];
+    for (r, row) in rows.iter().enumerate() {
+        for (c, v) in row.iter().enumerate() {
+            sheet.write_string(r as u32 + 1, c as u16, *v).unwrap();
+        }
+    }
+    workbook.save(&xlsx).unwrap();
+
+    let db_path = dir.path().join("generic_value.db");
+    let mut db = Db::open(&db_path).unwrap();
+    let cancel = AtomicBool::new(false);
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.imported, 2);
+
+    let q = Query {
+        text: String::new(),
+        filters: Filters {
+            year: "2024".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // No value semantic yet -> the total is zero.
+    let before = db.analytics_scoped(&q, 10, None, 10).unwrap();
+    assert_eq!(before.overview.row_count, 2);
+    assert_close(before.overview.total_value_usd, 0.0);
+
+    // The generic column was captured into the shape with no meaning.
+    let shape = db.table_shape().expect("table shape recorded");
+    let column = shape
+        .columns
+        .iter()
+        .find(|column| column.id == "сума")
+        .expect("сума column in shape");
+    assert!(column.semantic.is_none());
+
+    // The user assigns it the value meaning (what the column-mapping UI does).
+    assert!(db.set_column_semantic("сума", Some(SemanticField::Value)));
+
+    // Analytics now sums the value from the extra JSON for this generic table.
+    let after = db.analytics_scoped(&q, 10, None, 10).unwrap();
+    assert_close(after.overview.total_value_usd, 2500.50);
+}
+
+#[test]
+fn generic_table_semantics_drive_sections_and_months() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("generic_analytics.xlsx");
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    let sheet = workbook.add_worksheet();
+    let headers = [
+        "Order Date",
+        "Invoice No",
+        "Supplier Name",
+        "Buyer Name",
+        "Buyer Code",
+        "SKU",
+        "Item Description",
+        "Amount USD",
+        "Net kg",
+        "Ship From",
+    ];
+    for (c, h) in headers.iter().enumerate() {
+        sheet.write_string(0, c as u16, *h).unwrap();
+    }
+    let rows = [
+        [
+            "15.03.2024",
+            "INV-001",
+            "ACME SUPPLY",
+            "Buyer A",
+            "BUYER-1",
+            "SKU-42",
+            "Widget one",
+            "1500.50",
+            "10",
+            "China",
+        ],
+        [
+            "2024/04/16",
+            "INV-002",
+            "ACME SUPPLY",
+            "Buyer B",
+            "BUYER-2",
+            "SKU-42",
+            "Widget two",
+            "1000",
+            "5",
+            "CN",
+        ],
+    ];
+    for (r, row) in rows.iter().enumerate() {
+        for (c, v) in row.iter().enumerate() {
+            sheet.write_string(r as u32 + 1, c as u16, *v).unwrap();
+        }
+    }
+    workbook.save(&xlsx).unwrap();
+
+    let db_path = dir.path().join("generic_analytics.db");
+    let mut db = Db::open(&db_path).unwrap();
+    let cancel = AtomicBool::new(false);
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert_eq!(summary.error, None);
+    assert_eq!(summary.quality.layout, "generic table");
+    assert_eq!(summary.imported, 2);
+
+    for (id, semantic) in [
+        ("order_date", SemanticField::Date),
+        ("invoice_no", SemanticField::DeclarationNumber),
+        ("supplier_name", SemanticField::Sender),
+        ("buyer_name", SemanticField::Recipient),
+        ("buyer_code", SemanticField::CompanyCode),
+        ("sku", SemanticField::ProductCode),
+        ("item_description", SemanticField::Description),
+        ("amount_usd", SemanticField::Value),
+        ("net_kg", SemanticField::NetWeight),
+        ("ship_from", SemanticField::OriginCountry),
+    ] {
+        assert!(
+            db.set_column_semantic(id, Some(semantic)),
+            "missing shape column {id}"
+        );
+    }
+
+    let analytics = db.analytics(&Query::default(), 10).unwrap();
+    assert_eq!(analytics.overview.row_count, 2);
+    assert_eq!(analytics.overview.declaration_count, 2);
+    assert_eq!(analytics.overview.distinct_senders, 1);
+    assert_eq!(analytics.overview.distinct_recipients, 2);
+    assert_eq!(analytics.overview.distinct_edrpou, 2);
+    assert_eq!(analytics.overview.distinct_product_codes, 1);
+    assert_eq!(analytics.overview.distinct_origin_countries, 1);
+    assert_close(analytics.overview.total_value_usd, 2500.50);
+    assert_close(analytics.overview.total_net_kg, 15.0);
+
+    assert_eq!(
+        analytics
+            .months
+            .iter()
+            .map(|row| row.month.as_str())
+            .collect::<Vec<_>>(),
+        vec!["2024-03", "2024-04"]
+    );
+    assert_close(analytics.months[0].total_value_usd, 1500.50);
+    assert_close(analytics.months[1].total_value_usd, 1000.0);
+
+    let recipients = analytics_section(
+        &analytics.company_sections,
+        AnalyticsSectionKind::Recipients,
+    );
+    assert_eq!(recipients.rows.len(), 2);
+    assert_eq!(recipients.rows[0].label, "Buyer A");
+    assert_close(recipients.rows[0].total_value_usd, 1500.50);
+    assert!(recipients.rows[0].filter_action.is_none());
+
+    let products = analytics_section(
+        &analytics.product_sections,
+        AnalyticsSectionKind::ProductCodes,
+    );
+    assert_eq!(products.rows[0].label, "SKU-42");
+    assert_eq!(products.rows[0].rows, 2);
+    assert_close(products.rows[0].total_value_usd, 2500.50);
+
+    let origin = analytics_section(
+        &analytics.country_sections,
+        AnalyticsSectionKind::OriginCountries,
+    );
+    assert_eq!(origin.rows[0].label, "CN");
+    assert_eq!(origin.rows[0].rows, 2);
+
+    let pivot = db
+        .pivot(
+            &Query::default(),
+            PivotDim::Recipient,
+            PivotDim::Month,
+            PivotMetric::Value,
+            PivotLimits { rows: 25, cols: 18 },
+            "others",
+        )
+        .unwrap();
+    assert_eq!(
+        pivot.row_labels,
+        vec!["Buyer A".to_string(), "Buyer B".to_string()]
+    );
+    assert_eq!(
+        pivot.col_labels,
+        vec!["2024-03".to_string(), "2024-04".to_string()]
+    );
+    assert_close(pivot.grand_total, 2500.50);
+    assert_close(pivot.cells[0][0], 1500.50);
+    assert_close(pivot.cells[1][1], 1000.0);
+    assert!(!pivot.row_filterable);
+    assert!(!pivot.col_filterable);
+
+    let value_per_kg = price_metric(&analytics.price_sections, PriceMetricKind::ValuePerNetKg);
+    assert_eq!(value_per_kg.count, 2);
+    assert_close(value_per_kg.average, 175.025);
+    assert_close(value_per_kg.weighted_average, 166.7);
+
+    let profile = db.company_profile("BUYER-1", 10).unwrap();
+    assert_eq!(profile.edrpou, "BUYER-1");
+    assert_eq!(profile.names, vec!["Buyer A".to_string()]);
+    assert_eq!(profile.overview.row_count, 1);
+    assert_close(profile.overview.total_value_usd, 1500.50);
+    assert_close(profile.overview.total_net_kg, 10.0);
+    assert_eq!(profile.top_products[0].label, "SKU-42");
+    assert_eq!(
+        profile
+            .months
+            .iter()
+            .map(|row| row.month.as_str())
+            .collect::<Vec<_>>(),
+        vec!["2024-03"]
+    );
 }
 
 fn assert_close(actual: f64, expected: f64) {
@@ -1458,17 +1827,11 @@ fn import_registry_format() {
     assert_eq!(rows[0][result_col("edrpou")], "37642136"); // EDRPOU is read from the first recipient column
 
     let card = db.record_card(ids[0]).unwrap();
-    let get = |h: &str| {
-        card.fields
-            .iter()
-            .find(|(fh, _)| *fh == h)
-            .map(|(_, v)| v.clone())
-            .unwrap()
-    };
-    assert_eq!(get("Одержувач"), "ТОВ ЮСК УКРАЇНА");
-    assert_eq!(get("Відправник"), "JYSK SP Z O O");
-    assert_eq!(get("Тип"), "40/ДЕ");
-    assert_eq!(get("Брутто, кг."), "27.95");
+    let has = |value: &str| card.fields.iter().any(|(_, v)| v == value);
+    assert!(has("ТОВ ЮСК УКРАЇНА"));
+    assert!(has("JYSK SP Z O O"));
+    assert!(has("40/ДЕ"));
+    assert!(has("27.95"));
 
     // The year is extracted from the converted date.
     let filters = Filters {
@@ -1572,23 +1935,16 @@ fn import_registry_format_im12_variant() {
     assert_eq!(rows[0][result_col("edrpou")], "32818783");
 
     let card = db.record_card(ids[0]).unwrap();
-    let get = |h: &str| {
-        card.fields
-            .iter()
-            .find(|(fh, _)| *fh == h)
-            .map(|(_, v)| v.clone())
-            .unwrap()
-    };
-    assert_eq!(get("Одержувач"), "ТОВ ГЮАЛОС");
-    assert_eq!(get("Відправник"), "GUARDIAN CZESTOCHOWA SP Z O O");
-    assert_eq!(get("Тип"), "40/АА");
-    assert_eq!(get("РФВ Дол/кг."), "0.5756");
-    assert_eq!(get("ФВ вал.контр"), "8473.2");
-    assert_eq!(get("Особ.перем."), "0");
-    assert_eq!(get("43"), "1");
-    assert_eq!(get("3001"), "120.5");
-    assert_eq!(get("3002"), "0");
-    assert_eq!(get("9610"), "74216.87");
+    let has = |value: &str| card.fields.iter().any(|(_, v)| v == value);
+    assert!(has("ТОВ ГЮАЛОС"));
+    assert!(has("GUARDIAN CZESTOCHOWA SP Z O O"));
+    assert!(has("40/АА"));
+    assert!(has("0.5756"));
+    assert!(has("8473.2"));
+    assert!(has("0"));
+    assert!(has("1"));
+    assert!(has("120.5"));
+    assert!(has("74216.87"));
 }
 
 #[test]
@@ -1736,21 +2092,14 @@ fn import_wide_2026_import_layout_maps_participants() {
     assert_eq!(rows[0][result_col("edrpou")], "34474821");
 
     let card = db.record_card(ids[0]).unwrap();
-    let get = |h: &str| {
-        card.fields
-            .iter()
-            .find(|(fh, _)| *fh == h)
-            .map(|(_, v)| v.clone())
-            .unwrap()
-    };
-    assert_eq!(get("Одержувач"), "ТОВ ГРУП СЕБ УКРАЇНА");
-    assert_eq!(get("Відправник"), "GROUPE SEB SLOVENSKO SPOL S R O");
-    assert_eq!(get("ФВ вал.контр"), "1051.49");
-    assert_eq!(get("43"), "1");
-    assert_eq!(get("РФВ Дол/кг."), "15.55");
-    assert_eq!(get("3001"), "909.52");
-    assert_eq!(get("3002"), "0");
-    assert_eq!(get("9610"), "9277.13");
+    let has = |value: &str| card.fields.iter().any(|(_, v)| v == value);
+    assert!(has("ТОВ ГРУП СЕБ УКРАЇНА"));
+    assert!(has("GROUPE SEB SLOVENSKO SPOL S R O"));
+    assert!(has("1051.49"));
+    assert!(has("1"));
+    assert!(has("15.55"));
+    assert!(has("909.52"));
+    assert!(has("9277.13"));
 }
 
 #[test]
@@ -1897,17 +2246,11 @@ fn import_wide_2026_export_layout_maps_sender_company() {
     assert_eq!(rows[0][result_col("edrpou")], "30830662");
 
     let card = db.record_card(ids[0]).unwrap();
-    let get = |h: &str| {
-        card.fields
-            .iter()
-            .find(|(fh, _)| *fh == h)
-            .map(|(_, v)| v.clone())
-            .unwrap()
-    };
-    assert_eq!(get("Відправник"), "ПРАТ МИРОНІВСЬКА ПФ");
-    assert_eq!(get("Одержувач"), "ALEX AND HOLDING LLC");
-    assert_eq!(get("Кр.пох."), "ВІРМЕНІЯ");
-    assert_eq!(get("ФВ вал.контр"), "13140.4");
+    let has = |value: &str| card.fields.iter().any(|(_, v)| v == value);
+    assert!(has("ПРАТ МИРОНІВСЬКА ПФ"));
+    assert!(has("ALEX AND HOLDING LLC"));
+    assert!(has("ВІРМЕНІЯ"));
+    assert!(has("13140.4"));
 }
 
 /// Generic detector: an external export with Russian headers and title rows
@@ -1970,11 +2313,7 @@ fn import_generic_format_with_title_rows() {
         "UA100100/2024/55555"
     );
     let card = db.record_card(ids[0]).unwrap();
-    assert!(
-        card.fields
-            .iter()
-            .any(|(h, v)| *h == "Відправник" && v == "ACME GMBH")
-    );
+    assert!(card.fields.iter().any(|(_, v)| v == "ACME GMBH"));
 }
 
 /// Universality: columns this build does not model are still imported verbatim
@@ -2027,26 +2366,32 @@ fn import_captures_unmapped_columns_as_extra() {
     let (ids, _rows, _dups) = db.search_page(&q("converter"), 10, 0).unwrap();
     assert_eq!(ids.len(), 1);
 
-    // Unmapped columns are preserved verbatim on the card, in file order.
+    // Unmapped columns are preserved as first-class source fields on the card,
+    // in file order.
     let card = db.record_card(ids[0]).unwrap();
+    let card_pairs: Vec<(String, String)> = card
+        .fields
+        .iter()
+        .filter(|(h, _)| h == "Контейнер" || h == "Номер інвойсу")
+        .cloned()
+        .collect();
     assert_eq!(
-        card.extra,
+        card_pairs,
         vec![
             ("Контейнер".to_string(), "CONTAINERX9Z".to_string()),
             ("Номер інвойсу".to_string(), "INVOICEQ7W".to_string()),
         ]
     );
+    assert!(card.extra.is_empty());
 
     // ...and they are reachable through full-text search.
     assert_eq!(db.count(&q("CONTAINERX9Z")).unwrap(), 1);
     assert_eq!(db.count(&q("INVOICEQ7W")).unwrap(), 1);
 
     let catalog = db.field_catalog().unwrap();
-    assert!(
-        catalog
-            .iter()
-            .any(|field| field.id == format!("extra:{}", headers[6]))
-    );
+    assert!(catalog.iter().any(|field| field.label == headers[6]
+        && field.id.starts_with("source:")
+        && field.source == FieldRef::Extra(headers[6].to_string())));
     let extra_query = Query {
         advanced: Some(QueryExpr::Condition(QueryCondition {
             field: FieldRef::Extra(headers[6].to_string()),
@@ -2097,26 +2442,31 @@ fn import_arbitrary_table_preserves_all_columns_in_results_filters_and_export() 
     let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
     assert_eq!(summary.error, None);
     assert_eq!(summary.imported, 2);
-    assert_eq!(summary.quality.layout, "universal table");
+    assert_eq!(summary.quality.layout, "generic table");
     assert_eq!(summary.quality.header_row, 1);
     assert_eq!(summary.quality.source_columns, 5);
     assert_eq!(summary.quality.recognized_columns, 0);
     assert_eq!(summary.quality.extra_columns, 5);
     assert_eq!(summary.quality.non_empty_cells, 10);
     assert_eq!(summary.quality.empty_cells, 0);
-    assert!(
-        summary
-            .quality
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("generic table"))
-    );
+    assert!(summary.quality.warnings.is_empty());
 
     let log = db.import_log(1);
     assert_eq!(log.len(), 1);
-    assert_eq!(log[0].quality.layout, "universal table");
+    assert_eq!(log[0].quality.layout, "generic table");
     assert_eq!(log[0].quality.source_columns, 5);
     assert_eq!(log[0].quality.extra_columns, 5);
+
+    let shape = db.table_shape().unwrap();
+    assert_eq!(shape.columns.len(), 5);
+    assert_eq!(shape.columns[0].id, "sku");
+    assert_eq!(shape.columns[0].header, "SKU");
+    assert_eq!(shape.columns[0].role, ColumnRole::Code);
+    assert_eq!(shape.columns[0].storage, ColumnStorage::SourceJson);
+    assert_eq!(shape.columns[3].id, "price_eur");
+    assert_eq!(shape.columns[3].role, ColumnRole::Money);
+    assert_eq!(shape.columns[4].header, "Warehouse");
+    assert!(shape.columns.iter().all(|column| column.semantic.is_none()));
 
     let q = Query {
         text: "Laptop".into(),
@@ -2125,17 +2475,17 @@ fn import_arbitrary_table_preserves_all_columns_in_results_filters_and_export() 
     assert_eq!(db.count(&q).unwrap(), 1);
     let (fields, ids, rows, _dups) = db.search_page_dynamic(&q, 10, 0).unwrap();
     assert_eq!(ids.len(), 1);
-    let sku_idx = fields.iter().position(|f| f.id == "extra:SKU").unwrap();
+    let sku_idx = fields.iter().position(|f| f.id == "source:sku").unwrap();
     let price_idx = fields
         .iter()
-        .position(|f| f.id == "extra:Price EUR")
+        .position(|f| f.id == "source:price_eur")
         .unwrap();
     assert_eq!(rows[0][sku_idx], "SKU-42");
     assert_eq!(rows[0][price_idx], "1299.50");
 
     let card = db.record_card(ids[0]).unwrap();
     assert_eq!(
-        card.extra,
+        card.fields,
         vec![
             ("SKU".to_string(), "SKU-42".to_string()),
             ("Product Name".to_string(), "Laptop Pro".to_string()),
@@ -2144,6 +2494,7 @@ fn import_arbitrary_table_preserves_all_columns_in_results_filters_and_export() 
             ("Warehouse".to_string(), "Berlin".to_string()),
         ]
     );
+    assert!(card.extra.is_empty());
 
     let price_query = Query {
         advanced: Some(QueryExpr::Condition(QueryCondition {
@@ -2240,8 +2591,7 @@ fn records_schema_migration_preserves_rows_and_invalidates_old_file_hashes() {
     assert_eq!(first.error, None);
     assert_eq!(db.total_rows(), 3);
     db.meta_set("records_schema", "1");
-    db.conn
-        .execute("UPDATE import_log SET file_hash = 'legacy-hash'", [])
+    db.diagnostic_execute("UPDATE import_log SET file_hash = 'legacy-hash'")
         .unwrap();
     drop(db);
 
@@ -2377,7 +2727,7 @@ fn unknown_two_column_table_imports_as_universal_data() {
     let (fields, ids, rows, _) = db.search_page_dynamic(&q, 10, 0).unwrap();
     let md_idx = fields
         .iter()
-        .position(|field| field.id == "extra:Номер МД")
+        .position(|field| field.id == "source:номер_мд")
         .unwrap();
     assert_eq!(ids.len(), 1);
     assert_eq!(rows[0][md_idx], "24UA1");

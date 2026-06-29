@@ -1,1063 +1,94 @@
-//! SQLite storage: schema, batched inserts, FTS5 indexing, search, and filters.
+//! Public SQLite facade.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
-use rusqlite::functions::FunctionFlags;
+use rusqlite::Connection;
 use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
-use serde::{Deserialize, Serialize};
-use xxhash_rust::xxh3::Xxh3;
 
-use crate::schema::{COLUMNS, RESULT_COLUMNS, SEARCH_COLUMNS};
-use crate::search::{
-    ConditionOp, ConditionValue, FieldInfo, FieldKind, FieldRef, LogicOp, QueryExpr,
-    default_field_catalog, field_catalog, field_kind_for_column, result_field_catalog,
+use crate::domain::table::TableShape;
+use crate::search::{FieldInfo, field_catalog_for_context, result_field_catalog_for_context};
+use crate::storage::extra::{parse_extra, remember_extra_header};
+use crate::storage::normalize::normalize_text_key;
+use crate::storage::{
+    analytics_repo, connection as storage_connection, fts_index, import_log, maintenance, meta,
+    query_plan, record_writer, result_repo, table_shape,
 };
 
-/// Filter values; an empty string means the filter is not set.
-#[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Filters {
-    pub year: String,
-    pub product_code: String,
-    pub trademark: String,
-    pub description: String,
-    pub sender: String,
-    pub recipient: String,
-    pub edrpou: String,
-    pub trade_country: String,
-    pub dispatch_country: String,
-    pub origin_country: String,
-}
-
-impl Filters {
-    pub fn is_empty(&self) -> bool {
-        [
-            &self.year,
-            &self.product_code,
-            &self.trademark,
-            &self.description,
-            &self.sender,
-            &self.recipient,
-            &self.edrpou,
-            &self.trade_country,
-            &self.dispatch_country,
-            &self.origin_country,
-        ]
-        .iter()
-        .all(|v| v.trim().is_empty())
-    }
-
-    pub fn clear(&mut self) {
-        *self = Filters::default();
-    }
-}
-
-#[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Query {
-    pub text: String,
-    pub filters: Filters,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub advanced: Option<QueryExpr>,
-}
-
-impl Query {
-    pub fn is_empty(&self) -> bool {
-        self.text.trim().is_empty()
-            && self.filters.is_empty()
-            && self.advanced.as_ref().is_none_or(QueryExpr::is_empty)
-    }
-}
-
-/// One row prepared for insertion during import.
-pub struct ImportRecord {
-    pub hash: [u8; 16],
-    pub year: Option<i64>,
-    pub values: Vec<String>,
-    /// Unmapped source columns, kept verbatim so the app stays universal across
-    /// differently shaped customs files. JSON array of [header, value] pairs.
-    pub extra: Option<String>,
-}
-
-pub struct RecordCard {
-    pub fields: Vec<(&'static str, String)>,
-    pub source_file: String,
-    /// Extra source columns this file had beyond the known schema, in file order.
-    pub extra: Vec<(String, String)>,
-}
-
-#[derive(Clone)]
-pub struct ImportLogEntry {
-    pub file_name: String,
-    pub total_rows: u64,
-    pub imported: u64,
-    pub duplicates: u64,
-    pub seconds: f64,
-    pub imported_at: String,
-    pub quality: ImportQuality,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ImportQuality {
-    pub layout: String,
-    pub header_row: u64,
-    pub source_columns: u64,
-    pub recognized_columns: u64,
-    pub extra_columns: u64,
-    pub non_empty_cells: u64,
-    pub empty_cells: u64,
-    pub warnings: Vec<String>,
-}
-
-impl ImportQuality {
-    pub fn filled_percent(&self) -> f64 {
-        let total = self.non_empty_cells + self.empty_cells;
-        if total == 0 {
-            0.0
-        } else {
-            self.non_empty_cells as f64 * 100.0 / total as f64
-        }
-    }
-
-    fn warnings_text(&self) -> String {
-        self.warnings.join("\n")
-    }
-
-    fn with_warnings_text(mut self, warnings: String) -> ImportQuality {
-        self.warnings = warnings
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(ToOwned::to_owned)
-            .collect();
-        self
-    }
-}
-
-pub struct ImportLogWrite<'a> {
-    pub file_name: &'a str,
-    pub total_rows: u64,
-    pub imported: u64,
-    pub duplicates: u64,
-    pub seconds: f64,
-    pub file_hash: Option<&'a str>,
-    pub quality: &'a ImportQuality,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DatabaseStorageInfo {
-    pub database_bytes: u64,
-    pub wal_bytes: u64,
-    pub shm_bytes: u64,
-    pub page_count: u64,
-    pub page_size: u64,
-    pub freelist_pages: u64,
-    pub freelist_bytes: u64,
-}
-
-impl DatabaseStorageInfo {
-    pub fn total_file_bytes(&self) -> u64 {
-        self.database_bytes + self.wal_bytes + self.shm_bytes
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct WalCheckpointInfo {
-    pub busy: u64,
-    pub log_frames: u64,
-    pub checkpointed_frames: u64,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct AnalyticsOverview {
-    pub row_count: u64,
-    pub declaration_count: u64,
-    pub distinct_senders: u64,
-    pub distinct_recipients: u64,
-    pub distinct_edrpou: u64,
-    pub distinct_trademarks: u64,
-    pub distinct_product_codes: u64,
-    pub distinct_origin_countries: u64,
-    pub distinct_dispatch_countries: u64,
-    pub distinct_trade_countries: u64,
-    pub total_value_usd: f64,
-    pub total_gross_kg: f64,
-    pub total_net_kg: f64,
-    pub total_quantity: f64,
-    pub avg_value_per_net_kg: f64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AnalyticsFilterField {
-    Recipient,
-    Sender,
-    Edrpou,
-    ProductCode,
-    Trademark,
-    OriginCountry,
-    DispatchCountry,
-    TradeCountry,
-    Description,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AnalyticsFilterAction {
-    pub field: AnalyticsFilterField,
-    pub value: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct AnalyticsGroupRow {
-    pub label: String,
-    pub rows: u64,
-    pub declarations: u64,
-    pub companies: u64,
-    pub total_value_usd: f64,
-    pub total_net_kg: f64,
-    pub total_gross_kg: f64,
-    pub total_quantity: f64,
-    pub share_percent: f64,
-    pub avg_value_per_net_kg: f64,
-    pub filter_action: Option<AnalyticsFilterAction>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AnalyticsSectionKind {
-    #[default]
-    Recipients,
-    Senders,
-    Edrpou,
-    ProductCodes,
-    Trademarks,
-    ProductGroups,
-    OriginCountries,
-    DispatchCountries,
-    TradeCountries,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct AnalyticsSection {
-    pub kind: AnalyticsSectionKind,
-    pub rows: Vec<AnalyticsGroupRow>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PriceMetricKind {
-    #[default]
-    ValuePerNetKg,
-    RfvUsdKg,
-    RmvNetUsdKg,
-    RmvUsdExtraUnit,
-    RmvGrossUsdKg,
-    MinBaseUsdKg,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct AnalyticsPriceMetric {
-    pub kind: PriceMetricKind,
-    pub count: u64,
-    pub average: f64,
-    pub minimum: f64,
-    pub maximum: f64,
-    pub weighted_average: f64,
-    /// Robust statistics: median and quartiles are less sensitive to outliers
-    /// and source-data mistakes than min/max.
-    pub median: f64,
-    pub p25: f64,
-    pub p75: f64,
-}
-
-/// SQLite aggregate: collects values and returns "p25|p50|p75".
-struct PercentilesAggregate;
-
-impl rusqlite::functions::Aggregate<Vec<f64>, Option<String>> for PercentilesAggregate {
-    fn init(&self, _ctx: &mut rusqlite::functions::Context<'_>) -> rusqlite::Result<Vec<f64>> {
-        Ok(Vec::new())
-    }
-
-    fn step(
-        &self,
-        ctx: &mut rusqlite::functions::Context<'_>,
-        acc: &mut Vec<f64>,
-    ) -> rusqlite::Result<()> {
-        if let Some(value) = ctx.get::<Option<f64>>(0)?
-            && value.is_finite()
-        {
-            acc.push(value);
-        }
-        Ok(())
-    }
-
-    fn finalize(
-        &self,
-        _ctx: &mut rusqlite::functions::Context<'_>,
-        acc: Option<Vec<f64>>,
-    ) -> rusqlite::Result<Option<String>> {
-        let mut values = acc.unwrap_or_default();
-        if values.is_empty() {
-            return Ok(None);
-        }
-        values.sort_unstable_by(f64::total_cmp);
-        let pick = |p: f64| {
-            let idx = ((values.len() - 1) as f64 * p).round() as usize;
-            values[idx.min(values.len() - 1)]
-        };
-        Ok(Some(format!("{}|{}|{}", pick(0.25), pick(0.5), pick(0.75))))
-    }
-}
-
-/// Analytics category computed independently, so the GUI can load only
-/// the visible one.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AnalyticsScope {
-    #[default]
-    Companies,
-    Products,
-    Countries,
-    Prices,
-}
-
-impl AnalyticsScope {
-    pub const ALL: [AnalyticsScope; 4] = [
-        AnalyticsScope::Companies,
-        AnalyticsScope::Products,
-        AnalyticsScope::Countries,
-        AnalyticsScope::Prices,
-    ];
-
-    pub fn index(self) -> usize {
-        match self {
-            AnalyticsScope::Companies => 0,
-            AnalyticsScope::Products => 1,
-            AnalyticsScope::Countries => 2,
-            AnalyticsScope::Prices => 3,
-        }
-    }
-}
-
-/// One month of import dynamics (chart data).
-#[derive(Clone, Debug, Default)]
-pub struct AnalyticsMonthRow {
-    /// "2024-03"
-    pub month: String,
-    pub rows: u64,
-    pub declarations: u64,
-    pub total_value_usd: f64,
-    pub total_net_kg: f64,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Analytics {
-    pub overview: AnalyticsOverview,
-    pub months: Vec<AnalyticsMonthRow>,
-    pub company_sections: Vec<AnalyticsSection>,
-    pub product_sections: Vec<AnalyticsSection>,
-    pub country_sections: Vec<AnalyticsSection>,
-    pub price_sections: Vec<AnalyticsPriceMetric>,
-    pub top_recipients: Vec<AnalyticsGroupRow>,
-    pub top_senders: Vec<AnalyticsGroupRow>,
-    pub top_trademarks: Vec<AnalyticsGroupRow>,
-    pub top_product_codes: Vec<AnalyticsGroupRow>,
-    pub top_origin_countries: Vec<AnalyticsGroupRow>,
-}
-
-/// SQLite aggregate: median of the values as a number.
-struct MedianAggregate;
-
-impl rusqlite::functions::Aggregate<Vec<f64>, Option<f64>> for MedianAggregate {
-    fn init(&self, _ctx: &mut rusqlite::functions::Context<'_>) -> rusqlite::Result<Vec<f64>> {
-        Ok(Vec::new())
-    }
-
-    fn step(
-        &self,
-        ctx: &mut rusqlite::functions::Context<'_>,
-        acc: &mut Vec<f64>,
-    ) -> rusqlite::Result<()> {
-        if let Some(value) = ctx.get::<Option<f64>>(0)?
-            && value.is_finite()
-        {
-            acc.push(value);
-        }
-        Ok(())
-    }
-
-    fn finalize(
-        &self,
-        _ctx: &mut rusqlite::functions::Context<'_>,
-        acc: Option<Vec<f64>>,
-    ) -> rusqlite::Result<Option<f64>> {
-        let mut values = acc.unwrap_or_default();
-        if values.is_empty() {
-            return Ok(None);
-        }
-        values.sort_unstable_by(f64::total_cmp);
-        Ok(Some(values[values.len() / 2]))
-    }
-}
-
-/// One declaration flagged as potentially undervalued: its price per kg is
-/// well below the median for the same product code.
-#[derive(Clone, Debug, Default)]
-pub struct UndervaluedRow {
-    pub id: i64,
-    pub declaration_date: String,
-    pub declaration_number: String,
-    pub recipient: String,
-    pub sender: String,
-    pub edrpou: String,
-    pub product_code: String,
-    pub description: String,
-    pub customs_value: f64,
-    pub net_kg: f64,
-    pub price_per_kg: f64,
-    pub code_median: f64,
-    pub code_p25: f64,
-    pub code_p75: f64,
-    pub code_sample_count: u64,
-    pub estimated_gap: f64,
-    /// price_per_kg / code_median (0.3 means 30% of the typical price).
-    pub ratio: f64,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Undervaluation {
-    pub rows: Vec<UndervaluedRow>,
-    /// Number of distinct product codes that had enough samples to judge.
-    pub checked_codes: u64,
-    /// Priced rows in those judged product codes.
-    pub checked_rows: u64,
-    pub flagged_rows: u64,
-    pub flagged_codes: u64,
-    pub flagged_value: f64,
-    pub estimated_gap: f64,
-}
-
-/// Dimension for the pivot table (rows or columns).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PivotDim {
-    Recipient,
-    Sender,
-    Edrpou,
-    ProductCode,
-    Trademark,
-    OriginCountry,
-    DispatchCountry,
-    TradeCountry,
-    Month,
-    Year,
-}
-
-impl PivotDim {
-    fn sql(self) -> &'static str {
-        match self {
-            PivotDim::Recipient => "label_value(r.recipient)",
-            PivotDim::Sender => "label_value(r.sender)",
-            PivotDim::Edrpou => "label_value(r.edrpou)",
-            PivotDim::ProductCode => "label_value(r.product_code)",
-            PivotDim::Trademark => "label_value(r.trademark)",
-            PivotDim::OriginCountry => "country_key(r.origin_country)",
-            PivotDim::DispatchCountry => "country_key(r.dispatch_country)",
-            PivotDim::TradeCountry => "country_key(r.trade_country)",
-            PivotDim::Month => "SUBSTR(TRIM(r.declaration_date), 1, 7)",
-            PivotDim::Year => "CAST(r.year AS TEXT)",
-        }
-    }
-
-    /// The filter field this dimension maps to, for drill-down clicks.
-    pub fn filter_field(self) -> Option<AnalyticsFilterField> {
-        match self {
-            PivotDim::Recipient => Some(AnalyticsFilterField::Recipient),
-            PivotDim::Sender => Some(AnalyticsFilterField::Sender),
-            PivotDim::Edrpou => Some(AnalyticsFilterField::Edrpou),
-            PivotDim::ProductCode => Some(AnalyticsFilterField::ProductCode),
-            PivotDim::Trademark => Some(AnalyticsFilterField::Trademark),
-            PivotDim::OriginCountry => Some(AnalyticsFilterField::OriginCountry),
-            PivotDim::DispatchCountry => Some(AnalyticsFilterField::DispatchCountry),
-            PivotDim::TradeCountry => Some(AnalyticsFilterField::TradeCountry),
-            PivotDim::Month | PivotDim::Year => None,
-        }
-    }
-}
-
-pub fn pivot_filter_action(
-    dim: PivotDim,
-    value: impl Into<String>,
-) -> Option<AnalyticsFilterAction> {
-    dim.filter_field().map(|field| AnalyticsFilterAction {
-        field,
-        value: value.into(),
-    })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PivotMetric {
-    Value,
-    Rows,
-    NetKg,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PivotLimits {
-    pub rows: usize,
-    pub cols: usize,
-}
-
-impl PivotMetric {
-    fn sql(self) -> &'static str {
-        match self {
-            PivotMetric::Value => "COALESCE(SUM(num_value(r.currency_control_value)), 0.0)",
-            PivotMetric::Rows => "CAST(COUNT(*) AS REAL)",
-            PivotMetric::NetKg => "COALESCE(SUM(num_value(r.net_kg)), 0.0)",
-        }
-    }
-}
-
-/// Cross-tab: a matrix of one dimension by another for a chosen metric.
-#[derive(Clone, Debug, Default)]
-pub struct PivotResult {
-    pub row_labels: Vec<String>,
-    pub col_labels: Vec<String>,
-    /// cells[row][col].
-    pub cells: Vec<Vec<f64>>,
-    pub row_totals: Vec<f64>,
-    pub col_totals: Vec<f64>,
-    pub grand_total: f64,
-    /// True when low-ranked rows/columns were folded into an "others" bucket.
-    pub rows_truncated: bool,
-    pub cols_truncated: bool,
-}
-
-/// Single-company dossier built for one EDRPOU: everything an analyst needs
-/// to answer "tell me everything about this importer" on one screen.
-#[derive(Clone, Debug, Default)]
-pub struct CompanyProfile {
-    pub edrpou: String,
-    /// All recipient-name variants seen for this EDRPOU.
-    pub names: Vec<String>,
-    pub overview: AnalyticsOverview,
-    pub months: Vec<AnalyticsMonthRow>,
-    pub top_products: Vec<AnalyticsGroupRow>,
-    pub top_senders: Vec<AnalyticsGroupRow>,
-    pub top_origin_countries: Vec<AnalyticsGroupRow>,
-    pub product_sections: Vec<AnalyticsSection>,
-    pub country_sections: Vec<AnalyticsSection>,
-    pub price_sections: Vec<AnalyticsPriceMetric>,
-}
+pub use crate::db_types::*;
+pub use crate::storage::maintenance::{DatabaseStorageInfo, WalCheckpointInfo};
+pub use crate::storage::normalize::{extract_year, parse_number};
+pub use crate::storage::records::canonical_record_hash;
+pub use crate::storage::search_text::{build_fts_query, contains_ci, fts_prefix_terms};
 
 pub struct Db {
-    pub conn: Connection,
-}
-
-pub type SearchPage = (Vec<i64>, Vec<Vec<String>>, Vec<Option<String>>);
-pub type DynamicSearchPage = (
-    Vec<FieldInfo>,
-    Vec<i64>,
-    Vec<Vec<String>>,
-    Vec<Option<String>>,
-);
-
-#[derive(Clone)]
-struct SearchFieldSql {
-    expr: String,
-    extra_header: Option<String>,
-    kind: FieldKind,
-}
-
-fn records_ddl_for(table_name: &str) -> String {
-    let fields: Vec<String> = COLUMNS.iter().map(|c| format!("{} TEXT", c.name)).collect();
-    format!(
-        "CREATE TABLE IF NOT EXISTS {table_name} (
-            id INTEGER PRIMARY KEY,
-            row_hash BLOB NOT NULL,
-            source_file TEXT NOT NULL,
-            year INTEGER,
-            dup_first_file TEXT,
-            extra TEXT,
-            imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            {}
-        )",
-        fields.join(",\n            ")
-    )
-}
-
-fn records_ddl() -> String {
-    records_ddl_for("records")
-}
-
-fn search_text_expr() -> String {
-    search_text_expr_with_prefix("")
-}
-
-fn search_text_expr_with_prefix(prefix: &str) -> String {
-    // Known searchable columns plus the captured extra columns, so free-text
-    // search also reaches data from columns this build does not model.
-    let mut parts: Vec<String> = SEARCH_COLUMNS
-        .iter()
-        .map(|c| format!("COALESCE({prefix}{c},'')"))
-        .collect();
-    parts.push(format!("COALESCE(extra_values_text({prefix}extra),'')"));
-    parts.join(" || ' ' || ")
-}
-
-fn plain_search_terms(input: &str) -> Vec<String> {
-    input
-        .split(|ch: char| !(ch.is_alphanumeric() || ch == '\'' || ch == '-'))
-        .filter_map(|term| {
-            let term = term.trim_matches(['*', '\'', '-']).to_lowercase();
-            (term.chars().count() >= 2).then_some(term)
-        })
-        .take(32)
-        .collect()
-}
-
-pub fn canonical_record_hash(values: &[String], extra: Option<&str>) -> [u8; 16] {
-    let mut hasher = Xxh3::new();
-    for value in values {
-        let len = value.len() as u64;
-        hasher.update(&len.to_le_bytes());
-        hasher.update(value.as_bytes());
-    }
-    if let Some(extra) = extra {
-        hasher.update(&(extra.len() as u64).to_le_bytes());
-        hasher.update(extra.as_bytes());
-    }
-    hasher.digest128().to_le_bytes()
+    conn: Connection,
 }
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db, String> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-        }
-        let conn = Connection::open(path).map_err(|e| e.to_string())?;
-        let db = Db { conn };
-        db.init().map_err(|e| e.to_string())?;
-        Ok(db)
-    }
-
-    fn init(&self) -> rusqlite::Result<()> {
-        self.conn.pragma_update(None, "journal_mode", "WAL")?;
-        self.conn.pragma_update(None, "synchronous", "NORMAL")?;
-        self.conn.pragma_update(None, "temp_store", "MEMORY")?;
-        self.conn.pragma_update(None, "cache_size", -131072)?;
-        self.conn.pragma_update(None, "mmap_size", 268435456i64)?;
-        self.conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        // Case-insensitive substring search with Cyrillic support:
-        // SQLite's built-in LOWER/LIKE only handle ASCII case folding.
-        self.conn.create_scalar_function(
-            "cyr_contains",
-            2,
-            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let hay = ctx
-                    .get_raw(0)
-                    .as_str_or_null()
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                let needle = ctx
-                    .get_raw(1)
-                    .as_str_or_null()
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                Ok(match (hay, needle) {
-                    (Some(h), Some(n)) => contains_ci(h, n),
-                    _ => false,
-                })
-            },
-        )?;
-        self.conn.create_scalar_function(
-            "num_value",
-            1,
-            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let raw = ctx
-                    .get_raw(0)
-                    .as_str_or_null()
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                Ok(raw.and_then(parse_number))
-            },
-        )?;
-        self.conn.create_scalar_function(
-            "country_key",
-            1,
-            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let raw = ctx
-                    .get_raw(0)
-                    .as_str_or_null()
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                Ok(raw.map(normalize_country_key).unwrap_or_default())
-            },
-        )?;
-        self.conn.create_scalar_function(
-            "text_key",
-            1,
-            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let raw = ctx
-                    .get_raw(0)
-                    .as_str_or_null()
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                Ok(raw.map(normalize_text_key).unwrap_or_default())
-            },
-        )?;
-        self.conn.create_scalar_function(
-            "label_value",
-            1,
-            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let raw = ctx
-                    .get_raw(0)
-                    .as_str_or_null()
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                Ok(raw.map(clean_label_value).unwrap_or_default())
-            },
-        )?;
-        self.conn.create_scalar_function(
-            "extra_values_text",
-            1,
-            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let raw = ctx
-                    .get_raw(0)
-                    .as_str_or_null()
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                let values = parse_extra(raw)
-                    .into_iter()
-                    .map(|(_, value)| value)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                Ok(values)
-            },
-        )?;
-        self.conn.create_scalar_function(
-            "extra_value",
-            2,
-            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-            |ctx| {
-                let raw = ctx
-                    .get_raw(0)
-                    .as_str_or_null()
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                let header = ctx
-                    .get_raw(1)
-                    .as_str_or_null()
-                    .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-                Ok(extra_value_for_header(raw, header))
-            },
-        )?;
-        // Percentiles in one pass: "p25|p50|p75", or NULL with no values.
-        self.conn.create_aggregate_function(
-            "pctl_text",
-            1,
-            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-            PercentilesAggregate,
-        )?;
-        // Numeric median for SQL joins and filters.
-        self.conn.create_aggregate_function(
-            "median_num",
-            1,
-            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-            MedianAggregate,
-        )?;
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );",
-        )?;
-        // Search index settings changed between versions. When older rows do
-        // not have any `extra` payload yet, their indexed text is unchanged and
-        // the existing FTS table can be reused instead of forcing a multi-GB
-        // rebuild on first launch.
-        const FTS_SCHEMA_VERSION: &str = "5";
-        if self.meta_get("fts_schema").as_deref() != Some(FTS_SCHEMA_VERSION) {
-            if self.existing_rows_may_need_fts_rebuild()? {
-                self.conn
-                    .execute_batch("DROP TABLE IF EXISTS records_fts;")?;
-                self.meta_set("fts_watermark", "0");
-            }
-            self.meta_set("fts_schema", FTS_SCHEMA_VERSION);
-        }
-        self.migrate_records_schema()?;
-        self.conn.execute_batch(&format!(
-            "{records};
-            CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
-                search_text,
-                content='',
-                detail=none,
-                columnsize=0,
-                tokenize='unicode61 remove_diacritics 2'
-            );
-            CREATE TABLE IF NOT EXISTS import_log (
-                id INTEGER PRIMARY KEY,
-                file_name TEXT NOT NULL,
-                total_rows INTEGER NOT NULL,
-                imported INTEGER NOT NULL,
-                duplicates INTEGER NOT NULL,
-                seconds REAL NOT NULL,
-                layout TEXT,
-                header_row INTEGER,
-                source_columns INTEGER,
-                recognized_columns INTEGER,
-                extra_columns INTEGER,
-                non_empty_cells INTEGER,
-                empty_cells INTEGER,
-                warnings TEXT,
-                imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_records_year ON records(year);
-            CREATE INDEX IF NOT EXISTS idx_records_product_code ON records(product_code);
-            CREATE INDEX IF NOT EXISTS idx_records_edrpou ON records(edrpou);
-            CREATE INDEX IF NOT EXISTS idx_records_hash ON records(row_hash);",
-            records = records_ddl()
-        ))?;
-        // This column was added after early versions; add it without a migration.
-        let _ = self
-            .conn
-            .execute("ALTER TABLE import_log ADD COLUMN file_hash TEXT", []);
-        self.ensure_import_log_quality_columns()?;
-        Ok(())
-    }
-
-    fn ensure_import_log_quality_columns(&self) -> rusqlite::Result<()> {
-        for (name, ty) in [
-            ("layout", "TEXT"),
-            ("header_row", "INTEGER"),
-            ("source_columns", "INTEGER"),
-            ("recognized_columns", "INTEGER"),
-            ("extra_columns", "INTEGER"),
-            ("non_empty_cells", "INTEGER"),
-            ("empty_cells", "INTEGER"),
-            ("warnings", "TEXT"),
-        ] {
-            if !self.table_has_column("import_log", name)? {
-                let sql = format!("ALTER TABLE import_log ADD COLUMN {name} {ty}");
-                self.conn.execute(&sql, [])?;
-            }
-        }
-        Ok(())
-    }
-
-    fn migrate_records_schema(&self) -> rusqlite::Result<()> {
-        const RECORDS_SCHEMA_VERSION: &str = "4";
-        let current_schema = self.meta_get("records_schema");
-        if current_schema.as_deref() == Some(RECORDS_SCHEMA_VERSION) {
-            return Ok(());
-        }
-
-        if self.table_exists("records_v2")? {
-            if self.table_exists("records")? {
-                self.conn.execute_batch("DROP TABLE records_v2;")?;
-            } else {
-                self.conn
-                    .execute_batch("ALTER TABLE records_v2 RENAME TO records;")?;
-                self.meta_set("fts_watermark", "0");
-            }
-        }
-
-        if self.table_exists("records")? {
-            let has_dup_first = self.table_has_column("records", "dup_first_file")?;
-            let has_extra = self.table_has_column("records", "extra")?;
-            if self.records_have_known_columns()? {
-                if !has_dup_first {
-                    self.conn
-                        .execute_batch("ALTER TABLE records ADD COLUMN dup_first_file TEXT;")?;
-                }
-                if !has_extra {
-                    self.conn
-                        .execute_batch("ALTER TABLE records ADD COLUMN extra TEXT;")?;
-                }
-                if self.table_exists("import_log")? {
-                    let _ = self
-                        .conn
-                        .execute("ALTER TABLE import_log ADD COLUMN file_hash TEXT", []);
-                    self.conn
-                        .execute("UPDATE import_log SET file_hash = NULL", [])?;
-                }
-                let schema_version = current_schema
-                    .as_deref()
-                    .and_then(|version| version.parse::<u32>().ok())
-                    .unwrap_or(0);
-                if schema_version < 2 {
-                    self.meta_set("fts_watermark", "0");
-                }
-                self.meta_set("records_schema", RECORDS_SCHEMA_VERSION);
-                return Ok(());
-            }
-
-            let column_names = COLUMNS.iter().map(|c| c.name).collect::<Vec<_>>();
-            let columns_sql = column_names.join(", ");
-            let dup_expr = if has_dup_first {
-                "dup_first_file"
-            } else {
-                "NULL AS dup_first_file"
-            };
-            let extra_expr = if has_extra { "extra" } else { "NULL AS extra" };
-
-            self.conn.execute_batch("BEGIN IMMEDIATE;")?;
-            let migration_result = (|| -> rusqlite::Result<()> {
-                self.conn.execute_batch(
-                    "DROP TABLE IF EXISTS records_fts; DROP TABLE IF EXISTS records_v2;",
-                )?;
-                self.conn.execute_batch(&records_ddl_for("records_v2"))?;
-                self.conn.execute_batch(&format!(
-                    "INSERT INTO records_v2 (
-                        id, row_hash, source_file, year, dup_first_file, extra, imported_at, {columns_sql}
-                     )
-                     SELECT
-                        id, row_hash, source_file, year, {dup_expr}, {extra_expr}, imported_at, {columns_sql}
-                     FROM records;
-                     DROP TABLE records;
-                     ALTER TABLE records_v2 RENAME TO records;"
-                ))?;
-                Ok(())
-            })();
-            match migration_result {
-                Ok(()) => self.conn.execute_batch("COMMIT;")?,
-                Err(err) => {
-                    let _ = self.conn.execute_batch("ROLLBACK;");
-                    return Err(err);
-                }
-            }
-            self.rebuild_record_hashes()?;
-            if self.table_exists("import_log")? {
-                let _ = self
-                    .conn
-                    .execute("ALTER TABLE import_log ADD COLUMN file_hash TEXT", []);
-                self.conn
-                    .execute("UPDATE import_log SET file_hash = NULL", [])?;
-            }
-            self.meta_set("fts_watermark", "0");
-        }
-
-        self.meta_set("records_schema", RECORDS_SCHEMA_VERSION);
-        Ok(())
-    }
-
-    fn existing_rows_may_need_fts_rebuild(&self) -> rusqlite::Result<bool> {
-        if !self.table_exists("records")? || !self.table_has_column("records", "extra")? {
-            return Ok(false);
-        }
-        let has_extra_payload = self.conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM records
-                WHERE extra IS NOT NULL AND TRIM(extra) <> ''
-                LIMIT 1
-            )",
-            [],
-            |r| r.get::<_, i64>(0),
-        )?;
-        Ok(has_extra_payload != 0)
-    }
-
-    fn records_have_known_columns(&self) -> rusqlite::Result<bool> {
-        for name in ["id", "row_hash", "source_file", "year", "imported_at"] {
-            if !self.table_has_column("records", name)? {
-                return Ok(false);
-            }
-        }
-        for column in COLUMNS {
-            if !self.table_has_column("records", column.name)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    fn rebuild_record_hashes(&self) -> rusqlite::Result<()> {
-        let select: Vec<String> = COLUMNS.iter().map(|c| c.name.to_string()).collect();
-        let sql = format!("SELECT id, {}, extra FROM records", select.join(", "));
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let mut values = Vec::with_capacity(COLUMNS.len());
-            for i in 0..COLUMNS.len() {
-                values.push(row.get::<_, Option<String>>(i + 1)?.unwrap_or_default());
-            }
-            let extra: Option<String> = row.get(COLUMNS.len() + 1)?;
-            Ok((id, canonical_record_hash(&values, extra.as_deref())))
-        })?;
-        let updates: Vec<(i64, [u8; 16])> = rows.collect::<rusqlite::Result<_>>()?;
-        drop(stmt);
-
-        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
-        let update_result = (|| -> rusqlite::Result<()> {
-            let mut stmt = self
-                .conn
-                .prepare_cached("UPDATE records SET row_hash = ?1 WHERE id = ?2")?;
-            for (id, hash) in updates {
-                stmt.execute(params![&hash[..], id])?;
-            }
-            Ok(())
-        })();
-        match update_result {
-            Ok(()) => self.conn.execute_batch("COMMIT;"),
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(err)
-            }
-        }
-    }
-
-    fn table_exists(&self, name: &str) -> rusqlite::Result<bool> {
-        self.conn
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM sqlite_master
-                    WHERE type IN ('table', 'virtual table') AND name = ?1
-                )",
-                [name],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|v| v != 0)
-    }
-
-    fn table_has_column(&self, table: &str, column: &str) -> rusqlite::Result<bool> {
-        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        for name in rows {
-            if name? == column {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(Db {
+            conn: storage_connection::open(path)?,
+        })
     }
 
     // ---------- meta ----------
 
     pub fn meta_get(&self, key: &str) -> Option<String> {
-        self.conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
-            .optional()
-            .ok()
-            .flatten()
+        meta::get(&self.conn, key)
     }
 
     pub fn meta_set(&self, key: &str, value: &str) {
-        let _ = self.conn.execute(
-            "INSERT INTO meta(key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        );
+        meta::set(&self.conn, key, value);
     }
 
     fn meta_get_i64(&self, key: &str) -> i64 {
-        self.meta_get(key).and_then(|v| v.parse().ok()).unwrap_or(0)
+        meta::get_i64(&self.conn, key)
+    }
+
+    pub fn diagnostic_execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
+        self.conn.execute_batch(sql)
+    }
+
+    pub fn diagnostic_execute(&self, sql: &str) -> rusqlite::Result<usize> {
+        self.conn.execute(sql, [])
+    }
+
+    pub fn diagnostic_query_rows(
+        &self,
+        sql: &str,
+        max_rows: usize,
+    ) -> rusqlite::Result<Vec<Vec<String>>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let n_cols = stmt.column_count();
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while out.len() < max_rows {
+            let Some(row) = rows.next()? else {
+                break;
+            };
+            let mut cells = Vec::with_capacity(n_cols);
+            for i in 0..n_cols {
+                cells.push(sql_value_to_text(row.get::<_, Value>(i)?));
+            }
+            out.push(cells);
+        }
+        Ok(out)
     }
 
     // ---------- insert ----------
 
     pub fn begin_import_file(&mut self) -> rusqlite::Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")
+        record_writer::begin_import_file(&self.conn)
     }
 
     pub fn commit_import_file(&mut self) -> rusqlite::Result<()> {
-        self.conn.execute_batch("COMMIT")
+        record_writer::commit_import_file(&self.conn)
     }
 
     pub fn rollback_import_file(&mut self) {
-        let _ = self.conn.execute_batch("ROLLBACK");
+        record_writer::rollback_import_file(&self.conn);
     }
 
     /// Inserts a row batch. Duplicates are inserted and flagged.
@@ -1067,68 +98,7 @@ impl Db {
         source_file: &str,
         records: &[ImportRecord],
     ) -> rusqlite::Result<(u64, u64)> {
-        if records.is_empty() {
-            return Ok((0, 0));
-        }
-        let col_names: Vec<&str> = COLUMNS.iter().map(|c| c.name).collect();
-        // Duplicates are kept, not dropped. A row whose full-row hash was already
-        // stored is inserted with dup_first_file set to the file where it first
-        // appeared, so the UI can flag it and analytics can skip it.
-        let sql = format!(
-            "INSERT INTO records (row_hash, source_file, year, dup_first_file, extra, {}) VALUES ({})",
-            col_names.join(", "),
-            std::iter::repeat_n("?", 5 + col_names.len())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        self.conn.execute_batch("SAVEPOINT insert_batch")?;
-        let result = (|| -> rusqlite::Result<(u64, u64)> {
-            let mut first_seen: u64 = 0;
-            let mut duplicates: u64 = 0;
-            let mut lookup = self.conn.prepare_cached(
-                "SELECT source_file
-                     FROM records
-                     WHERE row_hash = ?1 AND dup_first_file IS NULL
-                     ORDER BY id ASC
-                     LIMIT 1",
-            )?;
-            let mut stmt = self.conn.prepare_cached(&sql)?;
-            for rec in records {
-                // Seen earlier (in this batch's transaction or a previous file)?
-                let prior: Option<String> =
-                    lookup.query_row([&rec.hash[..]], |r| r.get(0)).optional()?;
-                stmt.raw_bind_parameter(1, &rec.hash[..])?;
-                stmt.raw_bind_parameter(2, source_file)?;
-                stmt.raw_bind_parameter(3, rec.year)?;
-                match prior {
-                    Some(ref first_file) => {
-                        stmt.raw_bind_parameter(4, first_file.as_str())?;
-                        duplicates += 1;
-                    }
-                    None => {
-                        stmt.raw_bind_parameter(4, rusqlite::types::Null)?;
-                        first_seen += 1;
-                    }
-                }
-                stmt.raw_bind_parameter(5, rec.extra.as_deref())?;
-                for (i, v) in rec.values.iter().enumerate() {
-                    stmt.raw_bind_parameter(6 + i, v.as_str())?;
-                }
-                stmt.raw_execute()?;
-            }
-            Ok((first_seen + duplicates, duplicates))
-        })();
-        match result {
-            Ok(counts) => {
-                self.conn.execute_batch("RELEASE insert_batch")?;
-                Ok(counts)
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK TO insert_batch");
-                let _ = self.conn.execute_batch("RELEASE insert_batch");
-                Err(e)
-            }
-        }
+        record_writer::insert_batch(&self.conn, source_file, records)
     }
 
     // ---------- FTS ----------
@@ -1140,70 +110,112 @@ impl Db {
         cancel: &AtomicBool,
         mut progress: impl FnMut(u64, u64),
     ) -> rusqlite::Result<(u64, bool)> {
-        let max_id: i64 =
-            self.conn
-                .query_row("SELECT COALESCE(MAX(id), 0) FROM records", [], |r| r.get(0))?;
-        let start = self.meta_get_i64("fts_watermark");
-        if start >= max_id {
-            return Ok((0, false));
-        }
-        let span_total = (max_id - start) as u64;
-        let insert_sql = format!(
-            "INSERT INTO records_fts(rowid, search_text)
-             SELECT id, {} FROM records WHERE id > ?1 AND id <= ?2",
-            search_text_expr()
-        );
-        const CHUNK: i64 = 20_000;
-        let mut watermark = start;
-        let mut indexed: u64 = 0;
-        while watermark < max_id {
-            if cancel.load(Ordering::Relaxed) {
-                return Ok((indexed, true));
-            }
-            let end = (watermark + CHUNK).min(max_id);
-            let tx = self.conn.transaction()?;
-            let n = tx.execute(&insert_sql, params![watermark, end])?;
-            tx.execute(
-                "INSERT INTO meta(key, value) VALUES ('fts_watermark', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![end.to_string()],
-            )?;
-            tx.commit()?;
-            indexed += n as u64;
-            watermark = end;
-            progress((watermark - start) as u64, span_total);
-        }
-        Ok((indexed, false))
+        fts_index::index(&mut self.conn, cancel, &mut progress)
     }
 
     /// Number of rows not yet present in the search index.
     pub fn unindexed_rows(&self) -> u64 {
-        let watermark = self.meta_get_i64("fts_watermark");
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM records WHERE id > ?1",
-                [watermark],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0) as u64
+        fts_index::unindexed_rows(&self.conn)
     }
 
     /// Searchable field catalog for the current database, including imported
-    /// extra columns that are preserved in each row's JSON payload.
+    /// source columns preserved in each row's canonical fields or JSON payload.
     pub fn field_catalog(&self) -> rusqlite::Result<Vec<FieldInfo>> {
         let extra_headers = self.extra_headers()?;
-        if extra_headers.is_empty() {
-            Ok(default_field_catalog())
-        } else {
-            Ok(field_catalog(extra_headers))
-        }
+        Ok(field_catalog_for_context(
+            self.table_shape().as_ref(),
+            extra_headers,
+        ))
     }
 
     pub fn result_fields(&self) -> rusqlite::Result<Vec<FieldInfo>> {
-        Ok(result_field_catalog(self.extra_headers()?))
+        let extra_headers = self.extra_headers()?;
+        Ok(result_field_catalog_for_context(
+            self.table_shape().as_ref(),
+            extra_headers,
+        ))
+    }
+
+    pub fn field_catalog_cached(&self) -> Vec<FieldInfo> {
+        let extra_headers = self.cached_extra_headers();
+        field_catalog_for_context(self.table_shape().as_ref(), extra_headers)
+    }
+
+    pub fn result_fields_cached(&self) -> Vec<FieldInfo> {
+        let extra_headers = self.cached_extra_headers();
+        result_field_catalog_for_context(self.table_shape().as_ref(), extra_headers)
+    }
+
+    pub fn table_shape(&self) -> Option<TableShape> {
+        table_shape::get(&self.conn)
+    }
+
+    pub fn remember_table_shape(&self, shape: &TableShape) -> TableShape {
+        table_shape::merge(&self.conn, shape)
+    }
+
+    /// Assigns or clears the analytical meaning of a shape column by id, so the
+    /// user can tell analytics which generic column is the value, country, etc.
+    /// Returns true when the column existed. Used by the column-mapping UI.
+    pub fn set_column_semantic(
+        &self,
+        column_id: &str,
+        semantic: Option<crate::domain::table::SemanticField>,
+    ) -> bool {
+        let Some(mut shape) = table_shape::get(&self.conn) else {
+            return false;
+        };
+        let Some(column) = shape
+            .columns
+            .iter_mut()
+            .find(|column| column.id == column_id)
+        else {
+            return false;
+        };
+        column.semantic = semantic;
+        table_shape::set(&self.conn, &shape);
+        true
     }
 
     pub fn extra_headers(&self) -> rusqlite::Result<Vec<String>> {
+        if let Some(cached) = self.extra_headers_cache() {
+            return Ok(cached);
+        }
+        let headers = self.scan_extra_headers()?;
+        self.store_extra_headers(&headers);
+        Ok(headers)
+    }
+
+    pub fn cached_extra_headers(&self) -> Vec<String> {
+        self.extra_headers_cache().unwrap_or_default()
+    }
+
+    pub fn remember_extra_headers<I, S>(&self, headers: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let existing = self.extra_headers_cache().unwrap_or_default();
+        let mut seen = HashSet::new();
+        let mut merged = Vec::new();
+        for header in existing.iter().map(String::as_str) {
+            remember_extra_header(&mut seen, &mut merged, header);
+        }
+        for header in headers {
+            remember_extra_header(&mut seen, &mut merged, header.as_ref());
+        }
+        self.store_extra_headers(&merged);
+    }
+
+    fn extra_headers_cache(&self) -> Option<Vec<String>> {
+        meta::get_string_vec(&self.conn, meta::EXTRA_HEADERS_KEY)
+    }
+
+    fn store_extra_headers(&self, headers: &[String]) {
+        meta::set_string_vec(&self.conn, meta::EXTRA_HEADERS_KEY, headers);
+    }
+
+    fn scan_extra_headers(&self) -> rusqlite::Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT extra FROM records
              WHERE extra IS NOT NULL AND TRIM(extra) <> ''",
@@ -1224,333 +236,21 @@ impl Db {
 
     // ---------- search ----------
 
-    fn build_where(
+    fn filter_plan(
         &self,
         q: &Query,
         unique_only: bool,
-    ) -> rusqlite::Result<(String, String, Vec<Value>)> {
-        // `joins` is a placeholder for an (currently always empty) JOIN clause.
-        let joins = String::new();
-        let mut clauses: Vec<String> = Vec::new();
-        let mut params: Vec<Value> = Vec::new();
-
-        // Shared MATCH expression: query text plus company and country filter
-        // tokens. These columns are indexed, so FTS narrows the candidate set
-        // first and cyr_contains performs the exact substring check.
-        let text_code_prefix = product_code_search_prefix(&q.text);
-        // Bare HS/product-code prefixes such as "8504" are far cheaper and more
-        // useful as product_code range scans than as FTS prefix scans over every
-        // text column. Mixed free-text queries still use FTS.
-        let mut match_expr = if text_code_prefix.is_some() {
-            String::new()
-        } else {
-            build_fts_query(&q.text)
-        };
-        let f = &q.filters;
-        let mut contains_clauses: Vec<(String, String)> = Vec::new();
-        let trademark = f.trademark.trim();
-        if !trademark.is_empty()
-            && let Some(terms) = fts_prefix_terms(trademark)
-        {
-            if !match_expr.is_empty() {
-                match_expr.push(' ');
-            }
-            match_expr.push_str(&terms);
-        }
-        for (col, value) in [
-            ("description", &f.description),
-            ("sender", &f.sender),
-            ("recipient", &f.recipient),
-        ] {
-            let value = value.trim();
-            if value.is_empty() {
-                continue;
-            }
-            if let Some(terms) = fts_prefix_terms(value) {
-                if !match_expr.is_empty() {
-                    match_expr.push(' ');
-                }
-                match_expr.push_str(&terms);
-            }
-            contains_clauses.push((format!("cyr_contains(r.{col}, ?)"), value.to_lowercase()));
-        }
-        if !match_expr.is_empty() {
-            let watermark = self.meta_get_i64("fts_watermark");
-            let mut fts_clause =
-                "(r.id IN (SELECT rowid FROM records_fts WHERE records_fts MATCH ?)".to_string();
-            params.push(match_expr.into());
-            let mut tail_clauses = vec!["r.id > ?".to_string()];
-            let mut tail_params: Vec<Value> = vec![watermark.into()];
-            if text_code_prefix.is_none() {
-                for term in plain_search_terms(&q.text) {
-                    tail_clauses.push(format!(
-                        "cyr_contains({}, ?)",
-                        search_text_expr_with_prefix("r.")
-                    ));
-                    tail_params.push(term.into());
-                }
-            }
-            fts_clause.push_str(" OR (");
-            fts_clause.push_str(&tail_clauses.join(" AND "));
-            fts_clause.push_str("))");
-            clauses.push(fts_clause);
-            params.extend(tail_params);
-        }
-        if let Some(year) = parse_year(&f.year) {
-            clauses.push("r.year = ?".into());
-            params.push(year.into());
-        }
-        if let Some(code) = text_code_prefix {
-            clauses.push("r.product_code GLOB ?".into());
-            params.push(format!("{}*", glob_escape(code)).into());
-        }
-        let code = f.product_code.trim();
-        if !code.is_empty() {
-            clauses.push("r.product_code GLOB ?".into());
-            params.push(format!("{}*", glob_escape(code)).into());
-        }
-        let edrpou = f.edrpou.trim();
-        if !edrpou.is_empty() {
-            clauses.push("r.edrpou = ?".into());
-            params.push(edrpou.to_string().into());
-        }
-        if !trademark.is_empty() {
-            clauses.push("text_key(r.trademark) = text_key(?)".into());
-            params.push(trademark.to_string().into());
-        }
-        for (col, value) in [
-            ("trade_country", &f.trade_country),
-            ("dispatch_country", &f.dispatch_country),
-            ("origin_country", &f.origin_country),
-        ] {
-            let value = value.trim();
-            if value.is_empty() {
-                continue;
-            }
-            clauses.push(format!("country_key(r.{col}) = ?"));
-            params.push(normalize_country_key(value).into());
-        }
-        for (clause, param) in contains_clauses {
-            clauses.push(clause);
-            params.push(param.into());
-        }
-        if let Some(advanced) = &q.advanced
-            && let Some((clause, advanced_params)) = self.compile_query_expr(advanced)?
-        {
-            clauses.push(clause);
-            params.extend(advanced_params);
-        }
-        // Analytics count each unique row once: skip rows flagged as repeats.
-        // Search and the result table leave this off so duplicates stay visible.
-        if unique_only {
-            clauses.push("r.dup_first_file IS NULL".into());
-        }
-        let where_sql = if clauses.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", clauses.join(" AND "))
-        };
-        Ok((joins, where_sql, params))
-    }
-
-    fn compile_query_expr(
-        &self,
-        expr: &QueryExpr,
-    ) -> rusqlite::Result<Option<(String, Vec<Value>)>> {
-        match expr {
-            QueryExpr::Group(group) => {
-                let mut clauses = Vec::new();
-                let mut params = Vec::new();
-                for child in &group.children {
-                    if let Some((clause, child_params)) = self.compile_query_expr(child)? {
-                        clauses.push(clause);
-                        params.extend(child_params);
-                    }
-                }
-                if clauses.is_empty() {
-                    return Ok(None);
-                }
-                let joiner = match group.op {
-                    LogicOp::And => " AND ",
-                    LogicOp::Or => " OR ",
-                };
-                let mut clause = format!("({})", clauses.join(joiner));
-                if group.negated {
-                    clause = format!("NOT ({clause})");
-                }
-                Ok(Some((clause, params)))
-            }
-            QueryExpr::Condition(condition) => self.compile_condition(condition),
-        }
-    }
-
-    fn compile_condition(
-        &self,
-        condition: &crate::search::QueryCondition,
-    ) -> rusqlite::Result<Option<(String, Vec<Value>)>> {
-        if condition.is_empty() {
-            return Ok(None);
-        }
-        let field = self.search_field_sql(&condition.field)?;
-        validate_condition_operator(field.kind, condition.op)?;
-
-        let mut params = Vec::new();
-        let clause = match condition.op {
-            ConditionOp::Contains => {
-                let value = condition
-                    .value
-                    .single()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| invalid_search_input("contains requires a value"))?;
-                push_field_params(&field, &mut params);
-                params.push(value.to_lowercase().into());
-                format!("cyr_contains({}, ?)", field.expr)
-            }
-            ConditionOp::Equals => {
-                let value = condition
-                    .value
-                    .single()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| invalid_search_input("equals requires a value"))?;
-                compile_equal_clause(&field, value, &mut params)?
-            }
-            ConditionOp::StartsWith => {
-                let value = condition
-                    .value
-                    .single()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| invalid_search_input("starts with requires a value"))?;
-                push_field_params(&field, &mut params);
-                match field.kind {
-                    FieldKind::Code => {
-                        params.push(format!("{}*", glob_escape(value)).into());
-                        format!("{} GLOB ?", field.expr)
-                    }
-                    FieldKind::Text => {
-                        params.push(format!("{}*", glob_escape(&normalize_text_key(value))).into());
-                        format!("text_key({}) GLOB ?", field.expr)
-                    }
-                    _ => {
-                        return Err(invalid_search_input(
-                            "starts with is only valid for text and code fields",
-                        ));
-                    }
-                }
-            }
-            ConditionOp::IsAnyOf => {
-                let values = condition
-                    .value
-                    .list()
-                    .ok_or_else(|| invalid_search_input("is any of requires a list"))?;
-                let mut parts = Vec::new();
-                for value in values.iter().map(|value| value.trim()) {
-                    if value.is_empty() {
-                        continue;
-                    }
-                    parts.push(compile_equal_clause(&field, value, &mut params)?);
-                }
-                if parts.is_empty() {
-                    return Ok(None);
-                }
-                format!("({})", parts.join(" OR "))
-            }
-            ConditionOp::Range => compile_range_clause(&field, &condition.value, &mut params)?,
-            ConditionOp::IsEmpty => {
-                push_field_params(&field, &mut params);
-                format!("TRIM(COALESCE({}, '')) = ''", field.expr)
-            }
-            ConditionOp::IsNotEmpty => {
-                push_field_params(&field, &mut params);
-                format!("TRIM(COALESCE({}, '')) <> ''", field.expr)
-            }
-        };
-        let clause = if condition.negated {
-            format!("NOT ({clause})")
-        } else {
-            clause
-        };
-        Ok(Some((format!("({clause})"), params)))
-    }
-
-    fn search_field_sql(&self, field: &FieldRef) -> rusqlite::Result<SearchFieldSql> {
-        match field {
-            FieldRef::Column(name) if name == "year" => Ok(SearchFieldSql {
-                expr: "r.year".to_string(),
-                extra_header: None,
-                kind: FieldKind::Year,
-            }),
-            FieldRef::Column(name) if RESULT_COLUMNS.contains(&name.as_str()) => {
-                Ok(SearchFieldSql {
-                    expr: format!("r.{name}"),
-                    extra_header: None,
-                    kind: field_kind_for_column(name),
-                })
-            }
-            FieldRef::Column(name) => Err(invalid_search_input(&format!(
-                "Unknown search field: {name}"
-            ))),
-            FieldRef::Extra(header) if header.trim().is_empty() => {
-                Err(invalid_search_input("Extra search field header is empty"))
-            }
-            FieldRef::Extra(header) => Ok(SearchFieldSql {
-                expr: "extra_value(r.extra, ?)".to_string(),
-                extra_header: Some(header.trim().to_string()),
-                kind: crate::search::field_catalog([header.trim().to_string()])
-                    .pop()
-                    .map(|field| field.kind)
-                    .unwrap_or(FieldKind::Text),
-            }),
-        }
+    ) -> rusqlite::Result<query_plan::FilterPlan> {
+        query_plan::build_filter_plan(q, unique_only, self.meta_get_i64("fts_watermark"))
     }
 
     pub fn count(&self, q: &Query) -> rusqlite::Result<u64> {
-        let (joins, where_sql, params) = self.build_where(q, false)?;
-        let sql = format!("SELECT COUNT(*) FROM records r{joins}{where_sql}");
-        let n: i64 = self
-            .conn
-            .query_row(&sql, params_from_iter(params), |r| r.get(0))?;
-        Ok(n as u64)
+        result_repo::count(&self.conn, self.filter_plan(q, false)?)
     }
 
-    /// Result page: (row ids, RESULT_COLUMNS values, duplicate first-file hints).
+    /// Legacy fixed-schema result page.
     pub fn search_page(&self, q: &Query, limit: u64, offset: u64) -> rusqlite::Result<SearchPage> {
-        // false: the result table shows every matching row, duplicates included
-        // (they are highlighted, not hidden).
-        let (joins, where_sql, mut params) = self.build_where(q, false)?;
-        let select: Vec<String> = RESULT_COLUMNS.iter().map(|c| format!("r.{c}")).collect();
-        // Broad indexed filters (year, product code, EDRPOU) can match millions
-        // of rows. Date sorting those sets forces SQLite to build a temporary
-        // sort tree, so page by insertion order for the fast structural paths.
-        let order = if uses_fast_result_order(q) {
-            "r.id DESC"
-        } else {
-            "r.declaration_date DESC, r.id DESC"
-        };
-        let sql = format!(
-            "SELECT r.id, {}, r.dup_first_file FROM records r{joins}{where_sql} ORDER BY {order} LIMIT ? OFFSET ?",
-            select.join(", ")
-        );
-        params.push((limit as i64).into());
-        params.push((offset as i64).into());
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(params_from_iter(params))?;
-        let mut ids = Vec::new();
-        let mut data = Vec::new();
-        let mut dups = Vec::new();
-        while let Some(row) = rows.next()? {
-            ids.push(row.get::<_, i64>(0)?);
-            let mut values = Vec::with_capacity(RESULT_COLUMNS.len());
-            for i in 0..RESULT_COLUMNS.len() {
-                values.push(row.get::<_, Option<String>>(i + 1)?.unwrap_or_default());
-            }
-            data.push(values);
-            // dup_first_file follows the RESULT_COLUMNS block; Some => repeat.
-            dups.push(row.get::<_, Option<String>>(RESULT_COLUMNS.len() + 1)?);
-        }
-        Ok((ids, data, dups))
+        result_repo::legacy_search_page(&self.conn, q, self.filter_plan(q, false)?, limit, offset)
     }
 
     pub fn search_page_dynamic(
@@ -1559,82 +259,25 @@ impl Db {
         limit: u64,
         offset: u64,
     ) -> rusqlite::Result<DynamicSearchPage> {
-        let fields = self.result_fields()?;
-        let (joins, where_sql, params) = self.build_where(q, false)?;
-        let mut select = Vec::with_capacity(fields.len());
-        let mut extra_headers = Vec::new();
-        for field in &fields {
-            match &field.source {
-                FieldRef::Column(name) => select.push(format!("r.{name}")),
-                FieldRef::Extra(header) => {
-                    select.push("extra_value(r.extra, ?)".to_string());
-                    extra_headers.push(header.clone());
-                }
-            }
-        }
-        let order = if uses_fast_result_order(q) {
-            "r.id DESC"
-        } else {
-            "r.declaration_date DESC, r.id DESC"
-        };
-        let sql = format!(
-            "SELECT r.id, {}, r.dup_first_file FROM records r{joins}{where_sql} ORDER BY {order} LIMIT ? OFFSET ?",
-            select.join(", ")
-        );
-        let mut final_params: Vec<Value> = extra_headers.into_iter().map(Value::from).collect();
-        final_params.extend(params);
-        final_params.push((limit as i64).into());
-        final_params.push((offset as i64).into());
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(params_from_iter(final_params))?;
-        let mut ids = Vec::new();
-        let mut data = Vec::new();
-        let mut dups = Vec::new();
-        while let Some(row) = rows.next()? {
-            ids.push(row.get::<_, i64>(0)?);
-            let mut values = Vec::with_capacity(fields.len());
-            for i in 0..fields.len() {
-                values.push(row.get::<_, Option<String>>(i + 1)?.unwrap_or_default());
-            }
-            data.push(values);
-            dups.push(row.get::<_, Option<String>>(fields.len() + 1)?);
-        }
-        Ok((fields, ids, data, dups))
+        let fields = self.result_fields_cached();
+        result_repo::dynamic_search_page(
+            &self.conn,
+            q,
+            fields,
+            self.filter_plan(q, false)?,
+            limit,
+            offset,
+        )
     }
 
-    /// Export row batch using keyset pagination by id: all 41 columns plus file.
+    /// Legacy fixed-schema export row batch using keyset pagination by id.
     pub fn export_batch(
         &self,
         q: &Query,
         last_id: i64,
         limit: u64,
     ) -> rusqlite::Result<(i64, Vec<Vec<String>>)> {
-        let (joins, where_sql, mut params) = self.build_where(q, false)?;
-        let select: Vec<String> = COLUMNS.iter().map(|c| format!("r.{}", c.name)).collect();
-        let cond = if where_sql.is_empty() {
-            " WHERE"
-        } else {
-            " AND"
-        };
-        let sql = format!(
-            "SELECT r.id, {}, r.source_file FROM records r{joins}{where_sql}{cond} r.id > ? ORDER BY r.id LIMIT ?",
-            select.join(", ")
-        );
-        params.push(last_id.into());
-        params.push((limit as i64).into());
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(params_from_iter(params))?;
-        let mut data = Vec::new();
-        let mut max_id = last_id;
-        while let Some(row) = rows.next()? {
-            max_id = row.get::<_, i64>(0)?;
-            let mut values = Vec::with_capacity(COLUMNS.len() + 1);
-            for i in 0..=COLUMNS.len() {
-                values.push(row.get::<_, Option<String>>(i + 1)?.unwrap_or_default());
-            }
-            data.push(values);
-        }
-        Ok((max_id, data))
+        result_repo::legacy_export_batch(&self.conn, self.filter_plan(q, false)?, last_id, limit)
     }
 
     pub fn export_batch_dynamic(
@@ -1643,7 +286,7 @@ impl Db {
         last_id: i64,
         limit: u64,
     ) -> rusqlite::Result<(Vec<FieldInfo>, i64, Vec<Vec<String>>)> {
-        let fields = self.result_fields()?;
+        let fields = self.result_fields_cached();
         let (max_id, data) = self.export_batch_fields(q, last_id, limit, &fields)?;
         Ok((fields, max_id, data))
     }
@@ -1655,69 +298,22 @@ impl Db {
         limit: u64,
         fields: &[FieldInfo],
     ) -> rusqlite::Result<(i64, Vec<Vec<String>>)> {
-        let (joins, where_sql, params) = self.build_where(q, false)?;
-        let mut select = Vec::with_capacity(fields.len());
-        let mut extra_headers = Vec::new();
-        for field in fields {
-            match &field.source {
-                FieldRef::Column(name) => select.push(format!("r.{name}")),
-                FieldRef::Extra(header) => {
-                    select.push("extra_value(r.extra, ?)".to_string());
-                    extra_headers.push(header.clone());
-                }
-            }
-        }
-        let cond = if where_sql.is_empty() {
-            " WHERE"
-        } else {
-            " AND"
-        };
-        let sql = format!(
-            "SELECT r.id, {} FROM records r{joins}{where_sql}{cond} r.id > ? ORDER BY r.id LIMIT ?",
-            select.join(", ")
-        );
-        let mut final_params: Vec<Value> = extra_headers.into_iter().map(Value::from).collect();
-        final_params.extend(params);
-        final_params.push(last_id.into());
-        final_params.push((limit as i64).into());
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(params_from_iter(final_params))?;
-        let mut data = Vec::new();
-        let mut max_id = last_id;
-        while let Some(row) = rows.next()? {
-            max_id = row.get::<_, i64>(0)?;
-            let mut values = Vec::with_capacity(fields.len());
-            for i in 0..fields.len() {
-                values.push(row.get::<_, Option<String>>(i + 1)?.unwrap_or_default());
-            }
-            data.push(values);
-        }
-        Ok((max_id, data))
+        result_repo::export_batch_fields(
+            &self.conn,
+            fields,
+            self.filter_plan(q, false)?,
+            last_id,
+            limit,
+        )
     }
 
     /// Full record card by id.
     pub fn record_card(&self, id: i64) -> rusqlite::Result<RecordCard> {
-        let select: Vec<String> = COLUMNS.iter().map(|c| c.name.to_string()).collect();
-        let sql = format!(
-            "SELECT {}, source_file, extra FROM records WHERE id = ?1",
-            select.join(", ")
-        );
-        self.conn.query_row(&sql, [id], |row| {
-            let mut fields = Vec::with_capacity(COLUMNS.len());
-            for (i, col) in COLUMNS.iter().enumerate() {
-                fields.push((
-                    col.header,
-                    row.get::<_, Option<String>>(i)?.unwrap_or_default(),
-                ));
-            }
-            let source_file: String = row.get(COLUMNS.len())?;
-            let extra = parse_extra(row.get::<_, Option<String>>(COLUMNS.len() + 1)?.as_deref());
-            Ok(RecordCard {
-                fields,
-                source_file,
-                extra,
-            })
-        })
+        if self.table_shape().is_none() {
+            return result_repo::legacy_record_card(&self.conn, id);
+        }
+        let fields = self.result_fields_cached();
+        result_repo::record_card(&self.conn, fields, id)
     }
 
     // ---------- analytics ----------
@@ -1879,92 +475,24 @@ impl Db {
         limit: u64,
         overview: &AnalyticsOverview,
     ) -> rusqlite::Result<AnalyticsSection> {
-        let (label_expr, filter_field) = analytics_section_grouping(kind, hs_level);
-        self.analytics_group(q, kind, &label_expr, filter_field, limit, overview)
+        analytics_repo::section(
+            &self.conn,
+            self.filter_plan(q, true)?,
+            kind,
+            hs_level,
+            limit,
+            overview,
+        )
     }
 
     fn analytics_overview(&self, q: &Query) -> rusqlite::Result<AnalyticsOverview> {
-        let (joins, where_sql, params) = self.build_where(q, true)?;
-        let sql = format!(
-            "SELECT
-                COUNT(*),
-                COUNT(DISTINCT NULLIF(TRIM(r.declaration_number), '')),
-                COUNT(DISTINCT NULLIF(label_value(r.sender), '')),
-                COUNT(DISTINCT NULLIF(label_value(r.recipient), '')),
-                COUNT(DISTINCT NULLIF(label_value(r.edrpou), '')),
-                COUNT(DISTINCT NULLIF(label_value(r.trademark), '')),
-                COUNT(DISTINCT NULLIF(label_value(r.product_code), '')),
-                COUNT(DISTINCT NULLIF(country_key(r.origin_country), '')),
-                COUNT(DISTINCT NULLIF(country_key(r.dispatch_country), '')),
-                COUNT(DISTINCT NULLIF(country_key(r.trade_country), '')),
-                SUM(num_value(r.currency_control_value)),
-                SUM(num_value(r.gross_kg)),
-                SUM(num_value(r.net_kg)),
-                SUM(num_value(r.quantity))
-             FROM records r{joins}{where_sql}"
-        );
-        let overview = self
-            .conn
-            .query_row(&sql, params_from_iter(params.clone()), |row| {
-                Ok(AnalyticsOverview {
-                    row_count: row.get::<_, i64>(0)? as u64,
-                    declaration_count: row.get::<_, i64>(1)? as u64,
-                    distinct_senders: row.get::<_, i64>(2)? as u64,
-                    distinct_recipients: row.get::<_, i64>(3)? as u64,
-                    distinct_edrpou: row.get::<_, i64>(4)? as u64,
-                    distinct_trademarks: row.get::<_, i64>(5)? as u64,
-                    distinct_product_codes: row.get::<_, i64>(6)? as u64,
-                    distinct_origin_countries: row.get::<_, i64>(7)? as u64,
-                    distinct_dispatch_countries: row.get::<_, i64>(8)? as u64,
-                    distinct_trade_countries: row.get::<_, i64>(9)? as u64,
-                    total_value_usd: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
-                    total_gross_kg: row.get::<_, Option<f64>>(11)?.unwrap_or(0.0),
-                    total_net_kg: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
-                    total_quantity: row.get::<_, Option<f64>>(13)?.unwrap_or(0.0),
-                    avg_value_per_net_kg: 0.0,
-                })
-            })?;
-        Ok(AnalyticsOverview {
-            avg_value_per_net_kg: ratio(overview.total_value_usd, overview.total_net_kg),
-            ..overview
-        })
+        analytics_repo::overview(&self.conn, self.filter_plan(q, true)?)
     }
 
     /// Import dynamics grouped by month ("YYYY-MM" from the ISO date).
     /// Returns the most recent 48 months in chronological order.
     fn analytics_months(&self, q: &Query) -> rusqlite::Result<Vec<AnalyticsMonthRow>> {
-        let (joins, where_sql, params) = self.build_where(q, true)?;
-        let month_filter = "TRIM(r.declaration_date) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]*'";
-        let filter_sql = if where_sql.is_empty() {
-            format!(" WHERE {month_filter}")
-        } else {
-            format!("{where_sql} AND {month_filter}")
-        };
-        let sql = format!(
-            "SELECT
-                SUBSTR(TRIM(r.declaration_date), 1, 7) AS month,
-                COUNT(*) AS rows_count,
-                COUNT(DISTINCT NULLIF(TRIM(r.declaration_number), '')) AS declarations_count,
-                COALESCE(SUM(num_value(r.currency_control_value)), 0.0) AS total_value_usd,
-                COALESCE(SUM(num_value(r.net_kg)), 0.0) AS total_net_kg
-             FROM records r{joins}{filter_sql}
-             GROUP BY month
-             ORDER BY month DESC
-             LIMIT 48"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(params), |row| {
-            Ok(AnalyticsMonthRow {
-                month: row.get(0)?,
-                rows: row.get::<_, i64>(1)? as u64,
-                declarations: row.get::<_, i64>(2)? as u64,
-                total_value_usd: row.get(3)?,
-                total_net_kg: row.get(4)?,
-            })
-        })?;
-        let mut months: Vec<AnalyticsMonthRow> = rows.flatten().collect();
-        months.reverse();
-        Ok(months)
+        analytics_repo::months(&self.conn, self.filter_plan(q, true)?)
     }
 
     /// Full dossier for one company (by EDRPOU): name variants, headline
@@ -1972,108 +500,13 @@ impl Db {
     /// countries. Scoped to the company's rows, so it is fast thanks to the
     /// EDRPOU index even on a multi-million-row database.
     pub fn company_profile(&self, edrpou: &str, limit: u64) -> rusqlite::Result<CompanyProfile> {
-        let q = Query {
-            text: String::new(),
-            filters: Filters {
-                edrpou: edrpou.trim().to_string(),
-                ..Filters::default()
-            },
-            advanced: None,
-        };
-        let overview = self.analytics_overview(&q)?;
-        let months = self.analytics_months(&q)?;
-        let product_sections = vec![
-            self.analytics_section_with_overview(
-                &q,
-                AnalyticsSectionKind::ProductCodes,
-                10,
-                limit,
-                &overview,
-            )?,
-            self.analytics_section_with_overview(
-                &q,
-                AnalyticsSectionKind::Trademarks,
-                10,
-                limit,
-                &overview,
-            )?,
-            self.analytics_section_with_overview(
-                &q,
-                AnalyticsSectionKind::ProductGroups,
-                10,
-                limit,
-                &overview,
-            )?,
-        ];
-        let country_sections = vec![
-            self.analytics_section_with_overview(
-                &q,
-                AnalyticsSectionKind::OriginCountries,
-                10,
-                limit,
-                &overview,
-            )?,
-            self.analytics_section_with_overview(
-                &q,
-                AnalyticsSectionKind::DispatchCountries,
-                10,
-                limit,
-                &overview,
-            )?,
-            self.analytics_section_with_overview(
-                &q,
-                AnalyticsSectionKind::TradeCountries,
-                10,
-                limit,
-                &overview,
-            )?,
-        ];
-        let price_sections = self.analytics_price_metrics(&q)?;
-        let top_products = section_rows(&product_sections, AnalyticsSectionKind::ProductCodes);
-        let top_origin_countries =
-            section_rows(&country_sections, AnalyticsSectionKind::OriginCountries);
-        let top_senders = self
-            .analytics_group(
-                &q,
-                AnalyticsSectionKind::Senders,
-                "r.sender",
-                AnalyticsFilterField::Sender,
-                limit,
-                &overview,
-            )?
-            .rows;
-
-        let mut names = Vec::new();
-        let mut stmt = self.conn.prepare(
-            "SELECT TRIM(recipient) AS name, COUNT(*) AS n
-             FROM records
-             WHERE TRIM(edrpou) = ?1 AND TRIM(COALESCE(recipient, '')) <> ''
-                AND dup_first_file IS NULL
-             GROUP BY name ORDER BY n DESC LIMIT 8",
-        )?;
-        let rows = stmt.query_map([edrpou.trim()], |row| row.get::<_, String>(0))?;
-        for name in rows.flatten() {
-            names.push(name);
-        }
-
-        Ok(CompanyProfile {
-            edrpou: edrpou.trim().to_string(),
-            names,
-            overview,
-            months,
-            top_products,
-            top_senders,
-            top_origin_countries,
-            product_sections,
-            country_sections,
-            price_sections,
-        })
+        analytics_repo::company_profile(&self.conn, edrpou, limit)
     }
 
-    /// Finds declarations whose customs value per kg is far below the median
-    /// for the same product code — a classic signal of undervaluation. Only
+    /// Finds rows whose source value per kg is far below the median for the
+    /// same product code — a classic signal of undervaluation. Only
     /// codes with at least `min_samples` priced rows are judged, so a lone
-    /// declaration cannot flag itself. Rows are returned most-undervalued first.
+    /// single row cannot flag itself. Rows are returned most-undervalued first.
     pub fn undervaluation(
         &self,
         q: &Query,
@@ -2081,128 +514,13 @@ impl Db {
         min_samples: u64,
         limit: u64,
     ) -> rusqlite::Result<Undervaluation> {
-        let (joins, where_sql, params) = self.build_where(q, true)?;
-        let cond = if where_sql.is_empty() {
-            " WHERE"
-        } else {
-            " AND"
-        };
-        let cte = format!(
-            "WITH priced AS (
-                SELECT r.id AS id,
-                    TRIM(r.product_code) AS code,
-                    num_value(r.currency_control_value) AS customs_value,
-                    num_value(r.net_kg) AS net_kg,
-                    num_value(r.currency_control_value) / num_value(r.net_kg) AS price,
-                    r.declaration_date AS dt,
-                    r.declaration_number AS num,
-                    r.recipient AS recipient,
-                    r.sender AS sender,
-                    r.edrpou AS edrpou,
-                    r.description AS descr
-                FROM records r{joins}{where_sql}{cond}
-                    TRIM(r.product_code) <> ''
-                    AND num_value(r.net_kg) > 0
-                    AND num_value(r.currency_control_value) > 0
-             ),
-             code_stats AS (
-                SELECT code, median_num(price) AS med, pctl_text(price) AS pctls, COUNT(*) AS n
-                FROM priced GROUP BY code HAVING n >= ?
-             ),
-             flagged AS (
-                SELECT p.id, p.dt, p.num, p.recipient, p.sender, p.edrpou, p.code, p.descr,
-                    p.customs_value, p.net_kg, p.price, c.med, c.pctls, c.n,
-                    p.price / c.med AS ratio,
-                    MAX((c.med * p.net_kg) - p.customs_value, 0.0) AS estimated_gap
-                FROM priced p JOIN code_stats c ON c.code = p.code
-                WHERE c.med > 0 AND p.price < c.med * ?
-             )
-             "
-        );
-
-        let summary_sql = format!(
-            "{cte}
-             SELECT
-                COALESCE((SELECT SUM(n) FROM code_stats), 0),
-                COALESCE((SELECT COUNT(*) FROM code_stats), 0),
-                COALESCE((SELECT COUNT(*) FROM flagged), 0),
-                COALESCE((SELECT COUNT(DISTINCT code) FROM flagged), 0),
-                COALESCE((SELECT SUM(customs_value) FROM flagged), 0.0),
-                COALESCE((SELECT SUM(estimated_gap) FROM flagged), 0.0)"
-        );
-        let mut summary_bind: Vec<rusqlite::types::Value> = params.clone();
-        summary_bind.push((min_samples as i64).into());
-        summary_bind.push(threshold.into());
-        let summary = self.conn.query_row(
-            &summary_sql,
-            params_from_iter(summary_bind),
-            |row| -> rusqlite::Result<(u64, u64, u64, u64, f64, f64)> {
-                Ok((
-                    row.get::<_, i64>(0)? as u64,
-                    row.get::<_, i64>(1)? as u64,
-                    row.get::<_, i64>(2)? as u64,
-                    row.get::<_, i64>(3)? as u64,
-                    row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
-                    row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
-                ))
-            },
-        )?;
-
-        let sql = format!(
-            "{cte}
-             SELECT id, dt, num, recipient, sender, edrpou, code, descr,
-                    customs_value, net_kg, price, med, pctls, n, ratio, estimated_gap
-             FROM flagged
-             ORDER BY ratio ASC, estimated_gap DESC
-             LIMIT ?"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut bind: Vec<rusqlite::types::Value> = params;
-        bind.push((min_samples as i64).into());
-        bind.push(threshold.into());
-        bind.push((limit as i64).into());
-        let mut rows = stmt.query(params_from_iter(bind))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            let code: String = row.get(6)?;
-            let pctls: Option<String> = row.get(12)?;
-            let mut parts = pctls
-                .as_deref()
-                .unwrap_or("")
-                .split('|')
-                .map(|p| p.parse::<f64>().unwrap_or(0.0));
-            out.push(UndervaluedRow {
-                id: row.get(0)?,
-                declaration_date: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                declaration_number: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                recipient: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                sender: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                edrpou: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                product_code: code,
-                description: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                customs_value: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
-                net_kg: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
-                price_per_kg: row.get(10)?,
-                code_median: row.get(11)?,
-                code_p25: parts.next().unwrap_or(0.0),
-                code_p75: {
-                    let _median = parts.next();
-                    parts.next().unwrap_or(0.0)
-                },
-                code_sample_count: row.get::<_, i64>(13)? as u64,
-                ratio: row.get(14)?,
-                estimated_gap: row.get::<_, Option<f64>>(15)?.unwrap_or(0.0),
-            });
-        }
-        Ok(Undervaluation {
-            rows: out,
-            checked_rows: summary.0,
-            checked_codes: summary.1,
-            flagged_rows: summary.2,
-            flagged_codes: summary.3,
-            flagged_value: summary.4,
-            estimated_gap: summary.5,
-        })
+        analytics_repo::undervaluation(
+            &self.conn,
+            self.filter_plan(q, true)?,
+            threshold,
+            min_samples,
+            limit,
+        )
     }
 
     /// Cross-tabulation of `row_dim` by `col_dim` for `metric`, over the rows
@@ -2218,342 +536,41 @@ impl Db {
         limits: PivotLimits,
         others_label: &str,
     ) -> rusqlite::Result<PivotResult> {
-        let (joins, where_sql, params) = self.build_where(q, true)?;
-        let row_sql = row_dim.sql();
-        let col_sql = col_dim.sql();
-        let non_empty = format!("{row_sql} <> '' AND {col_sql} <> ''");
-        let filter_sql = if where_sql.is_empty() {
-            format!(" WHERE {non_empty}")
-        } else {
-            format!("{where_sql} AND {non_empty}")
-        };
-        let sql = format!(
-            "SELECT {row_sql} AS rk, {col_sql} AS ck, {metric} AS v
-             FROM records r{joins}{filter_sql}
-             GROUP BY rk, ck",
-            metric = metric.sql()
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query(params_from_iter(params))?;
-
-        // Accumulate into maps, then rank rows and columns by total.
-        let mut row_totals: std::collections::HashMap<String, f64> =
-            std::collections::HashMap::new();
-        let mut col_totals: std::collections::HashMap<String, f64> =
-            std::collections::HashMap::new();
-        let mut triples: Vec<(String, String, f64)> = Vec::new();
-        while let Some(row) = rows.next()? {
-            let rk: String = row.get(0)?;
-            let ck: String = row.get(1)?;
-            let v: f64 = row.get(2)?;
-            *row_totals.entry(rk.clone()).or_default() += v;
-            *col_totals.entry(ck.clone()).or_default() += v;
-            triples.push((rk, ck, v));
-        }
-
-        let rank =
-            |totals: &std::collections::HashMap<String, f64>, limit: usize, sort_label: bool| {
-                let mut items: Vec<(String, f64)> =
-                    totals.iter().map(|(k, v)| (k.clone(), *v)).collect();
-                if sort_label {
-                    items.sort_by(|a, b| a.0.cmp(&b.0));
-                } else {
-                    items.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-                }
-                let truncated = items.len() > limit;
-                items.truncate(limit);
-                (
-                    items.into_iter().map(|(k, _)| k).collect::<Vec<_>>(),
-                    truncated,
-                )
-            };
-
-        // Months/years read naturally in chronological order; others by size.
-        let col_chrono = matches!(col_dim, PivotDim::Month | PivotDim::Year);
-        let (row_labels, rows_truncated) = rank(&row_totals, limits.rows, false);
-        let (col_labels, cols_truncated) = rank(&col_totals, limits.cols, col_chrono);
-
-        let row_index: std::collections::HashMap<&str, usize> = row_labels
-            .iter()
-            .enumerate()
-            .map(|(i, k)| (k.as_str(), i))
-            .collect();
-        let col_index: std::collections::HashMap<&str, usize> = col_labels
-            .iter()
-            .enumerate()
-            .map(|(i, k)| (k.as_str(), i))
-            .collect();
-
-        let n_rows = row_labels.len() + usize::from(rows_truncated);
-        let n_cols = col_labels.len() + usize::from(cols_truncated);
-        let others_row = row_labels.len();
-        let others_col = col_labels.len();
-        let mut cells = vec![vec![0.0_f64; n_cols]; n_rows];
-        for (rk, ck, v) in triples {
-            let ri = row_index.get(rk.as_str()).copied().unwrap_or(others_row);
-            let ci = col_index.get(ck.as_str()).copied().unwrap_or(others_col);
-            if ri < n_rows && ci < n_cols {
-                cells[ri][ci] += v;
-            }
-        }
-
-        let mut final_row_labels = row_labels;
-        if rows_truncated {
-            final_row_labels.push(others_label.to_string());
-        }
-        let mut final_col_labels = col_labels;
-        if cols_truncated {
-            final_col_labels.push(others_label.to_string());
-        }
-        let row_tot: Vec<f64> = cells.iter().map(|r| r.iter().sum()).collect();
-        let mut col_tot = vec![0.0_f64; n_cols];
-        for r in &cells {
-            for (ci, v) in r.iter().enumerate() {
-                col_tot[ci] += v;
-            }
-        }
-        let grand: f64 = row_tot.iter().sum();
-
-        Ok(PivotResult {
-            row_labels: final_row_labels,
-            col_labels: final_col_labels,
-            cells,
-            row_totals: row_tot,
-            col_totals: col_tot,
-            grand_total: grand,
-            rows_truncated,
-            cols_truncated,
-        })
-    }
-
-    fn analytics_group(
-        &self,
-        q: &Query,
-        kind: AnalyticsSectionKind,
-        label_expr: &str,
-        filter_field: AnalyticsFilterField,
-        limit: u64,
-        overview: &AnalyticsOverview,
-    ) -> rusqlite::Result<AnalyticsSection> {
-        let (joins, where_sql, mut params) = self.build_where(q, true)?;
-        let label_sql = format!("label_value({label_expr})");
-        let non_empty = format!("{label_sql} <> ''");
-        let filter_sql = if where_sql.is_empty() {
-            format!(" WHERE {non_empty}")
-        } else {
-            format!("{where_sql} AND {non_empty}")
-        };
-        let sql = format!(
-            "SELECT
-                {label_sql} AS label,
-                COUNT(*) AS rows_count,
-                COUNT(DISTINCT NULLIF(TRIM(r.declaration_number), '')) AS declarations_count,
-                COUNT(DISTINCT NULLIF(TRIM(r.edrpou), '')) AS companies_count,
-                COALESCE(SUM(num_value(r.currency_control_value)), 0.0) AS total_value_usd,
-                COALESCE(SUM(num_value(r.net_kg)), 0.0) AS total_net_kg,
-                COALESCE(SUM(num_value(r.gross_kg)), 0.0) AS total_gross_kg,
-                COALESCE(SUM(num_value(r.quantity)), 0.0) AS total_quantity
-             FROM records r{joins}{filter_sql}
-             GROUP BY {label_sql}
-             ORDER BY total_value_usd DESC, total_net_kg DESC, rows_count DESC, label COLLATE NOCASE
-             LIMIT ?"
-        );
-        params.push((limit as i64).into());
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(params), |row| {
-            let label: String = row.get(0)?;
-            let total_value_usd: f64 = row.get(4)?;
-            let total_net_kg: f64 = row.get(5)?;
-            let total_gross_kg: f64 = row.get(6)?;
-            let total_quantity: f64 = row.get(7)?;
-            let share_base = if overview.total_value_usd > 0.0 {
-                overview.total_value_usd
-            } else if overview.total_net_kg > 0.0 {
-                overview.total_net_kg
-            } else {
-                overview.row_count as f64
-            };
-            let share_value = if overview.total_value_usd > 0.0 {
-                total_value_usd
-            } else if overview.total_net_kg > 0.0 {
-                total_net_kg
-            } else {
-                row.get::<_, i64>(1)? as f64
-            };
-            Ok(AnalyticsGroupRow {
-                filter_action: Some(AnalyticsFilterAction {
-                    field: filter_field,
-                    value: label.clone(),
-                }),
-                label,
-                rows: row.get::<_, i64>(1)? as u64,
-                declarations: row.get::<_, i64>(2)? as u64,
-                companies: row.get::<_, i64>(3)? as u64,
-                total_value_usd,
-                total_net_kg,
-                total_gross_kg,
-                total_quantity,
-                share_percent: ratio(share_value * 100.0, share_base),
-                avg_value_per_net_kg: ratio(total_value_usd, total_net_kg),
-            })
-        })?;
-        Ok(AnalyticsSection {
-            kind,
-            rows: rows.collect::<rusqlite::Result<Vec<_>>>()?,
-        })
+        analytics_repo::pivot(
+            &self.conn,
+            self.filter_plan(q, true)?,
+            row_dim,
+            col_dim,
+            metric,
+            limits,
+            others_label,
+        )
     }
 
     fn analytics_price_metrics(&self, q: &Query) -> rusqlite::Result<Vec<AnalyticsPriceMetric>> {
-        Ok(vec![
-            self.price_metric(
-                q,
-                PriceMetricKind::ValuePerNetKg,
-                "CASE
-                    WHEN num_value(r.currency_control_value) IS NOT NULL
-                        AND num_value(r.net_kg) IS NOT NULL
-                        AND num_value(r.net_kg) > 0
-                    THEN num_value(r.currency_control_value) / num_value(r.net_kg)
-                 END",
-            )?,
-            self.price_metric(q, PriceMetricKind::RfvUsdKg, "num_value(r.rfv_usd_kg)")?,
-            self.price_metric(
-                q,
-                PriceMetricKind::RmvNetUsdKg,
-                "num_value(r.rmv_net_usd_kg)",
-            )?,
-            self.price_metric(
-                q,
-                PriceMetricKind::RmvUsdExtraUnit,
-                "num_value(r.rmv_usd_extra_unit)",
-            )?,
-            self.price_metric(
-                q,
-                PriceMetricKind::RmvGrossUsdKg,
-                "num_value(r.rmv_gross_usd_kg)",
-            )?,
-            self.price_metric(
-                q,
-                PriceMetricKind::MinBaseUsdKg,
-                "num_value(r.min_base_usd_kg)",
-            )?,
-        ])
-    }
-
-    fn price_metric(
-        &self,
-        q: &Query,
-        kind: PriceMetricKind,
-        price_expr: &str,
-    ) -> rusqlite::Result<AnalyticsPriceMetric> {
-        let (joins, where_sql, params) = self.build_where(q, true)?;
-        let sql = format!(
-            "SELECT
-                COUNT(price),
-                AVG(price),
-                MIN(price),
-                MAX(price),
-                SUM(CASE WHEN price IS NOT NULL AND weight IS NOT NULL AND weight > 0
-                    THEN price * weight ELSE 0 END),
-                SUM(CASE WHEN price IS NOT NULL AND weight IS NOT NULL AND weight > 0
-                    THEN weight ELSE 0 END),
-                pctl_text(price)
-             FROM (
-                SELECT {price_expr} AS price, num_value(r.net_kg) AS weight
-                FROM records r{joins}{where_sql}
-             )"
-        );
-        self.conn.query_row(&sql, params_from_iter(params), |row| {
-            let weighted_sum = row.get::<_, Option<f64>>(4)?.unwrap_or(0.0);
-            let weighted_kg = row.get::<_, Option<f64>>(5)?.unwrap_or(0.0);
-            let pctls: Option<String> = row.get(6)?;
-            let mut parts = pctls
-                .as_deref()
-                .unwrap_or("")
-                .split('|')
-                .map(|p| p.parse::<f64>().unwrap_or(0.0));
-            let p25 = parts.next().unwrap_or(0.0);
-            let median = parts.next().unwrap_or(0.0);
-            let p75 = parts.next().unwrap_or(0.0);
-            Ok(AnalyticsPriceMetric {
-                kind,
-                count: row.get::<_, i64>(0)? as u64,
-                average: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
-                minimum: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-                maximum: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
-                weighted_average: ratio(weighted_sum, weighted_kg),
-                median,
-                p25,
-                p75,
-            })
-        })
+        analytics_repo::price_metrics(&self.conn, q, self.meta_get_i64("fts_watermark"))
     }
 
     // ---------- statistics ----------
 
     pub fn total_rows(&self) -> u64 {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM records", [], |r| r.get::<_, i64>(0))
-            .unwrap_or(0) as u64
+        record_writer::total_rows(&self.conn)
     }
 
     pub fn add_import_log(&self, entry: ImportLogWrite<'_>) {
-        let warnings = entry.quality.warnings_text();
-        let _ = self.conn.execute(
-            "INSERT INTO import_log (
-                file_name, total_rows, imported, duplicates, seconds, file_hash,
-                layout, header_row, source_columns, recognized_columns, extra_columns,
-                non_empty_cells, empty_cells, warnings
-             )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![
-                entry.file_name,
-                entry.total_rows as i64,
-                entry.imported as i64,
-                entry.duplicates as i64,
-                entry.seconds,
-                entry.file_hash,
-                empty_to_null(&entry.quality.layout),
-                entry.quality.header_row as i64,
-                entry.quality.source_columns as i64,
-                entry.quality.recognized_columns as i64,
-                entry.quality.extra_columns as i64,
-                entry.quality.non_empty_cells as i64,
-                entry.quality.empty_cells as i64,
-                empty_to_null(&warnings),
-            ],
-        );
+        import_log::add(&self.conn, entry);
     }
 
     pub fn storage_info(&self, db_path: &Path) -> rusqlite::Result<DatabaseStorageInfo> {
-        let page_count = pragma_u64(&self.conn, "page_count")?;
-        let page_size = pragma_u64(&self.conn, "page_size")?;
-        let freelist_pages = pragma_u64(&self.conn, "freelist_count")?;
-        Ok(DatabaseStorageInfo {
-            database_bytes: file_len(db_path),
-            wal_bytes: file_len(&sidecar_path(db_path, "-wal")),
-            shm_bytes: file_len(&sidecar_path(db_path, "-shm")),
-            page_count,
-            page_size,
-            freelist_pages,
-            freelist_bytes: freelist_pages.saturating_mul(page_size),
-        })
+        maintenance::storage_info(&self.conn, db_path)
     }
 
     pub fn checkpoint_wal_truncate(&self) -> rusqlite::Result<WalCheckpointInfo> {
-        self.conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                Ok(WalCheckpointInfo {
-                    busy: row.get::<_, i64>(0)?.max(0) as u64,
-                    log_frames: row.get::<_, i64>(1)?.max(0) as u64,
-                    checkpointed_frames: row.get::<_, i64>(2)?.max(0) as u64,
-                })
-            })
+        maintenance::checkpoint_wal_truncate(&self.conn)
     }
 
     pub fn vacuum_database(&self) -> rusqlite::Result<()> {
-        self.conn.execute_batch("VACUUM;")?;
-        self.checkpoint_wal_truncate()?;
-        Ok(())
+        maintenance::vacuum_database(&self.conn)
     }
 
     /// Full cleanup: removes all records and import logs, then returns disk
@@ -2566,6 +583,8 @@ impl Db {
                  DELETE FROM records;
                  DELETE FROM import_log;",
             )?;
+            meta::delete(&self.conn, meta::EXTRA_HEADERS_KEY)?;
+            meta::delete(&self.conn, table_shape::TABLE_SHAPE_KEY)?;
             self.meta_set("fts_watermark", "0");
             Ok(())
         })();
@@ -2582,173 +601,12 @@ impl Db {
 
     /// Name of a previously imported file with the same content.
     pub fn find_import_by_hash(&self, file_hash: &str) -> Option<String> {
-        self.conn
-            .query_row(
-                "SELECT file_name FROM import_log WHERE file_hash = ?1 ORDER BY id DESC LIMIT 1",
-                [file_hash],
-                |r| r.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten()
+        import_log::find_by_hash(&self.conn, file_hash)
     }
 
     pub fn import_log(&self, limit: u64) -> Vec<ImportLogEntry> {
-        let Ok(mut stmt) = self.conn.prepare(
-            "SELECT
-                file_name, total_rows, imported, duplicates, seconds, imported_at,
-                COALESCE(layout, ''),
-                COALESCE(header_row, 0),
-                COALESCE(source_columns, 0),
-                COALESCE(recognized_columns, 0),
-                COALESCE(extra_columns, 0),
-                COALESCE(non_empty_cells, 0),
-                COALESCE(empty_cells, 0),
-                COALESCE(warnings, '')
-             FROM import_log ORDER BY id DESC LIMIT ?1",
-        ) else {
-            return Vec::new();
-        };
-        stmt.query_map([limit as i64], |row| {
-            let quality = ImportQuality {
-                layout: row.get(6)?,
-                header_row: row.get::<_, i64>(7)?.max(0) as u64,
-                source_columns: row.get::<_, i64>(8)?.max(0) as u64,
-                recognized_columns: row.get::<_, i64>(9)?.max(0) as u64,
-                extra_columns: row.get::<_, i64>(10)?.max(0) as u64,
-                non_empty_cells: row.get::<_, i64>(11)?.max(0) as u64,
-                empty_cells: row.get::<_, i64>(12)?.max(0) as u64,
-                warnings: Vec::new(),
-            }
-            .with_warnings_text(row.get(13)?);
-            Ok(ImportLogEntry {
-                file_name: row.get(0)?,
-                total_rows: row.get::<_, i64>(1)? as u64,
-                imported: row.get::<_, i64>(2)? as u64,
-                duplicates: row.get::<_, i64>(3)? as u64,
-                seconds: row.get(4)?,
-                imported_at: row.get(5)?,
-                quality,
-            })
-        })
-        .map(|rows| rows.flatten().collect())
-        .unwrap_or_default()
+        import_log::list(&self.conn, limit)
     }
-}
-
-fn empty_to_null(value: &str) -> Option<&str> {
-    let value = value.trim();
-    if value.is_empty() { None } else { Some(value) }
-}
-
-fn pragma_u64(conn: &Connection, name: &str) -> rusqlite::Result<u64> {
-    let sql = format!("PRAGMA {name}");
-    conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
-        .map(|value| value.max(0) as u64)
-}
-
-fn file_len(path: &Path) -> u64 {
-    std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
-}
-
-fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_os_string();
-    value.push(suffix);
-    PathBuf::from(value)
-}
-
-/// Builds an FTS5 query from user input.
-/// Each word is an exact phrase; `word*` performs prefix search.
-/// Numeric terms with 4+ digits are automatically treated as prefixes,
-/// which is convenient for product codes.
-pub fn build_fts_query(input: &str) -> String {
-    fn flush(terms: &mut Vec<String>, current: &mut String, prefix: bool) {
-        if current.is_empty() {
-            return;
-        }
-        let all_digits = current.chars().all(|c| c.is_ascii_digit());
-        let prefix = prefix || (all_digits && current.len() >= 4);
-        let star = if prefix { "*" } else { "" };
-        terms.push(format!("\"{current}\"{star}"));
-        current.clear();
-    }
-    let mut terms: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for ch in input.chars() {
-        if terms.len() >= 32 {
-            break;
-        }
-        if ch.is_alphanumeric() {
-            current.push(ch);
-        } else if ch == '*' {
-            flush(&mut terms, &mut current, true);
-        } else {
-            flush(&mut terms, &mut current, false);
-        }
-    }
-    flush(&mut terms, &mut current, false);
-    terms.join(" ")
-}
-
-/// Prefix FTS terms for a filter value: `JYSK Ukraine` -> `"jysk"* "ukraine"*`.
-/// Returns None when the value cannot produce reliable terms, such as 1-char tokens.
-pub fn fts_prefix_terms(value: &str) -> Option<String> {
-    // Short tokens (single letters in names like "S A", "Z O O", initials)
-    // are dropped, not fatal: we still narrow by the distinctive long tokens
-    // through FTS, and cyr_contains does the exact substring check afterwards.
-    // Returning None here would disable FTS narrowing entirely and force a
-    // full-table cyr_contains scan over every row — far too slow on big bases.
-    let mut terms: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for ch in value.chars().chain(std::iter::once(' ')) {
-        if ch.is_alphanumeric() {
-            current.push(ch);
-        } else if !current.is_empty() {
-            if current.chars().count() >= 3 {
-                terms.push(format!("\"{current}\"*"));
-            }
-            current.clear();
-        }
-        if terms.len() >= 8 {
-            break;
-        }
-    }
-    if terms.is_empty() {
-        None
-    } else {
-        Some(terms.join(" "))
-    }
-}
-
-/// Allocation-free case-insensitive substring search, including Cyrillic text.
-/// `needle_lower` must already be lowercased.
-pub fn contains_ci(hay: &str, needle_lower: &str) -> bool {
-    if needle_lower.is_empty() {
-        return true;
-    }
-    let Some(first) = needle_lower.chars().next() else {
-        return true;
-    };
-    for (i, c) in hay.char_indices() {
-        if c.to_lowercase().next() != Some(first) {
-            continue;
-        }
-        let mut h = hay[i..].chars().flat_map(char::to_lowercase);
-        let mut n = needle_lower.chars();
-        loop {
-            let Some(nc) = n.next() else {
-                return true;
-            };
-            if h.next() != Some(nc) {
-                break;
-            }
-        }
-    }
-    false
-}
-
-pub fn analytics_should_run(q: &Query) -> bool {
-    !q.is_empty()
 }
 
 fn section_rows(
@@ -2762,460 +620,12 @@ fn section_rows(
         .unwrap_or_default()
 }
 
-fn analytics_section_grouping(
-    kind: AnalyticsSectionKind,
-    hs_level: u8,
-) -> (String, AnalyticsFilterField) {
-    match kind {
-        AnalyticsSectionKind::Recipients => {
-            ("r.recipient".to_string(), AnalyticsFilterField::Recipient)
-        }
-        AnalyticsSectionKind::Senders => ("r.sender".to_string(), AnalyticsFilterField::Sender),
-        AnalyticsSectionKind::Edrpou => ("r.edrpou".to_string(), AnalyticsFilterField::Edrpou),
-        AnalyticsSectionKind::ProductCodes => {
-            let expr = if hs_level >= 10 {
-                "r.product_code".to_string()
-            } else {
-                format!("SUBSTR(TRIM(r.product_code), 1, {})", hs_level.clamp(2, 8))
-            };
-            (expr, AnalyticsFilterField::ProductCode)
-        }
-        AnalyticsSectionKind::Trademarks => {
-            ("r.trademark".to_string(), AnalyticsFilterField::Trademark)
-        }
-        AnalyticsSectionKind::ProductGroups => (
-            "SUBSTR(TRIM(r.description), 1, 80)".to_string(),
-            AnalyticsFilterField::Description,
-        ),
-        AnalyticsSectionKind::OriginCountries => (
-            "country_key(r.origin_country)".to_string(),
-            AnalyticsFilterField::OriginCountry,
-        ),
-        AnalyticsSectionKind::DispatchCountries => (
-            "country_key(r.dispatch_country)".to_string(),
-            AnalyticsFilterField::DispatchCountry,
-        ),
-        AnalyticsSectionKind::TradeCountries => (
-            "country_key(r.trade_country)".to_string(),
-            AnalyticsFilterField::TradeCountry,
-        ),
+fn sql_value_to_text(value: Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Integer(x) => x.to_string(),
+        Value::Real(x) => x.to_string(),
+        Value::Text(s) => s,
+        Value::Blob(b) => format!("<blob {}>", b.len()),
     }
-}
-
-fn ratio(numerator: f64, denominator: f64) -> f64 {
-    if denominator.abs() <= f64::EPSILON {
-        0.0
-    } else {
-        numerator / denominator
-    }
-}
-
-/// Parses the stored `extra` JSON (an array of [header, value] pairs) back into
-/// ordered key/value pairs for display. Returns empty on missing or bad data.
-fn parse_extra(raw: Option<&str>) -> Vec<(String, String)> {
-    raw.and_then(|text| serde_json::from_str::<Vec<(String, String)>>(text).ok())
-        .unwrap_or_default()
-}
-
-fn extra_value_for_header(raw: Option<&str>, header: Option<&str>) -> String {
-    let Some(header) = header else {
-        return String::new();
-    };
-    let wanted = normalize_text_key(header);
-    if wanted.is_empty() {
-        return String::new();
-    }
-    parse_extra(raw)
-        .into_iter()
-        .find_map(|(candidate, value)| (normalize_text_key(&candidate) == wanted).then_some(value))
-        .unwrap_or_default()
-}
-
-fn validate_condition_operator(kind: FieldKind, op: ConditionOp) -> rusqlite::Result<()> {
-    let allowed = match kind {
-        FieldKind::Text => matches!(
-            op,
-            ConditionOp::Contains
-                | ConditionOp::Equals
-                | ConditionOp::StartsWith
-                | ConditionOp::IsAnyOf
-                | ConditionOp::IsEmpty
-                | ConditionOp::IsNotEmpty
-        ),
-        FieldKind::Code => matches!(
-            op,
-            ConditionOp::StartsWith
-                | ConditionOp::Equals
-                | ConditionOp::IsAnyOf
-                | ConditionOp::IsEmpty
-                | ConditionOp::IsNotEmpty
-        ),
-        FieldKind::Country => matches!(
-            op,
-            ConditionOp::Equals
-                | ConditionOp::IsAnyOf
-                | ConditionOp::IsEmpty
-                | ConditionOp::IsNotEmpty
-        ),
-        FieldKind::Number | FieldKind::Date | FieldKind::Year => matches!(
-            op,
-            ConditionOp::Equals
-                | ConditionOp::Range
-                | ConditionOp::IsEmpty
-                | ConditionOp::IsNotEmpty
-        ),
-    };
-    if allowed {
-        Ok(())
-    } else {
-        Err(invalid_search_input(&format!(
-            "{} is not valid for {:?} fields",
-            op.label(),
-            kind
-        )))
-    }
-}
-
-fn push_field_params(field: &SearchFieldSql, params: &mut Vec<Value>) {
-    if let Some(header) = &field.extra_header {
-        params.push(header.clone().into());
-    }
-}
-
-fn compile_equal_clause(
-    field: &SearchFieldSql,
-    value: &str,
-    params: &mut Vec<Value>,
-) -> rusqlite::Result<String> {
-    push_field_params(field, params);
-    match field.kind {
-        FieldKind::Text => {
-            params.push(value.to_string().into());
-            Ok(format!("text_key({}) = text_key(?)", field.expr))
-        }
-        FieldKind::Code | FieldKind::Date => {
-            params.push(value.to_string().into());
-            Ok(format!("TRIM(COALESCE({}, '')) = ?", field.expr))
-        }
-        FieldKind::Country => {
-            params.push(normalize_country_key(value).into());
-            Ok(format!("country_key({}) = ?", field.expr))
-        }
-        FieldKind::Number => {
-            let number = parse_number(value)
-                .ok_or_else(|| invalid_search_input("number comparison requires a number"))?;
-            params.push(number.into());
-            Ok(format!("num_value({}) = ?", field.expr))
-        }
-        FieldKind::Year => {
-            let year = parse_year(value)
-                .ok_or_else(|| invalid_search_input("year comparison requires a 4-digit year"))?;
-            params.push(year.into());
-            Ok(format!("{} = ?", field.expr))
-        }
-    }
-}
-
-fn compile_range_clause(
-    field: &SearchFieldSql,
-    value: &ConditionValue,
-    params: &mut Vec<Value>,
-) -> rusqlite::Result<String> {
-    let ConditionValue::Range { from, to } = value else {
-        return Err(invalid_search_input("range requires from/to values"));
-    };
-    let mut parts = Vec::new();
-    if let Some(from) = from
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        push_field_params(field, params);
-        parts.push(compile_range_bound(field, ">=", from, params)?);
-    }
-    if let Some(to) = to
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        push_field_params(field, params);
-        parts.push(compile_range_bound(field, "<=", to, params)?);
-    }
-    if parts.is_empty() {
-        return Err(invalid_search_input("range requires at least one boundary"));
-    }
-    Ok(format!("({})", parts.join(" AND ")))
-}
-
-fn compile_range_bound(
-    field: &SearchFieldSql,
-    cmp: &str,
-    value: &str,
-    params: &mut Vec<Value>,
-) -> rusqlite::Result<String> {
-    match field.kind {
-        FieldKind::Number => {
-            let number = parse_number(value)
-                .ok_or_else(|| invalid_search_input("number range requires numeric bounds"))?;
-            params.push(number.into());
-            Ok(format!("num_value({}) {cmp} ?", field.expr))
-        }
-        FieldKind::Year => {
-            let year = parse_year(value)
-                .ok_or_else(|| invalid_search_input("year range requires 4-digit years"))?;
-            params.push(year.into());
-            Ok(format!("{} {cmp} ?", field.expr))
-        }
-        FieldKind::Date => {
-            params.push(value.to_string().into());
-            Ok(format!("TRIM(COALESCE({}, '')) {cmp} ?", field.expr))
-        }
-        _ => Err(invalid_search_input(
-            "range is only valid for number, date, and year fields",
-        )),
-    }
-}
-
-fn invalid_search_input(message: &str) -> rusqlite::Error {
-    rusqlite::Error::InvalidParameterName(message.to_string())
-}
-
-pub fn parse_number(value: &str) -> Option<f64> {
-    let mut compact = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if ch.is_ascii_digit() || matches!(ch, '.' | ',' | '-' | '+') {
-            compact.push(ch);
-        }
-    }
-    if !compact.chars().any(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-
-    let dot_count = compact.matches('.').count();
-    let comma_count = compact.matches(',').count();
-    let decimal_sep = match (dot_count, comma_count) {
-        (0, 0) => None,
-        (0, 1) => decimal_separator_for_single(&compact, ','),
-        (1, 0) => decimal_separator_for_single(&compact, '.'),
-        (0, _) | (_, 0) => None,
-        _ => {
-            let last_dot = compact.rfind('.').unwrap_or(0);
-            let last_comma = compact.rfind(',').unwrap_or(0);
-            Some(if last_dot > last_comma { '.' } else { ',' })
-        }
-    };
-
-    let mut normalized = String::with_capacity(compact.len());
-    let mut sign_written = false;
-    let mut decimal_written = false;
-    for (i, ch) in compact.chars().enumerate() {
-        if ch.is_ascii_digit() {
-            normalized.push(ch);
-        } else if matches!(ch, '-' | '+') && !sign_written && normalized.is_empty() && i == 0 {
-            normalized.push(ch);
-            sign_written = true;
-        } else if Some(ch) == decimal_sep && !decimal_written {
-            normalized.push('.');
-            decimal_written = true;
-        }
-    }
-
-    normalized.parse::<f64>().ok()
-}
-
-fn decimal_separator_for_single(value: &str, sep: char) -> Option<char> {
-    let pos = value.rfind(sep)?;
-    let after = value[pos + sep.len_utf8()..]
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .count();
-    if after == 0 { None } else { Some(sep) }
-}
-
-fn normalize_country_key(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let key: String = trimmed
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(char::to_uppercase)
-        .collect();
-    if matches!(
-        key.as_str(),
-        "0" | "00" | "000" | "NA" | "NODATA" | "ND" | "НД" | "НЕМАДАНИХ" | "НЕТДАННЫХ"
-    ) {
-        return String::new();
-    }
-    match key.as_str() {
-        "CN" | "CHN" | "КИТАЙ" => "CN",
-        "IE" | "IRL" | "ІРЛАНДІЯ" | "ИРЛАНДИЯ" => "IE",
-        "PL" | "POL" | "ПОЛЬЩА" | "ПОЛЬША" => "PL",
-        "CZ" | "CZE" | "ЧЕСЬКАРЕСПУБЛІКА" | "ЧЕХІЯ" | "ЧЕШСКАЯРЕСПУБЛИКА" | "ЧЕХИЯ" => {
-            "CZ"
-        }
-        "DE" | "DEU" | "НІМЕЧЧИНА" | "ГЕРМАНІЯ" | "ГЕРМАНИЯ" => "DE",
-        "US" | "USA" | "СПОЛУЧЕНІШТАТИАМЕРИКИ" | "США" | "СОЕДИНЕННЫЕШТАТЫАМЕРИКИ" => {
-            "US"
-        }
-        "VN" | "VNM" | "ВЄТНАМ" | "ВЕТНАМ" => "VN",
-        "EU" | "КРАЇНИЄС" | "СТРАНЫЕС" => "EU",
-        "KR" | "KOR" | "ПІВДЕННАКОРЕЯ" | "КОРЕЯРЕСПУБЛІКА" | "ЮЖНАЯКОРЕЯ" => {
-            "KR"
-        }
-        "TR" | "TUR" | "ТУРЕЧЧИНА" | "ТУРЦІЯ" | "ТУРЦИЯ" => "TR",
-        "IN" | "IND" | "ІНДІЯ" | "ИНДИЯ" => "IN",
-        "IT" | "ITA" | "ІТАЛІЯ" | "ИТАЛИЯ" => "IT",
-        "BE" | "BEL" | "БЕЛЬГІЯ" | "БЕЛЬГИЯ" => "BE",
-        "NL" | "NLD" | "НІДЕРЛАНДИ" | "НИДЕРЛАНДЫ" => "NL",
-        "FR" | "FRA" | "ФРАНЦІЯ" | "ФРАНЦИЯ" => "FR",
-        "GB" | "UK" | "GBR" | "ВЕЛИКАБРИТАНІЯ" | "ВЕЛИКОБРИТАНІЯ" | "ВЕЛИКОБРИТАНИЯ" => {
-            "GB"
-        }
-        "ES" | "ESP" | "ІСПАНІЯ" | "ИСПАНИЯ" => "ES",
-        "CH" | "CHE" | "ШВЕЙЦАРІЯ" | "ШВЕЙЦАРИЯ" => "CH",
-        "AT" | "AUT" | "АВСТРІЯ" | "АВСТРИЯ" => "AT",
-        "FI" | "FIN" | "ФІНЛЯНДІЯ" | "ФИНЛЯНДИЯ" => "FI",
-        "LV" | "LVA" | "ЛАТВІЯ" | "ЛАТВИЯ" => "LV",
-        "LT" | "LTU" | "ЛИТВА" => "LT",
-        "EE" | "EST" | "ЕСТОНІЯ" | "ЭСТОНИЯ" => "EE",
-        "HU" | "HUN" | "УГОРЩИНА" | "ВЕНГРИЯ" => "HU",
-        "RO" | "ROU" | "РУМУНІЯ" | "РУМЫНИЯ" => "RO",
-        "BG" | "BGR" | "БОЛГАРІЯ" | "БОЛГАРИЯ" => "BG",
-        _ => return key,
-    }
-    .to_string()
-}
-
-fn normalize_text_key(value: &str) -> String {
-    let mut out = String::new();
-    let mut last_space = false;
-    for ch in value.trim().chars() {
-        if ch.is_whitespace() {
-            if !out.is_empty() && !last_space {
-                out.push(' ');
-                last_space = true;
-            }
-        } else {
-            out.extend(ch.to_lowercase());
-            last_space = false;
-        }
-    }
-    out
-}
-
-fn clean_label_value(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let key: String = trimmed
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(char::to_uppercase)
-        .collect();
-    if matches!(
-        key.as_str(),
-        "0" | "00"
-            | "000"
-            | "0000"
-            | "NA"
-            | "NА"
-            | "ND"
-            | "NULL"
-            | "NONE"
-            | "NODATA"
-            | "UNKNOWN"
-            | "НД"
-            | "НЕМАДАНИХ"
-            | "НЕТДАННЫХ"
-            | "НЕВІДОМО"
-            | "НЕИЗВЕСТНО"
-    ) {
-        String::new()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn parse_year(value: &str) -> Option<i64> {
-    let digits: String = value.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digits.len() == 4 {
-        digits.parse().ok()
-    } else {
-        None
-    }
-}
-
-fn glob_escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '*' | '?' | '[' | ']' => {
-                out.push('[');
-                out.push(ch);
-                out.push(']');
-            }
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-fn product_code_search_prefix(value: &str) -> Option<&str> {
-    let value = value.trim();
-    if !(4..=10).contains(&value.len()) || !value.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let chapter = value.get(..2)?.parse::<u8>().ok()?;
-    if !(1..=97).contains(&chapter) {
-        return None;
-    }
-    // Avoid turning likely year/declaration-number searches into product-code
-    // searches. HS chapter 20 headings are 2001..2009, so 20xx years are not
-    // useful product-code prefixes in practice.
-    if value.len() == 4 && value.starts_with("20") {
-        return None;
-    }
-    Some(value)
-}
-
-fn uses_fast_result_order(q: &Query) -> bool {
-    if q.is_empty() || product_code_search_prefix(&q.text).is_some() {
-        return true;
-    }
-    if !q.text.trim().is_empty() {
-        return false;
-    }
-    let f = &q.filters;
-    [
-        &f.trademark,
-        &f.description,
-        &f.sender,
-        &f.recipient,
-        &f.trade_country,
-        &f.dispatch_country,
-        &f.origin_country,
-    ]
-    .iter()
-    .all(|value| value.trim().is_empty())
-}
-
-/// Extracts a 20xx year from date text.
-pub fn extract_year(value: &str) -> Option<i64> {
-    let bytes = value.as_bytes();
-    for window_start in 0..bytes.len().saturating_sub(3) {
-        let w = &bytes[window_start..window_start + 4];
-        if w[0] == b'2' && w[1] == b'0' && w[2].is_ascii_digit() && w[3].is_ascii_digit() {
-            // Not part of a longer number.
-            let before_digit = window_start > 0 && bytes[window_start - 1].is_ascii_digit();
-            let after_digit =
-                window_start + 4 < bytes.len() && bytes[window_start + 4].is_ascii_digit();
-            if !before_digit && !after_digit {
-                return std::str::from_utf8(w).ok()?.parse().ok();
-            }
-        }
-    }
-    None
 }

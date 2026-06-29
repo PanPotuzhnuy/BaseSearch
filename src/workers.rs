@@ -1,140 +1,18 @@
 //! Background threads for search, import, and export. The GUI never blocks.
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
 
-use crate::db::{
-    Analytics, AnalyticsScope, AnalyticsSection, AnalyticsSectionKind, CompanyProfile, Db,
-    PivotDim, PivotLimits, PivotMetric, PivotResult, Query, Undervaluation, analytics_should_run,
-};
-use crate::export::{self, ExportError};
-use crate::import::{self, FileSummary, ImportPhase};
-use crate::search::FieldInfo;
+use crate::db::{Db, PivotLimits, Query, analytics_should_run};
 
-pub enum WorkerReq {
-    Search {
-        q: Box<Query>,
-        page: u64,
-        generation: u64,
-    },
-    /// One analytics category for the current query; cheap enough to
-    /// request lazily as the user switches tabs. `scope = None` loads
-    /// only the overview and the monthly dynamics.
-    Analytics {
-        q: Box<Query>,
-        limit: u64,
-        scope: Option<AnalyticsScope>,
-        hs_level: u8,
-        generation: u64,
-    },
-    /// Full grouped list for one analytics card; loaded on demand for drill-down.
-    AnalyticsSection {
-        q: Box<Query>,
-        kind: AnalyticsSectionKind,
-        limit: u64,
-        hs_level: u8,
-        generation: u64,
-    },
-    /// Company dossier for one EDRPOU.
-    Profile {
-        edrpou: String,
-        generation: u64,
-    },
-    /// Cross-tab of the current query.
-    Pivot {
-        q: Box<Query>,
-        row_dim: PivotDim,
-        col_dim: PivotDim,
-        metric: PivotMetric,
-        others_label: String,
-        generation: u64,
-    },
-    /// Full analytics for the comparison side of Compare Mode.
-    Compare {
-        q: Box<Query>,
-        generation: u64,
-    },
-    /// Undervaluation scan over the current query.
-    Underpricing {
-        q: Box<Query>,
-        threshold: f64,
-        generation: u64,
-    },
-    Stats,
-}
+mod jobs;
+mod protocol;
+mod startup;
 
-#[derive(Clone)]
-pub struct ImportEvent {
-    pub file_idx: usize,
-    pub file_count: usize,
-    pub file_name: String,
-    pub phase: ImportPhase,
-    pub done: u64,
-    pub total: u64,
-}
-
-pub enum Msg {
-    SearchPage {
-        generation: u64,
-        fields: Vec<FieldInfo>,
-        ids: Vec<i64>,
-        rows: Vec<Vec<String>>,
-        /// Per row: Some(first file) if it is a kept duplicate, else None.
-        dups: Vec<Option<String>>,
-        has_next: bool,
-        ms: u64,
-    },
-    SearchCount {
-        generation: u64,
-        total: u64,
-    },
-    SearchError {
-        generation: u64,
-        message: String,
-    },
-    AnalyticsDone {
-        generation: u64,
-        scope: Option<AnalyticsScope>,
-        analytics: Box<Analytics>,
-    },
-    AnalyticsSectionDone {
-        generation: u64,
-        section: Box<AnalyticsSection>,
-    },
-    ProfileDone {
-        generation: u64,
-        profile: Box<CompanyProfile>,
-    },
-    PivotDone {
-        generation: u64,
-        pivot: Box<PivotResult>,
-    },
-    CompareDone {
-        generation: u64,
-        query: Box<Query>,
-        analytics: Box<Analytics>,
-    },
-    CompareError {
-        generation: u64,
-        message: String,
-    },
-    UnderpricingDone {
-        generation: u64,
-        result: Box<Undervaluation>,
-    },
-    Stats(u64),
-    Import(ImportEvent),
-    ImportDone(Vec<FileSummary>, u64),
-    ExportProgress(u64, u64),
-    ExportDone(Result<(u64, PathBuf), ExportError>),
-    DbCleared(Result<(), String>),
-    Fatal(String),
-}
-
-pub const PAGE_SIZE: u64 = 100;
+pub use jobs::{spawn_clear_db, spawn_export, spawn_import, spawn_index_repair, spawn_optimize_db};
+pub use protocol::{ImportEvent, Msg, PAGE_SIZE, StartupData, WorkerReq};
+pub use startup::spawn_startup;
 
 enum SearchCountReq {
     Count { q: Box<Query>, generation: u64 },
@@ -300,22 +178,35 @@ pub fn spawn_search_worker(
     ctx: egui::Context,
 ) {
     std::thread::spawn(move || {
-        let db = match Db::open(&db_path) {
-            Ok(db) => db,
-            Err(e) => {
-                let _ = tx.send(Msg::Fatal(e));
-                ctx.request_repaint();
-                return;
-            }
-        };
-        let (count_tx, count_rx) = channel::<SearchCountReq>();
-        spawn_search_count_worker(db_path.clone(), count_rx, tx.clone(), ctx.clone());
-
+        let mut db: Option<Db> = None;
+        let mut count_tx: Option<Sender<SearchCountReq>> = None;
         while let Ok(req) = rx.recv() {
+            if db.is_none() {
+                match Db::open(&db_path) {
+                    Ok(opened) => {
+                        let (tx_count, count_rx) = channel::<SearchCountReq>();
+                        spawn_search_count_worker(
+                            db_path.clone(),
+                            count_rx,
+                            tx.clone(),
+                            ctx.clone(),
+                        );
+                        count_tx = Some(tx_count);
+                        db = Some(opened);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::Fatal(e));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+            }
+            let db = db.as_ref().expect("database opened above");
+            let count_tx = count_tx.as_ref().expect("count worker opened above");
             // Analytics-family requests are handled by the shared dispatcher;
             // it returns Some(req) only for Search and Stats, which this worker
             // owns.
-            let req = match handle_analytics_req(&db, req, &tx, &ctx) {
+            let req = match handle_analytics_req(db, req, &tx, &ctx) {
                 None => continue,
                 Some(req) => req,
             };
@@ -391,20 +282,23 @@ pub fn spawn_analytics_worker(
     ctx: egui::Context,
 ) {
     std::thread::spawn(move || {
-        let db = match Db::open(&db_path) {
-            Ok(db) => db,
-            Err(e) => {
-                let _ = tx.send(Msg::Fatal(e));
-                ctx.request_repaint();
-                return;
-            }
-        };
-
+        let mut db: Option<Db> = None;
         while let Ok(req) = rx.recv() {
+            if db.is_none() {
+                match Db::open(&db_path) {
+                    Ok(opened) => db = Some(opened),
+                    Err(e) => {
+                        let _ = tx.send(Msg::Fatal(e));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+            }
+            let db = db.as_ref().expect("database opened above");
             // This worker only serves analytics-family requests. Search and Stats
             // are not routed here; if one arrives, the shared dispatcher returns
             // it unchanged and we simply drop it.
-            let _ = handle_analytics_req(&db, req, &tx, &ctx);
+            let _ = handle_analytics_req(db, req, &tx, &ctx);
         }
     });
 }
@@ -467,124 +361,5 @@ fn spawn_search_count_worker(
             let _ = tx.send(msg);
             ctx.request_repaint();
         }
-    });
-}
-
-pub fn spawn_import(
-    db_path: PathBuf,
-    files: Vec<PathBuf>,
-    cancel: Arc<AtomicBool>,
-    tx: Sender<Msg>,
-    ctx: egui::Context,
-) {
-    std::thread::spawn(move || {
-        let mut db = match Db::open(&db_path) {
-            Ok(db) => db,
-            Err(e) => {
-                let _ = tx.send(Msg::Fatal(e));
-                ctx.request_repaint();
-                return;
-            }
-        };
-        let count = files.len();
-        let mut summaries = Vec::with_capacity(count);
-        for (i, path) in files.iter().enumerate() {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-            let file_name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let summary = import::import_file(&mut db, path, &cancel, &mut |phase, done, total| {
-                let _ = tx.send(Msg::Import(ImportEvent {
-                    file_idx: i + 1,
-                    file_count: count,
-                    file_name: file_name.clone(),
-                    phase,
-                    done,
-                    total,
-                }));
-                ctx.request_repaint();
-            });
-            summaries.push(summary);
-        }
-        let total_rows = db.total_rows();
-        let _ = tx.send(Msg::ImportDone(summaries, total_rows));
-        ctx.request_repaint();
-    });
-}
-
-/// Completes indexing on startup if the previous run was interrupted.
-pub fn spawn_index_repair(
-    db_path: PathBuf,
-    cancel: Arc<AtomicBool>,
-    tx: Sender<Msg>,
-    ctx: egui::Context,
-) {
-    std::thread::spawn(move || {
-        let mut db = match Db::open(&db_path) {
-            Ok(db) => db,
-            Err(e) => {
-                let _ = tx.send(Msg::Fatal(e));
-                ctx.request_repaint();
-                return;
-            }
-        };
-        let _ = db.index_fts(&cancel, |done, total| {
-            let _ = tx.send(Msg::Import(ImportEvent {
-                file_idx: 1,
-                file_count: 1,
-                file_name: String::new(),
-                phase: ImportPhase::Indexing,
-                done,
-                total,
-            }));
-            ctx.request_repaint();
-        });
-        let total_rows = db.total_rows();
-        let _ = tx.send(Msg::ImportDone(Vec::new(), total_rows));
-        ctx.request_repaint();
-    });
-}
-
-/// Clears the database in the background because VACUUM can take minutes.
-pub fn spawn_clear_db(db_path: PathBuf, tx: Sender<Msg>, ctx: egui::Context) {
-    std::thread::spawn(move || {
-        let result =
-            Db::open(&db_path).and_then(|mut db| db.clear_all().map_err(|e| e.to_string()));
-        let _ = tx.send(Msg::DbCleared(result));
-        ctx.request_repaint();
-    });
-}
-
-pub fn spawn_export(
-    db_path: PathBuf,
-    q: Query,
-    dest: PathBuf,
-    cancel: Arc<AtomicBool>,
-    tx: Sender<Msg>,
-    ctx: egui::Context,
-) {
-    std::thread::spawn(move || {
-        let db = match Db::open(&db_path) {
-            Ok(db) => db,
-            Err(e) => {
-                let _ = tx.send(Msg::Fatal(e));
-                ctx.request_repaint();
-                return;
-            }
-        };
-        let mut last_sent = Instant::now();
-        let result = export::export(&db, &q, &dest, &cancel, |done, total| {
-            if last_sent.elapsed().as_millis() >= 100 {
-                last_sent = Instant::now();
-                let _ = tx.send(Msg::ExportProgress(done, total));
-                ctx.request_repaint();
-            }
-        })
-        .map(|written| (written, dest.clone()));
-        let _ = tx.send(Msg::ExportDone(result));
-        ctx.request_repaint();
     });
 }

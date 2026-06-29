@@ -4,15 +4,12 @@
 //! files that are hundreds of megabytes. Before parsing, the file content hash
 //! is calculated so repeat imports of the same file can be skipped quickly.
 //!
-//! Supported column layouts:
-//! - format A: 41-column customs layout, with extra columns and noisy headers
-//!   tolerated;
-//! - format B: registry-style layout with split declaration numbers, repeated
-//!   headers, and known source typos;
-//! - generic layout: heuristic matching through a multilingual header alias
-//!   dictionary, with the header row searched near the beginning of the sheet;
-//! - universal layout: if no known schema matches, the best header row is used
-//!   and every source column is preserved as dynamic data.
+//! Supported input:
+//! - any spreadsheet-like table with a detectable header row;
+//! - optional semantic profiles that recognize common business fields and
+//!   improve analytics without deciding whether a file is importable;
+//! - repeated/noisy headers and additional source columns, which are preserved
+//!   as dynamic data instead of being dropped.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -27,6 +24,7 @@ use xxhash_rust::xxh3::Xxh3;
 use crate::db::{
     Db, ImportLogWrite, ImportQuality, ImportRecord, canonical_record_hash, extract_year,
 };
+use crate::domain::table::{ColumnStorage, SemanticField, TableShape};
 use crate::schema::{COLUMNS, DATE_COL, REQUIRED_HEADERS};
 
 const BATCH_SIZE: usize = 8192;
@@ -177,7 +175,7 @@ impl HeaderIndex {
     }
 }
 
-/// Format A: all required columns are present.
+/// Profile A: all compatibility profile columns are present.
 fn map_format_a(idx: &HeaderIndex) -> Option<Vec<ColSrc>> {
     if !REQUIRED_HEADERS
         .iter()
@@ -196,7 +194,7 @@ fn map_format_a(idx: &HeaderIndex) -> Option<Vec<ColSrc>> {
     )
 }
 
-/// Format B: registry-style export.
+/// Profile B: registry-style export.
 /// Header names vary between files: product-name variants, repeated recipient
 /// headers versus separate recipient code/name columns, and known source typos.
 /// Each field is therefore resolved through a list of known variants.
@@ -237,7 +235,7 @@ fn map_format_b(idx: &HeaderIndex) -> Option<Vec<ColSrc>> {
         ("Ознака товару в контейнері", 0),
         ("Ознака товару у контейнері", 0),
     ]);
-    let customs_value_method = idx.first_of(&[("Метод визначення митної вартості", 0)]);
+    let valuation_method = idx.first_of(&[("Метод визначення митної вартості", 0)]);
     let duty_uah = idx.first_of(&[("Мито, грн.", 0), ("Мито, грн", 0)]);
     let excise_uah = idx.first_of(&[("Акциз, грн.", 0), ("Акциз, грн", 0)]);
     let vat_uah = idx.first_of(&[("ПДВ, грн.", 0), ("ПДВ, грн", 0)]);
@@ -274,7 +272,7 @@ fn map_format_b(idx: &HeaderIndex) -> Option<Vec<ColSrc>> {
                 "net_kg" => opt(idx.get("Вага нетто, кг", 0)),
                 "currency_control_value" => opt(value_usd),
                 "movement_feature" => opt(movement_feature),
-                "field_43" => opt(customs_value_method),
+                "field_43" => opt(valuation_method),
                 "rfv_usd_kg" => opt(price_usd_kg),
                 "field_3001" => opt(duty_uah),
                 "field_3002" => opt(excise_uah),
@@ -285,14 +283,14 @@ fn map_format_b(idx: &HeaderIndex) -> Option<Vec<ColSrc>> {
     )
 }
 
-/// Wide customs export/import layout used by newer 2026 files.
+/// Wide export/import layout used by newer files.
 ///
 /// These files have 50+ columns and repeated participant headers. For imports,
 /// the recipient code and recipient name are split into neighboring columns;
 /// for exports, the sender code and sender name are split the same way. The
 /// generic detector cannot infer that relationship from headers alone, so this
 /// layout is mapped explicitly.
-fn map_wide_customs(headers: &[String], idx: &HeaderIndex) -> Option<Vec<ColSrc>> {
+fn map_wide_profile(headers: &[String], idx: &HeaderIndex) -> Option<Vec<ColSrc>> {
     if headers.len() < 45 {
         return None;
     }
@@ -451,7 +449,7 @@ fn map_wide_customs(headers: &[String], idx: &HeaderIndex) -> Option<Vec<ColSrc>
     )
 }
 
-/// Generic detector dictionary: schema column name -> normalized header aliases.
+/// Semantic detector dictionary: schema column name -> normalized header aliases.
 /// Aliases are lowercase and stripped of spaces and punctuation.
 const GENERIC_ALIASES: &[(&str, &[&str])] = &[
     ("clearance_time", &["часоформлення", "времяоформления"]),
@@ -635,9 +633,9 @@ fn norm_header(h: &str) -> String {
         .collect()
 }
 
-/// Generic detector for similar exports.
-/// Requires at least a description plus one of product code, declaration number,
-/// sender, or recipient.
+/// Generic semantic detector for similar exports.
+/// Requires at least a description plus one of code, document id, supplier, or
+/// customer.
 fn map_generic(headers: &[String]) -> Option<Vec<ColSrc>> {
     let mut alias_to_target: HashMap<&str, &str> = HashMap::new();
     for (target, aliases) in GENERIC_ALIASES {
@@ -679,30 +677,43 @@ fn detect_mapping(headers: &[String]) -> Option<MappingPlan> {
     let idx = HeaderIndex::new(headers);
     if let Some(columns) = map_format_a(&idx) {
         return Some(MappingPlan {
-            layout: "standard customs",
+            layout: "recognized profile",
             columns,
         });
     }
     if let Some(columns) = map_format_b(&idx) {
         return Some(MappingPlan {
-            layout: "registry customs",
+            layout: "registry profile",
             columns,
         });
     }
-    if let Some(columns) = map_wide_customs(headers, &idx) {
+    if let Some(columns) = map_wide_profile(headers, &idx) {
         return Some(MappingPlan {
-            layout: "wide customs",
+            layout: "wide profile",
             columns,
         });
     }
     map_generic(headers).map(|columns| MappingPlan {
-        layout: "generic customs-like",
+        layout: "semantic profile",
         columns,
     })
 }
 
 fn universal_mapping() -> Vec<ColSrc> {
     vec![ColSrc::Missing; COLUMNS.len()]
+}
+
+fn semantic_for_schema_column(name: &str) -> Option<SemanticField> {
+    // Single source of truth lives in the schema profile.
+    crate::schema::semantic_for_column(name)
+}
+
+fn mapped_source_indices(src: &ColSrc) -> Vec<usize> {
+    match src {
+        ColSrc::Cell(index) => vec![*index],
+        ColSrc::Join(parts, _) => parts.clone(),
+        ColSrc::Missing => Vec::new(),
+    }
 }
 
 fn universal_headers(row: &[Data], width: usize) -> Vec<String> {
@@ -748,7 +759,7 @@ fn best_universal_header(scanned: &[Vec<Data>]) -> Option<(usize, Vec<String>)> 
 
 /// Source columns the mapping does not consume, paired with their header names,
 /// in file order. These are preserved per row in the `extra` payload so the app
-/// keeps every column of differently shaped files, not only the known schema.
+/// keeps every column, not only fields recognized by a semantic profile.
 fn unmapped_columns(headers: &[String], mapping: &[ColSrc]) -> Vec<(usize, String)> {
     let mut consumed = std::collections::HashSet::new();
     for src in mapping {
@@ -899,12 +910,6 @@ fn finalize_quality(summary: &mut FileSummary) {
     if quality.layout.is_empty() {
         return;
     }
-    if quality.layout == "universal table" {
-        push_quality_warning(
-            quality,
-            "No known trade schema was detected; the file was imported as a generic table.",
-        );
-    }
     if quality.header_row > 1 {
         push_quality_warning(
             quality,
@@ -914,16 +919,11 @@ fn finalize_quality(summary: &mut FileSummary) {
             ),
         );
     }
-    if quality.recognized_columns == 0 {
-        push_quality_warning(
-            quality,
-            "No semantic trade columns were recognized; analytics will be limited to generic table data.",
-        );
-    } else if quality.recognized_columns < 6 {
+    if quality.recognized_columns > 0 && quality.recognized_columns < 6 {
         push_quality_warning(
             quality,
             &format!(
-                "Only {} semantic columns were recognized; check that important fields mapped correctly.",
+                "Only {} semantic fields were recognized; source columns are still preserved, but domain analytics may be limited.",
                 quality.recognized_columns
             ),
         );
@@ -1096,7 +1096,9 @@ impl RowSink<'_> {
                 self.first_row_headers = headers.clone();
             }
             if let Some(plan) = detect_mapping(&headers) {
+                self.remember_table_shape(&headers, Some(&plan.columns));
                 self.extra_cols = unmapped_columns(&headers, &plan.columns);
+                self.remember_extra_columns();
                 self.summary.quality = ImportQuality {
                     layout: plan.layout.to_string(),
                     header_row: self.rows_seen,
@@ -1124,10 +1126,12 @@ impl RowSink<'_> {
         let Some((header_idx, headers)) = best_universal_header(&scanned) else {
             return Err(self.missing_error());
         };
+        self.remember_table_shape(&headers, None);
         self.mapping = Some(universal_mapping());
         self.extra_cols = headers.into_iter().enumerate().collect();
+        self.remember_extra_columns();
         self.summary.quality = ImportQuality {
-            layout: "universal table".to_string(),
+            layout: "generic table".to_string(),
             header_row: (header_idx + 1) as u64,
             source_columns: self.extra_cols.len() as u64,
             recognized_columns: 0,
@@ -1220,6 +1224,34 @@ impl RowSink<'_> {
         }
     }
 
+    fn remember_extra_columns(&self) {
+        self.db
+            .remember_extra_headers(self.extra_cols.iter().map(|(_, header)| header.as_str()));
+    }
+
+    fn remember_table_shape(&self, headers: &[String], mapping: Option<&[ColSrc]>) {
+        let mut shape = TableShape::from_headers(headers.iter().cloned());
+        if let Some(mapping) = mapping {
+            for (target_idx, src) in mapping.iter().enumerate() {
+                let semantic = semantic_for_schema_column(COLUMNS[target_idx].name);
+                for source_index in mapped_source_indices(src) {
+                    if let Some(column) = shape
+                        .columns
+                        .iter_mut()
+                        .find(|column| column.source_index == source_index)
+                    {
+                        if let Some(semantic) = semantic {
+                            column.semantic = Some(semantic);
+                        }
+                        column.storage =
+                            ColumnStorage::SchemaColumn(COLUMNS[target_idx].name.to_string());
+                    }
+                }
+            }
+        }
+        self.db.remember_table_shape(&shape);
+    }
+
     fn flush_batch(&mut self) -> Result<(), String> {
         if self.batch.is_empty() {
             return Ok(());
@@ -1244,13 +1276,7 @@ impl RowSink<'_> {
     }
 
     fn missing_error(&self) -> String {
-        let idx = HeaderIndex::new(&self.first_row_headers);
-        let missing: Vec<&str> = REQUIRED_HEADERS
-            .iter()
-            .filter(|h| !idx.has(h))
-            .copied()
-            .collect();
-        format!("__MISSING__{}", missing.join(", "))
+        "No non-empty header row was found in the first rows of the sheet.".to_string()
     }
 }
 

@@ -1,0 +1,377 @@
+use super::analytics_groups::section_title;
+use super::format::{fmt_compact, fmt_decimal};
+use super::month_chart::{MonthMetric, months_chart};
+use super::price_view::price_metric_title;
+use super::ui_text::{query_summary, trunc_label};
+use super::widgets::kpi_tile;
+use crate::db::{Analytics, AnalyticsGroupRow, AnalyticsSection, Query};
+use crate::i18n::{Lang, group_digits, tr};
+
+pub(super) fn analytics_report_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Звіт",
+        _ => "Report",
+    }
+}
+
+pub(super) fn report_title(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Звіт по поточному запиту",
+        _ => "Report for the current query",
+    }
+}
+
+pub(super) fn report_hint(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => {
+            "Короткий підсумок для роботи: головні цифри, компанії, товари, країни і ціни. HTML-звіт можна зберегти як PDF через друк у браузері."
+        }
+        _ => {
+            "A clean working summary: headline numbers, companies, goods, countries, and prices. The HTML report can be saved as PDF from the browser print dialog."
+        }
+    }
+}
+
+pub(super) fn report_copy_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Копіювати звіт",
+        _ => "Copy report",
+    }
+}
+
+pub(super) fn report_export_label(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ua => "Експорт HTML/PDF",
+        _ => "Export HTML/PDF",
+    }
+}
+
+pub(super) fn report_markdown(analytics: &Analytics, query: &Query, lang: Lang) -> String {
+    let mut out = String::new();
+    out.push_str("# Base Search Report\n\n");
+    out.push_str(&format!("Query: {}\n\n", query_summary(query, tr(lang))));
+    out.push_str("## Summary\n");
+    out.push_str(&format!(
+        "- Rows: {}\n",
+        group_digits(analytics.overview.row_count)
+    ));
+    out.push_str(&format!(
+        "- Declarations: {}\n",
+        group_digits(analytics.overview.declaration_count)
+    ));
+    out.push_str(&format!(
+        "- Total value: {:.2}\n",
+        analytics.overview.total_value_usd
+    ));
+    out.push_str(&format!(
+        "- Net weight: {:.3} kg\n",
+        analytics.overview.total_net_kg
+    ));
+    out.push_str(&format!(
+        "- Average value/kg: {:.2}\n\n",
+        analytics.overview.avg_value_per_net_kg
+    ));
+    append_report_sections(&mut out, "Companies", &analytics.company_sections);
+    append_report_sections(&mut out, "Goods", &analytics.product_sections);
+    append_report_sections(&mut out, "Countries", &analytics.country_sections);
+    out
+}
+
+pub(super) fn report_html(analytics: &Analytics, query: &Query, lang: Lang) -> String {
+    let mut body = String::new();
+    body.push_str(&format!(
+        "<h1>Base Search Report</h1><p class=\"query\">{}</p>",
+        esc_html(&query_summary(query, tr(lang)))
+    ));
+    body.push_str("<section class=\"kpis\">");
+    for (label, value) in [
+        (
+            tr(lang).rows_label,
+            group_digits(analytics.overview.row_count),
+        ),
+        (
+            tr(lang).declarations_label,
+            group_digits(analytics.overview.declaration_count),
+        ),
+        (
+            tr(lang).total_value,
+            format!("{:.2}", analytics.overview.total_value_usd),
+        ),
+        (
+            tr(lang).net_weight,
+            format!("{:.3} kg", analytics.overview.total_net_kg),
+        ),
+        (
+            tr(lang).avg_value_kg,
+            fmt_decimal(analytics.overview.avg_value_per_net_kg, 2),
+        ),
+        (
+            tr(lang).unique_edrpou,
+            group_digits(analytics.overview.distinct_edrpou),
+        ),
+    ] {
+        body.push_str(&format!(
+            "<article><span>{}</span><strong>{}</strong></article>",
+            esc_html(label),
+            esc_html(&value)
+        ));
+    }
+    body.push_str("</section>");
+    append_html_sections(
+        &mut body,
+        tr(lang).companies_section,
+        &analytics.company_sections,
+        lang,
+    );
+    append_html_sections(
+        &mut body,
+        tr(lang).products_section,
+        &analytics.product_sections,
+        lang,
+    );
+    append_html_sections(
+        &mut body,
+        tr(lang).countries_section,
+        &analytics.country_sections,
+        lang,
+    );
+    append_html_prices(&mut body, analytics, lang);
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Base Search Report</title>{}</head><body>{}</body></html>",
+        report_css(),
+        body
+    )
+}
+
+pub(super) fn report_ui(ui: &mut egui::Ui, analytics: &Analytics, query: &Query, lang: Lang) {
+    ui.label(
+        egui::RichText::new(query_summary(query, tr(lang)))
+            .weak()
+            .small(),
+    );
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        kpi_tile(
+            ui,
+            tr(lang).rows_label,
+            group_digits(analytics.overview.row_count),
+            tr(lang).rows_help,
+        );
+        kpi_tile(
+            ui,
+            tr(lang).declarations_label,
+            group_digits(analytics.overview.declaration_count),
+            tr(lang).declarations_help,
+        );
+        kpi_tile(
+            ui,
+            tr(lang).total_value,
+            fmt_compact(analytics.overview.total_value_usd),
+            tr(lang).total_value_help,
+        );
+        kpi_tile(
+            ui,
+            tr(lang).net_weight,
+            format!("{} kg", fmt_compact(analytics.overview.total_net_kg)),
+            tr(lang).net_weight_help,
+        );
+        kpi_tile(
+            ui,
+            tr(lang).avg_value_kg,
+            fmt_decimal(analytics.overview.avg_value_per_net_kg, 2),
+            tr(lang).avg_value_kg_help,
+        );
+        kpi_tile(
+            ui,
+            tr(lang).unique_edrpou,
+            group_digits(analytics.overview.distinct_edrpou),
+            tr(lang).unique_edrpou,
+        );
+    });
+    ui.add_space(12.0);
+
+    if !analytics.months.is_empty() {
+        ui.label(egui::RichText::new(tr(lang).months_section).strong());
+        months_chart(ui, &analytics.months, MonthMetric::Value, lang);
+        ui.add_space(12.0);
+    }
+
+    ui.columns(2, |cols| {
+        report_section(
+            &mut cols[0],
+            tr(lang).companies_section,
+            &analytics.company_sections,
+            lang,
+        );
+        report_section(
+            &mut cols[1],
+            tr(lang).products_section,
+            &analytics.product_sections,
+            lang,
+        );
+    });
+    ui.add_space(10.0);
+    ui.columns(2, |cols| {
+        report_section(
+            &mut cols[0],
+            tr(lang).countries_section,
+            &analytics.country_sections,
+            lang,
+        );
+        report_prices(&mut cols[1], analytics, lang);
+    });
+}
+
+fn report_section(ui: &mut egui::Ui, title: &str, sections: &[AnalyticsSection], lang: Lang) {
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(title).strong());
+            ui.add_space(4.0);
+            for section in sections.iter().filter(|s| !s.rows.is_empty()).take(2) {
+                ui.label(
+                    egui::RichText::new(section_title(section.kind, lang))
+                        .weak()
+                        .small(),
+                );
+                for row in section.rows.iter().take(5) {
+                    report_group_row(ui, row);
+                }
+                ui.add_space(4.0);
+            }
+        });
+}
+
+fn report_group_row(ui: &mut egui::Ui, row: &AnalyticsGroupRow) {
+    ui.horizontal(|ui| {
+        ui.label(trunc_label(&row.label, 38));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} · {}%",
+                    fmt_compact(row.total_value_usd),
+                    fmt_decimal(row.share_percent, 1)
+                ))
+                .monospace(),
+            );
+        });
+    });
+}
+
+fn report_prices(ui: &mut egui::Ui, analytics: &Analytics, lang: Lang) {
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(tr(lang).prices_section).strong());
+            ui.add_space(4.0);
+            for metric in analytics
+                .price_sections
+                .iter()
+                .filter(|m| m.count > 0)
+                .take(5)
+            {
+                ui.horizontal(|ui| {
+                    ui.label(price_metric_title(metric.kind, lang));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}: {}",
+                                tr(lang).median,
+                                fmt_decimal(metric.median, 2)
+                            ))
+                            .monospace(),
+                        );
+                    });
+                });
+            }
+        });
+}
+
+fn append_html_sections(out: &mut String, title: &str, sections: &[AnalyticsSection], lang: Lang) {
+    out.push_str(&format!("<section><h2>{}</h2>", esc_html(title)));
+    for section in sections.iter().filter(|s| !s.rows.is_empty()).take(3) {
+        out.push_str(&format!(
+            "<h3>{}</h3><table><thead><tr><th>Name</th><th>Value</th><th>Net kg</th><th>Rows</th><th>Share</th></tr></thead><tbody>",
+            esc_html(section_title(section.kind, lang))
+        ));
+        for row in section.rows.iter().take(10) {
+            out.push_str(&format!(
+                "<tr><td>{}</td><td>{:.2}</td><td>{:.3}</td><td>{}</td><td>{:.1}%</td></tr>",
+                esc_html(&row.label),
+                row.total_value_usd,
+                row.total_net_kg,
+                row.rows,
+                row.share_percent
+            ));
+        }
+        out.push_str("</tbody></table>");
+    }
+    out.push_str("</section>");
+}
+
+fn append_html_prices(out: &mut String, analytics: &Analytics, lang: Lang) {
+    out.push_str(&format!(
+        "<section><h2>{}</h2><table><thead><tr><th>Metric</th><th>Average</th><th>Weighted</th><th>Median</th><th>P25-P75</th><th>Rows</th></tr></thead><tbody>",
+        esc_html(tr(lang).prices_section)
+    ));
+    for metric in analytics
+        .price_sections
+        .iter()
+        .filter(|m| m.count > 0)
+        .take(8)
+    {
+        out.push_str(&format!(
+            "<tr><td>{}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3} - {:.3}</td><td>{}</td></tr>",
+            esc_html(price_metric_title(metric.kind, lang)),
+            metric.average,
+            metric.weighted_average,
+            metric.median,
+            metric.p25,
+            metric.p75,
+            metric.count
+        ));
+    }
+    out.push_str("</tbody></table></section>");
+}
+
+fn report_css() -> &'static str {
+    "<style>
+      :root { color-scheme: light; font-family: Segoe UI, Arial, sans-serif; color: #1b2430; }
+      body { margin: 36px; background: #fff; font-size: 13px; line-height: 1.45; }
+      h1 { margin: 0 0 4px; font-size: 26px; }
+      h2 { margin: 26px 0 8px; font-size: 18px; border-bottom: 1px solid #d7dde5; padding-bottom: 4px; }
+      h3 { margin: 16px 0 6px; font-size: 14px; color: #34404e; }
+      .query { margin: 0 0 18px; color: #6a7682; }
+      .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 18px 0 20px; }
+      .kpis article { border: 1px solid #d7dde5; border-radius: 6px; padding: 10px 12px; }
+      .kpis span { display: block; color: #6a7682; font-size: 11px; }
+      .kpis strong { display: block; margin-top: 4px; font-size: 18px; font-family: Consolas, monospace; }
+      table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+      th, td { border-bottom: 1px solid #e4e8ee; padding: 6px 7px; text-align: left; vertical-align: top; }
+      th { background: #f3f6f9; color: #34404e; font-size: 11px; text-transform: uppercase; }
+      td:not(:first-child), th:not(:first-child) { text-align: right; font-family: Consolas, monospace; }
+      @media print { body { margin: 18mm; } .kpis { grid-template-columns: repeat(3, 1fr); } h2 { break-after: avoid; } table { break-inside: avoid; } }
+    </style>"
+}
+
+fn esc_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn append_report_sections(out: &mut String, title: &str, sections: &[AnalyticsSection]) {
+    out.push_str(&format!("## {title}\n"));
+    for section in sections.iter().filter(|s| !s.rows.is_empty()).take(3) {
+        out.push_str(&format!("### {:?}\n", section.kind));
+        for row in section.rows.iter().take(10) {
+            out.push_str(&format!(
+                "- {}: value {:.2}, net {:.3} kg, rows {}, share {:.1}%\n",
+                row.label, row.total_value_usd, row.total_net_kg, row.rows, row.share_percent
+            ));
+        }
+    }
+    out.push('\n');
+}

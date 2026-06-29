@@ -1,4 +1,4 @@
-# Base Search 1.5.1
+# Base Search 1.6.0
 
 [![CI](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml)
 
@@ -7,9 +7,10 @@ analytics, and export across large Excel datasets.
 
 It is built for people who have many large spreadsheet files and need to work
 with them as one searchable database instead of opening heavy workbooks one by
-one in Excel. The original focus was customs and trade data, but version 1.5.0
-can also import ordinary tabular Excel files and preserve their real source
-columns.
+one in Excel. Base Search is document-neutral: ordinary tabular Excel files are
+imported with their real source columns as first-class fields, and optional
+semantic profiles can add better analytics when familiar business fields are
+recognized.
 
 Base Search runs locally. It does not upload spreadsheets, search results, or
 the database to a cloud service.
@@ -18,13 +19,14 @@ the database to a cloud service.
 
 - Imports `.xlsx`, `.xlsb`, and `.xls` files into one local SQLite database.
 - Shows an import quality report with detected layout, header row, recognized
-  columns, preserved extra columns, table fill rate, and warnings.
-- Preserves known trade/customs fields and unknown spreadsheet columns.
+  semantic columns, preserved source columns, table fill rate, and warnings.
+- Preserves every source column from the spreadsheet.
 - Builds a full-text search index for fast repeated searches.
-- Searches across products, companies, codes, declaration numbers, countries,
-  trademarks, and generic imported columns.
+- Searches across products, companies, codes, invoice/order numbers, countries,
+  brands, and any imported source columns.
 - Supports advanced search rules: all/any groups, excluded rules, nested
-  groups, ranges, empty/not-empty checks, and filters over extra columns.
+  groups, ranges, empty/not-empty checks, and filters over imported source
+  columns.
 - Shows paged results instead of trying to render millions of rows at once.
 - Opens a full details card for any row.
 - Provides analytics for the current query and filters.
@@ -35,8 +37,8 @@ the database to a cloud service.
 ## Typical Use Cases
 
 - Search across many Excel exports as one dataset.
-- Find all rows related to a product, brand, code, company, country, or year.
-- Compare which companies, product codes, brands, or countries dominate a
+- Find all rows related to a product, brand, SKU/code, company, country, or year.
+- Compare which companies, SKUs/codes, brands, or countries dominate a
   selected result set.
 - Inspect suspicious prices or unusual value-per-weight patterns.
 - Prepare filtered CSV/XLSX extracts for further work in Excel, BI tools, or
@@ -143,28 +145,25 @@ outside the executable makes updates and backups simpler.
 
 Base Search 1.5.1 is not limited to one fixed spreadsheet layout.
 
-If a file matches a known customs/trade layout, the app maps fields such as
-date, company, product code, country, value, weight, and price indicators into
-semantic columns.
-
-If a file does not match a known layout, Base Search imports it as a generic
-table:
+The default import model is a generic table:
 
 - the detected header row becomes the column list;
 - every source column is preserved;
 - values are indexed for full-text search;
-- extra fields are visible in the result table;
-- extra fields are available in Advanced Search;
+- source fields are visible in the result table;
+- source fields are available in Advanced Search;
 - CSV/XLSX export includes the dynamic columns.
 
-Customs-specific analytics use recognized semantic fields when they exist.
-Generic columns remain searchable, filterable, visible, and exportable.
+When Base Search recognizes common business fields such as date, company,
+SKU/code, country, value, quantity, weight, or price indicators, it adds semantic
+meaning for better analytics. The original spreadsheet headers still remain the
+user-facing columns. Generic columns remain searchable, filterable, visible,
+and exportable without requiring any document-specific schema.
 
 After each import, Base Search shows a quality report. It explains which layout
 was detected, which row was used as the header, how many columns were recognized
-as semantic trade fields, how many columns were preserved as extra dynamic
-fields, how full the imported table is, and whether anything deserves a manual
-check.
+as semantic fields, how many source columns were preserved, how full the
+imported table is, and whether anything deserves a manual check.
 
 ## Search
 
@@ -175,9 +174,9 @@ Base Search supports two search styles.
 Use the main search box for fast broad search:
 
 ```text
-apple
-8504
-wine bottle
+brand name
+SKU-42
+invoice number
 company name
 ```
 
@@ -185,22 +184,22 @@ Rules:
 
 - multiple words must all be present;
 - `word*` searches by prefix;
-- numeric terms with 4 or more digits are treated as code prefixes;
+- numeric terms with 4 or more digits can be treated as code prefixes;
 - text matching is case-insensitive;
 - field filters are better when the meaning matters.
 
-For example, searching `Apple` everywhere is broad. Filtering by trademark or
-company is narrower and more precise.
+Broad search is useful for discovery. Field filters are narrower and more
+precise when the column meaning matters.
 
 ### Advanced Search
 
 Use Advanced Search for structured questions:
 
-- sender contains A or B;
+- company contains A or B;
 - origin country is not CN;
 - year is between 2024 and 2026;
 - value is greater than a threshold;
-- an imported extra column is empty or not empty;
+- an imported source column is empty or not empty;
 - several groups of rules should match with all/any logic.
 
 Advanced Search is designed for users who need flexible filtering without
@@ -215,10 +214,10 @@ Available views include:
 
 | View | Purpose |
 |---|---|
-| Overview | Headline totals, declarations, companies, value, weight, quantity, countries, and monthly dynamics. |
-| Companies | Top organization codes, recipients/importers, and senders. |
-| Goods | Product codes, brands, and product groups. |
-| Countries | Origin, dispatch, and trade countries. |
+| Overview | Headline totals, document IDs, companies, value, weight, quantity, countries, and monthly dynamics when recognized fields exist. |
+| Companies | Top company identifiers and recognized company columns. |
+| Goods | Product/SKU codes, brands, and product groups when recognized fields exist. |
+| Countries | Recognized country columns. |
 | Prices | Average and weighted price metrics, medians, quartiles, and possible undervaluation checks. |
 | Pivot | Cross-tab analysis by company, code, country, month, year, or other supported dimensions. |
 | Report | A compact working report that can be copied or saved as print-ready HTML. |
@@ -365,7 +364,7 @@ reports, and database on their own machine.
 ## Limitations
 
 - Base Search is not a spreadsheet editor.
-- It does not replace legal, customs, accounting, or compliance review.
+- It does not replace legal, accounting, compliance, or domain-expert review.
 - Generic tables are searchable and exportable, but semantic analytics require
   recognizable fields such as dates, values, weights, companies, codes, or
   countries.

@@ -196,30 +196,11 @@ fn format_bytes(bytes: u64) -> String {
 /// Diagnostic query: arbitrary SELECT, limited to 50 printed rows.
 fn cmd_sql(db_path: &Path, sql: &str) -> Result<(), String> {
     let db = Db::open(db_path)?;
-    let mut stmt = db.conn.prepare(sql).map_err(|e| e.to_string())?;
-    let n_cols = stmt.column_count();
-    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-    let mut printed = 0;
-    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let mut cells = Vec::with_capacity(n_cols);
-        for i in 0..n_cols {
-            cells.push(
-                row.get::<_, rusqlite::types::Value>(i)
-                    .map(|v| match v {
-                        rusqlite::types::Value::Null => "NULL".to_string(),
-                        rusqlite::types::Value::Integer(x) => x.to_string(),
-                        rusqlite::types::Value::Real(x) => x.to_string(),
-                        rusqlite::types::Value::Text(s) => s,
-                        rusqlite::types::Value::Blob(b) => format!("<blob {}>", b.len()),
-                    })
-                    .unwrap_or_default(),
-            );
-        }
+    for cells in db
+        .diagnostic_query_rows(sql, 50)
+        .map_err(|e| e.to_string())?
+    {
         println!("{}", cells.join(" | "));
-        printed += 1;
-        if printed >= 50 {
-            break;
-        }
     }
     Ok(())
 }
@@ -597,7 +578,7 @@ fn cmd_analytics(db_path: &Path, args: &[String]) -> Result<(), String> {
     let started = Instant::now();
     let analytics = db.analytics(&q, 10).map_err(|e| e.to_string())?;
     println!(
-        "Rows: {}  declarations: {}  recipients: {}  senders: {}  EDRPOU: {}",
+        "Rows: {}  document IDs: {}  companies: {}  sources: {}  company IDs: {}",
         analytics.overview.row_count,
         analytics.overview.declaration_count,
         analytics.overview.distinct_recipients,

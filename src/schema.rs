@@ -1,7 +1,13 @@
-//! Column definitions for customs Excel files and their database mapping.
+//! Compatibility profile column definitions and database mapping.
+//!
+//! The public product should treat this as one optional semantic profile, not
+//! as the universal data model. New generic-document work belongs in
+//! `crate::domain`.
+
+use crate::domain::table::SemanticField;
 
 pub struct ColumnDef {
-    /// Source Excel column header as it appears in customs data.
+    /// Source Excel column header as it appears in the compatibility profile.
     pub header: &'static str,
     /// SQLite column name.
     pub name: &'static str,
@@ -202,8 +208,8 @@ pub const SEARCH_COLUMNS: [&str; 9] = [
     "origin_country",
 ];
 
-/// Result table columns by database name. Includes all source columns plus the
-/// source file so the main table can expose the full imported row.
+/// Legacy compatibility-profile result columns by database name. Newer UI/export
+/// paths prefer the persisted table shape when it is available.
 pub const RESULT_COLUMNS: [&str; 42] = [
     "clearance_time",
     "customs_office",
@@ -251,6 +257,44 @@ pub const RESULT_COLUMNS: [&str; 42] = [
 
 pub fn col_index(name: &str) -> Option<usize> {
     COLUMNS.iter().position(|c| c.name == name)
+}
+
+/// The single source of truth linking this compatibility profile's columns to
+/// the domain-neutral [`SemanticField`] roles. The import field semantics, the
+/// table shape, and the materialized analytics columns ([`crate::storage::derived`])
+/// all resolve through this one table, so the profile is defined in one place.
+pub const SEMANTIC_COLUMNS: &[(SemanticField, &str)] = &[
+    (SemanticField::Date, "declaration_date"),
+    (SemanticField::DeclarationNumber, "declaration_number"),
+    (SemanticField::Sender, "sender"),
+    (SemanticField::CompanyCode, "edrpou"),
+    (SemanticField::Recipient, "recipient"),
+    (SemanticField::ProductCode, "product_code"),
+    (SemanticField::Description, "description"),
+    (SemanticField::TradeCountry, "trade_country"),
+    (SemanticField::DispatchCountry, "dispatch_country"),
+    (SemanticField::OriginCountry, "origin_country"),
+    (SemanticField::Quantity, "quantity"),
+    (SemanticField::GrossWeight, "gross_kg"),
+    (SemanticField::NetWeight, "net_kg"),
+    (SemanticField::Value, "currency_control_value"),
+    (SemanticField::Trademark, "trademark"),
+];
+
+/// Semantic role carried by a profile column, if any.
+pub fn semantic_for_column(name: &str) -> Option<SemanticField> {
+    SEMANTIC_COLUMNS
+        .iter()
+        .find(|(_, column)| *column == name)
+        .map(|(field, _)| *field)
+}
+
+/// Profile column that carries a semantic role, if any.
+pub fn column_for_semantic(field: SemanticField) -> Option<&'static str> {
+    SEMANTIC_COLUMNS
+        .iter()
+        .find(|(candidate, _)| *candidate == field)
+        .map(|(_, column)| *column)
 }
 
 /// Expanded meaning for abbreviated source columns, shown as a hover hint on

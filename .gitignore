@@ -36,9 +36,14 @@
 *.tmp
 *.temp
 
-# Local planning drafts
-/docs/PRODUCT_REQUIREMENTS.md
-/docs/ROADMAP.md
+# Public documentation policy
+*.md
+!README.md
+!LICENSE*.md
+
+# Local planning drafts and internal audits
+/docs/
+/audit/
 
 # Editor and OS files
 .claude/
