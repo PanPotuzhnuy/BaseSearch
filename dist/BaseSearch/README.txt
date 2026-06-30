@@ -1,4 +1,4 @@
-Base Search 1.6.0
+Base Search 1.6.5
 ===============
 
 How to run
@@ -52,6 +52,17 @@ base-search-cli.exe compact data\base_search.db --vacuum
 The --vacuum mode keeps records but rewrites the database file. It can take a
 long time on multi-gigabyte databases.
 
+Benchmark / OLAP baseline
+-------------------------
+Version 1.6.5 adds a technical benchmark command for repeatable search and
+analytics measurements:
+
+base-search-cli.exe benchmark data\base_search.db Apple --year 2024 --repeat 3
+
+It measures search count, first result page, analytics overview, company/goods/
+country/price aggregations, pivot, and possible undervaluation checks on the
+current SQLite backend. Use --json for machine-readable output.
+
 Basic workflow
 --------------
 1. Open BaseSearch.exe.
@@ -88,7 +99,7 @@ groups and nested when a search needs more structure.
 
 Universal tables
 ----------------
-Base Search 1.6.0 can import regular Excel tables even when they do not follow
+Base Search 1.6.5 can import regular Excel tables even when they do not follow
 the customs schema. Unknown columns are preserved as dynamic fields, included
 in full-text search, shown in the desktop and browser result tables, available
 in Advanced Search, listed on the row card, and exported to CSV/XLSX.

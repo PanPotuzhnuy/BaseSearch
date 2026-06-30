@@ -12,6 +12,7 @@ use base_search::db::{
 };
 use base_search::export;
 use base_search::import::{self, ImportPhase};
+use base_search::olap::{OlapBenchmarkOptions, OlapBenchmarkReport, run_sqlite_benchmark};
 use base_search::search::FieldInfo;
 use base_search::web;
 
@@ -25,10 +26,20 @@ Usage:
   base-search-cli search <db> [query...] [--limit N] [--year Y] [--code C]
                      [--sender S] [--recipient R] [--edrpou E]
                      [--trademark T] [--description D]
+                     [--origin C] [--dispatch C] [--trade C]
                      [--repeat N] [--warmups N] [--no-print-rows] [--json]
   base-search-cli analytics <db> [query...] [--year Y] [--code C]
                        [--sender S] [--recipient R] [--edrpou E]
                        [--trademark T] [--description D]
+                       [--origin C] [--dispatch C] [--trade C]
+  base-search-cli benchmark <db> [query...] [--year Y] [--code C]
+                       [--sender S] [--recipient R] [--edrpou E]
+                       [--trademark T] [--description D]
+                       [--origin C] [--dispatch C] [--trade C]
+                       [--repeat N] [--warmups N] [--limit N]
+                       [--section-limit N] [--hs-level 2|4|6|10]
+                       [--pivot-rows N] [--pivot-cols N]
+                       [--allow-empty] [--json]
   base-search-cli export <db> <out.csv|out.xlsx> [query...]
   base-search-cli web [db] [--host 127.0.0.1] [--port 7832] [--no-open]";
 
@@ -41,6 +52,7 @@ fn main() -> ExitCode {
         Some("import") if args.len() >= 3 => cmd_import(Path::new(&args[1]), &args[2..]),
         Some("search") if args.len() >= 2 => cmd_search(Path::new(&args[1]), &args[2..]),
         Some("analytics") if args.len() >= 2 => cmd_analytics(Path::new(&args[1]), &args[2..]),
+        Some("benchmark") if args.len() >= 2 => cmd_benchmark(Path::new(&args[1]), &args[2..]),
         Some("export") if args.len() >= 3 => cmd_export(Path::new(&args[1]), &args[2], &args[3..]),
         Some("web") => cmd_web(&args[1..]),
         Some("sql") if args.len() == 3 => cmd_sql(Path::new(&args[1]), &args[2]),
@@ -326,6 +338,9 @@ fn parse_query_with_options(args: &[String], allow_limit: bool) -> Result<(Query
             "--edrpou" => filters.edrpou = take(&mut i, "--edrpou")?,
             "--trademark" => filters.trademark = take(&mut i, "--trademark")?,
             "--description" => filters.description = take(&mut i, "--description")?,
+            "--origin" => filters.origin_country = take(&mut i, "--origin")?,
+            "--dispatch" => filters.dispatch_country = take(&mut i, "--dispatch")?,
+            "--trade" => filters.trade_country = take(&mut i, "--trade")?,
             flag if flag.starts_with("--") => return Err(format!("Unknown query option: {flag}")),
             word => words.push(word.to_string()),
         }
@@ -353,6 +368,13 @@ impl Default for SearchOptions {
             json: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct BenchmarkCliOptions {
+    olap: OlapBenchmarkOptions,
+    json: bool,
+    allow_empty: bool,
 }
 
 #[derive(Debug)]
@@ -609,6 +631,154 @@ fn cmd_analytics(db_path: &Path, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_benchmark(db_path: &Path, args: &[String]) -> Result<(), String> {
+    let mut db = Db::open(db_path)?;
+    ensure_indexed(&mut db)?;
+    let (query_args, mut options) = parse_benchmark_args(args)?;
+    let limit_was_set = query_args.iter().any(|arg| arg == "--limit");
+    let (query, limit) = parse_query(&query_args)?;
+    if limit_was_set {
+        options.olap.page_limit = limit;
+    }
+    if query.is_empty() && !options.allow_empty {
+        return Err(
+            "Benchmark requires a query or filter. Use --allow-empty for a full-database baseline."
+                .to_string(),
+        );
+    }
+
+    let report = run_sqlite_benchmark(&db, &query, &options.olap)?;
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|err| err.to_string())?
+        );
+    } else {
+        print_benchmark_report(&report);
+    }
+    Ok(())
+}
+
+fn parse_benchmark_args(args: &[String]) -> Result<(Vec<String>, BenchmarkCliOptions), String> {
+    let mut query_args = Vec::new();
+    let mut options = BenchmarkCliOptions::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--repeat" => {
+                i += 1;
+                options.olap.repeat = parse_positive_usize(args.get(i), "--repeat")?;
+            }
+            "--warmups" => {
+                i += 1;
+                options.olap.warmups = parse_usize(args.get(i), "--warmups")?;
+            }
+            "--section-limit" => {
+                i += 1;
+                options.olap.section_limit = parse_positive_u64(args.get(i), "--section-limit")?;
+            }
+            "--hs-level" => {
+                i += 1;
+                options.olap.hs_level = parse_hs_level(args.get(i))?;
+            }
+            "--pivot-rows" => {
+                i += 1;
+                options.olap.pivot_rows = parse_positive_usize(args.get(i), "--pivot-rows")?;
+            }
+            "--pivot-cols" => {
+                i += 1;
+                options.olap.pivot_cols = parse_positive_usize(args.get(i), "--pivot-cols")?;
+            }
+            "--allow-empty" => options.allow_empty = true,
+            "--json" => options.json = true,
+            arg => query_args.push(arg.to_string()),
+        }
+        i += 1;
+    }
+    options.olap.page_limit = options.olap.page_limit.clamp(1, 500);
+    options.olap.section_limit = options.olap.section_limit.clamp(1, 200);
+    options.olap.pivot_rows = options.olap.pivot_rows.clamp(1, 100);
+    options.olap.pivot_cols = options.olap.pivot_cols.clamp(1, 100);
+    Ok((query_args, options))
+}
+
+fn parse_positive_u64(value: Option<&String>, flag: &str) -> Result<u64, String> {
+    let parsed = value
+        .ok_or_else(|| format!("{flag} requires a value"))?
+        .parse()
+        .map_err(|_| format!("{flag} must be a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("{flag} must be at least 1"));
+    }
+    Ok(parsed)
+}
+
+fn parse_hs_level(value: Option<&String>) -> Result<u8, String> {
+    let parsed: u8 = value
+        .ok_or_else(|| "--hs-level requires a value".to_string())?
+        .parse()
+        .map_err(|_| "--hs-level must be one of 2, 4, 6, 10".to_string())?;
+    match parsed {
+        2 | 4 | 6 | 10 => Ok(parsed),
+        _ => Err("--hs-level must be one of 2, 4, 6, 10".to_string()),
+    }
+}
+
+fn print_benchmark_report(report: &OlapBenchmarkReport) {
+    println!("Backend: {}", report.backend);
+    println!("Database rows: {}", report.total_database_rows);
+    println!("Unindexed rows: {}", report.unindexed_rows);
+    println!("Query: {}", query_label(&report.query));
+    if report.query_is_empty {
+        println!("Scope: full database");
+    }
+    println!();
+    println!(
+        "{:<28} {:<8} {:>10} {:>10} {:>10} {:>10}",
+        "Scenario", "Category", "Avg ms", "Min ms", "Max ms", "Output"
+    );
+    for scenario in &report.scenarios {
+        println!(
+            "{:<28} {:<8} {:>10.3} {:>10.3} {:>10.3} {:>10}",
+            scenario.name,
+            scenario.category,
+            scenario.average_ms,
+            scenario.minimum_ms,
+            scenario.maximum_ms,
+            scenario.output_rows
+        );
+    }
+}
+
+fn query_label(query: &Query) -> String {
+    let mut parts = Vec::new();
+    if !query.text.trim().is_empty() {
+        parts.push(format!("text={}", query.text.trim()));
+    }
+    let filters = &query.filters;
+    for (name, value) in [
+        ("year", filters.year.as_str()),
+        ("code", filters.product_code.as_str()),
+        ("sender", filters.sender.as_str()),
+        ("recipient", filters.recipient.as_str()),
+        ("edrpou", filters.edrpou.as_str()),
+        ("trademark", filters.trademark.as_str()),
+        ("description", filters.description.as_str()),
+        ("origin", filters.origin_country.as_str()),
+        ("dispatch", filters.dispatch_country.as_str()),
+        ("trade", filters.trade_country.as_str()),
+    ] {
+        if !value.trim().is_empty() {
+            parts.push(format!("{name}={}", value.trim()));
+        }
+    }
+    if parts.is_empty() {
+        "<empty>".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
 fn print_sections(group: &str, sections: &[AnalyticsSection]) {
     for section in sections {
         if section.rows.is_empty() {
@@ -737,6 +907,9 @@ mod tests {
     fn parse_query_rejects_missing_filter_values() {
         assert!(parse_query(&args(&["--year"])).is_err());
         assert!(parse_query(&args(&["--code"])).is_err());
+        assert!(parse_query(&args(&["--origin"])).is_err());
+        assert!(parse_query(&args(&["--dispatch"])).is_err());
+        assert!(parse_query(&args(&["--trade"])).is_err());
     }
 
     #[test]
@@ -750,6 +923,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_query_accepts_country_filters() {
+        let (query, _) = parse_query(&args(&[
+            "Widget",
+            "--origin",
+            "CN",
+            "--dispatch",
+            "PL",
+            "--trade",
+            "DE",
+        ]))
+        .unwrap();
+        assert_eq!(query.text, "Widget");
+        assert_eq!(query.filters.origin_country, "CN");
+        assert_eq!(query.filters.dispatch_country, "PL");
+        assert_eq!(query.filters.trade_country, "DE");
+    }
+
+    #[test]
     fn parse_export_query_rejects_limit() {
         assert!(parse_export_query(&args(&["--limit", "10"])).is_err());
     }
@@ -760,5 +951,44 @@ mod tests {
         assert!(parse_compact_options(&args(&["--vacuum"])).unwrap());
         assert!(parse_compact_options(&args(&["--unknown"])).is_err());
         assert!(parse_compact_options(&args(&["--vacuum", "--again"])).is_err());
+    }
+
+    #[test]
+    fn parse_benchmark_options_separates_runtime_and_query_args() {
+        let (query_args, options) = parse_benchmark_args(&args(&[
+            "Widget",
+            "--year",
+            "2024",
+            "--repeat",
+            "5",
+            "--warmups",
+            "2",
+            "--section-limit",
+            "25",
+            "--hs-level",
+            "4",
+            "--pivot-rows",
+            "30",
+            "--pivot-cols",
+            "8",
+            "--allow-empty",
+            "--json",
+        ]))
+        .unwrap();
+        assert_eq!(query_args, args(&["Widget", "--year", "2024"]));
+        assert_eq!(options.olap.repeat, 5);
+        assert_eq!(options.olap.warmups, 2);
+        assert_eq!(options.olap.section_limit, 25);
+        assert_eq!(options.olap.hs_level, 4);
+        assert_eq!(options.olap.pivot_rows, 30);
+        assert_eq!(options.olap.pivot_cols, 8);
+        assert!(options.allow_empty);
+        assert!(options.json);
+    }
+
+    #[test]
+    fn parse_benchmark_options_rejects_invalid_hs_level() {
+        assert!(parse_benchmark_args(&args(&["--hs-level", "3"])).is_err());
+        assert!(parse_benchmark_args(&args(&["--hs-level"])).is_err());
     }
 }

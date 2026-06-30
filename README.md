@@ -1,4 +1,4 @@
-# Base Search 1.6.0
+# Base Search 1.6.5
 
 [![CI](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/IvanK577/BaseSearch/actions/workflows/ci.yml)
 
@@ -143,7 +143,7 @@ outside the executable makes updates and backups simpler.
 
 ## Universal Table Import
 
-Base Search 1.5.1 is not limited to one fixed spreadsheet layout.
+Base Search 1.6.5 is not limited to one fixed spreadsheet layout.
 
 The default import model is a generic table:
 
@@ -265,13 +265,22 @@ base-search-cli compact <db> [--vacuum]
 base-search-cli peek   <file.xlsx|file.xlsb>
 base-search-cli import <db> <file.xlsx|file.xlsb> [...]
 base-search-cli search <db> [query...] [--limit N] [--year Y] [--code C]
-base-search-cli analytics <db> [query...] [--year Y] [--code C]
+base-search-cli analytics <db> [query...] [--year Y] [--code C] [--origin C]
+base-search-cli benchmark <db> [query...] [--year Y] [--code C] [--origin C] [--repeat N]
 base-search-cli export <db> <out.csv|out.xlsx> [query...]
 base-search-cli web [db] [--host 127.0.0.1] [--port 7832] [--no-open]
 ```
 
 The desktop app is the primary interface. The CLI is mainly for verification,
 batch work, troubleshooting, and database maintenance.
+
+`benchmark` runs the same practical scenarios that matter for future OLAP and
+database-backend decisions: search count, first result page, analytics overview,
+company/product/country/price aggregations, pivot, and possible undervaluation
+checks. It measures the current SQLite baseline before comparing alternatives
+such as DuckDB, PostgreSQL, ClickHouse, OpenSearch, or Elasticsearch.
+Use `--json` for machine-readable output and `--allow-empty` only when a
+full-database benchmark is intentional.
 
 ## Database Maintenance
 
@@ -347,6 +356,7 @@ Base Search is built with:
 - SQLite for local storage;
 - SQLite FTS5 for full-text search;
 - SQLite aggregate queries for analytics;
+- a benchmark command for repeatable search and OLAP baseline measurements;
 - a small localhost web server for browser mode;
 - xxhash for duplicate detection;
 - CSV and XLSX writers for export.

@@ -5,6 +5,7 @@ pub mod domain;
 pub mod export;
 pub mod i18n;
 pub mod import;
+pub mod olap;
 pub mod schema;
 pub mod search;
 pub(crate) mod storage;

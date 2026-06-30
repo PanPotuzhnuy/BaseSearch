@@ -13,6 +13,7 @@ use base_search::db::{
 use base_search::domain::table::{ColumnRole, ColumnStorage, SemanticField};
 use base_search::export;
 use base_search::import::{self, ImportPhase, collapse_ws, normalize_date, normalize_value};
+use base_search::olap::{OlapBenchmarkOptions, run_sqlite_benchmark};
 use base_search::schema::{COLUMNS, RESULT_COLUMNS, col_index, column_glossary};
 use base_search::search::{
     ConditionOp, ConditionValue, FieldRef, LogicOp, QueryCondition, QueryExpr, QueryGroup,
@@ -122,6 +123,58 @@ fn pivot_dimension_labels_map_to_filter_actions() {
 
     assert_eq!(pivot_filter_action(PivotDim::Month, "2024-03"), None);
     assert_eq!(pivot_filter_action(PivotDim::Year, "2024"), None);
+}
+
+#[test]
+fn olap_benchmark_runs_sqlite_baseline_scenarios() {
+    let dir = tempfile::tempdir().unwrap();
+    let xlsx = dir.path().join("benchmark.xlsx");
+    let db_path = dir.path().join("benchmark.db");
+    write_test_xlsx(&xlsx, &sample_rows());
+    let mut db = Db::open(&db_path).unwrap();
+    let cancel = AtomicBool::new(false);
+    let summary = import::import_file(&mut db, &xlsx, &cancel, &mut |_, _, _| {});
+    assert!(summary.error.is_none());
+
+    let query = Query {
+        text: "SIEMENS".to_string(),
+        ..Default::default()
+    };
+    let report = run_sqlite_benchmark(
+        &db,
+        &query,
+        &OlapBenchmarkOptions {
+            repeat: 1,
+            warmups: 0,
+            page_limit: 5,
+            section_limit: 5,
+            pivot_rows: 5,
+            pivot_cols: 5,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(report.backend, "sqlite");
+    assert_eq!(report.total_database_rows, 3);
+    assert_eq!(report.query.text, "SIEMENS");
+    assert_eq!(report.scenarios.len(), 9);
+    assert!(
+        report
+            .scenarios
+            .iter()
+            .any(|scenario| scenario.name == "Search count" && scenario.output_rows == 1)
+    );
+    assert!(
+        report
+            .scenarios
+            .iter()
+            .any(|scenario| scenario.name == "Pivot: recipient by month")
+    );
+    for scenario in &report.scenarios {
+        assert_eq!(scenario.runs_ms.len(), 1);
+        assert!(scenario.maximum_ms >= scenario.minimum_ms);
+    }
 }
 
 /// Creates a test XLSX file with the full schema column set.
