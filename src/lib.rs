@@ -2,6 +2,8 @@ pub mod app;
 pub mod db;
 pub mod db_types;
 pub mod domain;
+#[cfg(feature = "duckdb-olap")]
+pub mod duckdb_olap;
 pub mod export;
 pub mod i18n;
 pub mod import;

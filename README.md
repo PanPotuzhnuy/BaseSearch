@@ -267,6 +267,8 @@ base-search-cli import <db> <file.xlsx|file.xlsb> [...]
 base-search-cli search <db> [query...] [--limit N] [--year Y] [--code C]
 base-search-cli analytics <db> [query...] [--year Y] [--code C] [--origin C]
 base-search-cli benchmark <db> [query...] [--year Y] [--code C] [--origin C] [--repeat N]
+base-search-cli olap-build <db> [projection.duckdb]
+base-search-cli olap-benchmark <projection.duckdb> [query...] [--year Y] [--origin C]
 base-search-cli export <db> <out.csv|out.xlsx> [query...]
 base-search-cli web [db] [--host 127.0.0.1] [--port 7832] [--no-open]
 ```
@@ -281,6 +283,19 @@ checks. It measures the current SQLite baseline before comparing alternatives
 such as DuckDB, PostgreSQL, ClickHouse, OpenSearch, or Elasticsearch.
 Use `--json` for machine-readable output and `--allow-empty` only when a
 full-database benchmark is intentional.
+
+Optional DuckDB OLAP support can be enabled for technical comparisons and heavy
+aggregate experiments:
+
+```powershell
+cargo build --features duckdb-olap --bin base-search-cli
+base-search-cli olap-build data/base_search.db data/base_search.duckdb
+base-search-cli olap-benchmark data/base_search.duckdb --year 2026 --json
+```
+
+SQLite remains the primary database and full-text search engine. DuckDB is used
+as a separate analytical projection for columnar scans, grouping, pivots, and
+repeatable backend comparisons.
 
 ## Database Maintenance
 
@@ -357,6 +372,7 @@ Base Search is built with:
 - SQLite FTS5 for full-text search;
 - SQLite aggregate queries for analytics;
 - a benchmark command for repeatable search and OLAP baseline measurements;
+- optional DuckDB projections for analytical backend experiments;
 - a small localhost web server for browser mode;
 - xxhash for duplicate detection;
 - CSV and XLSX writers for export.

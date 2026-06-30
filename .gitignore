@@ -16,6 +16,7 @@
 *.db
 *.sqlite
 *.sqlite3
+*.duckdb
 *.db-wal
 *.db-shm
 *.sqlite-wal

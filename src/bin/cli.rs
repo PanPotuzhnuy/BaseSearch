@@ -10,6 +10,8 @@ use base_search::db::{
     AnalyticsGroupRow, AnalyticsPriceMetric, AnalyticsSection, AnalyticsSectionKind,
     DatabaseStorageInfo, Db, Filters, PriceMetricKind, Query,
 };
+#[cfg(feature = "duckdb-olap")]
+use base_search::duckdb_olap;
 use base_search::export;
 use base_search::import::{self, ImportPhase};
 use base_search::olap::{OlapBenchmarkOptions, OlapBenchmarkReport, run_sqlite_benchmark};
@@ -40,6 +42,9 @@ Usage:
                        [--section-limit N] [--hs-level 2|4|6|10]
                        [--pivot-rows N] [--pivot-cols N]
                        [--allow-empty] [--json]
+  base-search-cli olap-build <db> [projection.duckdb]
+  base-search-cli olap-benchmark <projection.duckdb> [query...] [--year Y]
+                       [--origin C] [--repeat N] [--warmups N] [--json]
   base-search-cli export <db> <out.csv|out.xlsx> [query...]
   base-search-cli web [db] [--host 127.0.0.1] [--port 7832] [--no-open]";
 
@@ -53,6 +58,10 @@ fn main() -> ExitCode {
         Some("search") if args.len() >= 2 => cmd_search(Path::new(&args[1]), &args[2..]),
         Some("analytics") if args.len() >= 2 => cmd_analytics(Path::new(&args[1]), &args[2..]),
         Some("benchmark") if args.len() >= 2 => cmd_benchmark(Path::new(&args[1]), &args[2..]),
+        Some("olap-build") if args.len() >= 2 => cmd_olap_build(Path::new(&args[1]), args.get(2)),
+        Some("olap-benchmark") if args.len() >= 2 => {
+            cmd_olap_benchmark(Path::new(&args[1]), &args[2..])
+        }
         Some("export") if args.len() >= 3 => cmd_export(Path::new(&args[1]), &args[2], &args[3..]),
         Some("web") => cmd_web(&args[1..]),
         Some("sql") if args.len() == 3 => cmd_sql(Path::new(&args[1]), &args[2]),
@@ -657,6 +666,62 @@ fn cmd_benchmark(db_path: &Path, args: &[String]) -> Result<(), String> {
         print_benchmark_report(&report);
     }
     Ok(())
+}
+
+#[cfg(feature = "duckdb-olap")]
+fn cmd_olap_build(db_path: &Path, projection_arg: Option<&String>) -> Result<(), String> {
+    let projection_path = projection_arg
+        .map(PathBuf::from)
+        .unwrap_or_else(|| duckdb_olap::default_projection_path(db_path));
+    let build = duckdb_olap::build_projection(db_path, &projection_path)?;
+    println!(
+        "Built DuckDB projection: {}",
+        build.projection_path.display()
+    );
+    println!(
+        "Rows: {}  time: {:.1}s",
+        build.rows,
+        build.elapsed_ms / 1000.0
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "duckdb-olap"))]
+fn cmd_olap_build(_db_path: &Path, _projection_arg: Option<&String>) -> Result<(), String> {
+    Err(
+        "DuckDB OLAP support is not enabled in this binary. Rebuild with --features duckdb-olap."
+            .to_string(),
+    )
+}
+
+#[cfg(feature = "duckdb-olap")]
+fn cmd_olap_benchmark(projection_path: &Path, args: &[String]) -> Result<(), String> {
+    let (query_args, options) = parse_benchmark_args(args)?;
+    let (query, _) = parse_query(&query_args)?;
+    if query.is_empty() && !options.allow_empty {
+        return Err(
+            "OLAP benchmark requires a query or filter. Use --allow-empty for a full-projection baseline."
+                .to_string(),
+        );
+    }
+    let report = duckdb_olap::run_duckdb_benchmark(projection_path, &query, &options.olap)?;
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|err| err.to_string())?
+        );
+    } else {
+        print_benchmark_report(&report);
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "duckdb-olap"))]
+fn cmd_olap_benchmark(_projection_path: &Path, _args: &[String]) -> Result<(), String> {
+    Err(
+        "DuckDB OLAP support is not enabled in this binary. Rebuild with --features duckdb-olap."
+            .to_string(),
+    )
 }
 
 fn parse_benchmark_args(args: &[String]) -> Result<(Vec<String>, BenchmarkCliOptions), String> {
